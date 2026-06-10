@@ -5,7 +5,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::str;
 use std::sync::Arc;
-use rand::RngExt; // Трейт для генерации диапазонов в rand 0.10
+use rand::prelude::*;
 
 mod quic;
 
