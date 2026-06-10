@@ -28,7 +28,6 @@ struct Config {
     ranges: Ranges,
 }
 
-// Твоя функция красивого логирования пакетов
 fn print_payload(direction: &str, data: &[u8]) {
     println!("{}", direction);
     if let Ok(text) = str::from_utf8(data) {
@@ -129,7 +128,6 @@ async fn run_udp_proxy(listen_address: String, udp_target: String, ranges: Range
                             Duration::from_secs(4),
                                                                             upstream_socket.recv_from(&mut resp_buf)
                         ).await {
-                            // Изолируем rng внутри блока
                             let udp_jitter = {
                                 let mut rng = rand::rng();
                                 rng.random_range(ranges_clone.udp_jitter_min_ms..=ranges_clone.udp_jitter_max_ms)
@@ -148,31 +146,55 @@ async fn run_udp_proxy(listen_address: String, udp_target: String, ranges: Range
 }
 
 async fn handle_connection(mut client_stream: TcpStream, ranges: Ranges, is_enabled: bool) {
-    let mut buffer = [0u8; 4096];
-    let bytes_read = match client_stream.read(&mut buffer).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
+    let mut buffer = [0u8; 8192];
+    let mut total_read = 0;
+    let mut header_end_idx = None;
+
+    loop {
+        match client_stream.read(&mut buffer[total_read..]).await {
+            Ok(0) => return,
+            Ok(n) => {
+                total_read += n;
+                let current_slice = &buffer[..total_read];
+
+                if let Some(pos) = current_slice.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end_idx = Some(pos + 4);
+                    break;
+                }
+
+                if total_read >= buffer.len() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+
+    let end_idx = match header_end_idx {
+        Some(idx) => idx,
+        None => return,
     };
 
-    let request = match str::from_utf8(&buffer[..bytes_read]) {
+    let request = match str::from_utf8(&buffer[..end_idx]) {
         Ok(r) => r.to_string(),
         Err(_) => return,
     };
 
     if request.starts_with("CONNECT") {
-        handle_connect(client_stream, &request, ranges, is_enabled).await;
+        let initial_payload = buffer[end_idx..total_read].to_vec();
+        handle_connect(client_stream, &request, initial_payload, ranges, is_enabled).await;
     } else {
-        handle_http(client_stream, &request, &buffer[..bytes_read], ranges, is_enabled).await;
+        handle_http(client_stream, &request, &buffer[..total_read], ranges, is_enabled).await;
     }
 }
 
-fn find_sni_index(data: &[u8], target_domain: &str) -> Option<usize> {
-    let target_bytes = target_domain.as_bytes();
-    data.windows(target_bytes.len())
-    .position(|window| window == target_bytes)
-}
-
-async fn handle_connect(client_stream: TcpStream, request: &str, ranges: Ranges, is_enabled: bool) {
+async fn handle_connect(
+    client_stream: TcpStream,
+    request: &str,
+    initial_payload: Vec<u8>,
+    ranges: Ranges,
+    is_enabled: bool
+) {
     let target = match parse_connect_target(request) {
         Some(t) => t,
         None => {
@@ -181,6 +203,9 @@ async fn handle_connect(client_stream: TcpStream, request: &str, ranges: Ranges,
         }
     };
     println!("[HTTPS] Туннель к: {}", target);
+
+    // Выделяем чистый домен без порта для поиска SNI (например, www.youtube.com)
+    let domain_only = target.split(':').next().unwrap_or(&target).to_string();
 
     let server_stream = match TcpStream::connect(&target).await {
         Ok(s) => s,
@@ -204,82 +229,94 @@ async fn handle_connect(client_stream: TcpStream, request: &str, ranges: Ranges,
     let (mut client_reader, mut client_writer) = client_stream.into_split();
     let (mut server_reader, mut server_writer) = server_stream.into_split();
 
-    let target_clone = target.clone();
-
     let client_to_server = async move {
         let mut buffer = [0u8; 4096];
         let mut is_first_packet = true;
+        let mut leftover = initial_payload;
+
         loop {
-            match client_reader.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(bytes_read) => {
-                    let data = &buffer[..bytes_read];
+            let data: &[u8];
+            let bytes_read: usize;
 
-                    if is_enabled && is_first_packet {
-                        // Извлекаем чистый домен без порта для поиска (например, "www.youtube.com")
-                        let pattern = "youtube";
+            if !leftover.is_empty() {
+                bytes_read = leftover.len();
+                buffer[..bytes_read].copy_from_slice(&leftover);
+                data = &buffer[..bytes_read];
+                leftover.clear();
+            } else {
+                match client_reader.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes_read = n;
+                        data = &buffer[..bytes_read];
+                    }
+                    Err(_) => break,
+                }
+            }
 
-                        if let Some(sni_pos) = find_sni_index(data, pattern) {
-                            // Режем прямо внутри слова "youtube"!
-                            // sni_pos — это буква 'y'. + 2 означает, что 'y' и 'o' улетят в Чанке 1,
-                            // а 'utube.com' улетит в Чанке 2.
-                            let cut_offset = 2;
-                            let dynamic_frag = sni_pos + cut_offset;
+            if is_enabled && is_first_packet {
+                // ✂️ ХИРУРГИЧЕСКИЙ SNI SPLIT ✂️
+                if let Some(sni_idx) = find_sni_index(data, &domain_only) {
+                    // Режем строго посередине строки домена
+                    let half_len = domain_only.len() / 2;
+                    let split_pos = sni_idx + half_len;
 
-                            if dynamic_frag < data.len() {
-                                let (first_chunk, second_chunk) = data.split_at(dynamic_frag);
+                    if split_pos < data.len() {
+                        let (first_chunk, second_chunk) = data.split_at(split_pos);
 
-                                println!("[✂️ REAL SNI SPLIT] Паттерн '{}' найден на позиции {}. Режем на индексе {}", pattern, sni_pos, dynamic_frag);
+                        println!(
+                            "[✂️ SNI SPLIT] Домен '{}' найден на позиции {}. Режем на индексе {}.",
+                            domain_only, sni_idx, split_pos
+                        );
+                        println!(
+                            "    -> Часть 1 улетит как: {:?}",
+                            String::from_utf8_lossy(&data[sni_idx..split_pos])
+                        );
+                        println!(
+                            "    -> Часть 2 улетит как: {:?}",
+                            String::from_utf8_lossy(&data[split_pos..sni_idx + domain_only.len()])
+                        );
 
-                                let msg1 = format!("[HTTPS => Server] Чанк 1: {} байт", first_chunk.len());
-                                print_payload(&msg1, first_chunk);
-                                if server_writer.write_all(first_chunk).await.is_err() { break; }
-                                let _ = server_writer.flush().await;
+                        let msg1 = format!("[HTTPS => Server] Чанк 1: {} байт", first_chunk.len());
+                        print_payload(&msg1, first_chunk);
+                        if server_writer.write_all(first_chunk).await.is_err() { break; }
+                        let _ = server_writer.flush().await;
 
-                                let random_delay = {
-                                    let mut rng = rand::rng();
-                                    rng.random_range(ranges.delay_min_ms..=ranges.delay_max_ms)
-                                };
-                                println!("[HTTPS => Server] Пауза: {} мс", random_delay);
-                                tokio::time::sleep(Duration::from_millis(random_delay)).await;
+                        let random_delay = {
+                            let mut rng = rand::rng();
+                            rng.random_range(ranges.delay_min_ms..=ranges.delay_max_ms)
+                        };
+                        println!("[HTTPS => Server] Пауза: {} мс", random_delay);
+                        tokio::time::sleep(Duration::from_millis(random_delay)).await;
 
-                                let msg2 = format!("[HTTPS => Server] Чанк 2: {} байт", second_chunk.len());
-                                print_payload(&msg2, second_chunk);
-                                if server_writer.write_all(second_chunk).await.is_err() { break; }
-                                let _ = server_writer.flush().await;
-                            } else {
-                                if server_writer.write_all(data).await.is_err() { break; }
-                            }
-                        } else {
-                            // Если домен в байтах не нашли (например, это не TLS, а другой протокол),
-                            // режем по старой логике из конфига
-                            let min_bound = ranges.frag_min.min(data.len());
-                            let max_bound = std::cmp::min(ranges.frag_max, data.len()).max(min_bound);
-                            let dynamic_frag = {
-                                let mut rng = rand::rng();
-                                if min_bound < max_bound { rng.random_range(min_bound..=max_bound) } else { min_bound }
-                            };
+                        let msg2 = format!("[HTTPS => Server] Чанк 2: {} байт", second_chunk.len());
+                        print_payload(&msg2, second_chunk);
+                        if server_writer.write_all(second_chunk).await.is_err() { break; }
+                        let _ = server_writer.flush().await;
+                    } else {
+                        if server_writer.write_all(data).await.is_err() { break; }
+                    }
+                } else {
+                    // Фолбэк: если SNI почему-то не обнаружился в буфере, откатываемся на 3-байтовый сплит Клода
+                    println!("[!] SNI домена не найден в первом пакете, применяем фолбэк-сплит (3 байта)");
+                    if data.len() > 3 {
+                        let (first_chunk, second_chunk) = data.split_at(3);
+                        if server_writer.write_all(first_chunk).await.is_err() { break; }
+                        let _ = server_writer.flush().await;
 
-                            if data.len() > dynamic_frag && dynamic_frag > 0 {
-                                let (first_chunk, second_chunk) = data.split_at(dynamic_frag);
-                                if server_writer.write_all(first_chunk).await.is_err() { break; }
-                                let _ = server_writer.flush().await;
-                                let random_delay = {
-                                    let mut rng = rand::rng();
-                                    rng.random_range(ranges.delay_min_ms..=ranges.delay_max_ms)
-                                };
-                                tokio::time::sleep(Duration::from_millis(random_delay)).await;
-                                if server_writer.write_all(second_chunk).await.is_err() { break; }
-                            } else {
-                                if server_writer.write_all(data).await.is_err() { break; }
-                            }
-                        }
-                        is_first_packet = false;
+                        let random_delay = {
+                            let mut rng = rand::rng();
+                            rng.random_range(ranges.delay_min_ms..=ranges.delay_max_ms)
+                        };
+                        tokio::time::sleep(Duration::from_millis(random_delay)).await;
+                        if server_writer.write_all(second_chunk).await.is_err() { break; }
                     } else {
                         if server_writer.write_all(data).await.is_err() { break; }
                     }
                 }
-                Err(_) => break,
+                is_first_packet = false;
+            } else {
+                if server_writer.write_all(data).await.is_err() { break; }
             }
         }
     };
@@ -333,8 +370,20 @@ async fn handle_http(
     };
 
     if is_enabled {
-        let min_bound = ranges.frag_min.min(raw_request.len());
-        let max_bound = std::cmp::min(ranges.frag_max, raw_request.len()).max(min_bound);
+        let mut modified_request = request_str.to_string();
+
+        if modified_request.contains("Host:") {
+            modified_request = modified_request.replace("Host:", "hOsT :");
+            println!("[HTTP ✂️] Обфускация: Host: -> hOsT :");
+        } else if modified_request.contains("host:") {
+            modified_request = modified_request.replace("host:", "hOsT :");
+            println!("[HTTP ✂️] Обфускация: host: -> hOsT :");
+        }
+
+        let modified_bytes = modified_request.as_bytes();
+
+        let min_bound = ranges.frag_min.min(modified_bytes.len());
+        let max_bound = std::cmp::min(ranges.frag_max, modified_bytes.len()).max(min_bound);
 
         let frag_size = {
             let mut rng = rand::rng();
@@ -345,8 +394,8 @@ async fn handle_http(
             }
         };
 
-        if raw_request.len() > frag_size && frag_size > 0 {
-            let (first_chunk, second_chunk) = raw_request.split_at(frag_size);
+        if modified_bytes.len() > frag_size && frag_size > 0 {
+            let (first_chunk, second_chunk) = modified_bytes.split_at(frag_size);
 
             let msg1 = format!("[HTTP => Server] Чанк 1: {} байт", first_chunk.len());
             print_payload(&msg1, first_chunk);
@@ -365,9 +414,9 @@ async fn handle_http(
             if server_stream.write_all(second_chunk).await.is_err() { return; }
             let _ = server_stream.flush().await;
         } else {
-            let msg = format!("[HTTP => Server] {} байт", raw_request.len());
-            print_payload(&msg, raw_request);
-            if server_stream.write_all(raw_request).await.is_err() { return; }
+            let msg = format!("[HTTP => Server] {} байт", modified_bytes.len());
+            print_payload(&msg, modified_bytes);
+            if server_stream.write_all(modified_bytes).await.is_err() { return; }
             let _ = server_stream.flush().await;
         }
     } else {
@@ -437,4 +486,10 @@ fn parse_http_target(request: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn find_sni_index(data: &[u8], target_domain: &str) -> Option<usize> {
+    let target_bytes = target_domain.as_bytes();
+    data.windows(target_bytes.len())
+    .position(|window| window == target_bytes)
 }
