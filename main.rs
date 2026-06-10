@@ -255,65 +255,29 @@ async fn handle_connect(
             }
 
             if is_enabled && is_first_packet {
-                // ✂️ ХИРУРГИЧЕСКИЙ SNI SPLIT ✂️
-                if let Some(sni_idx) = find_sni_index(data, &domain_only) {
-                    // Режем строго посередине строки домена
-                    let half_len = domain_only.len() / 2;
-                    let split_pos = sni_idx + half_len;
+                println!("[⚡ MICRO-FRAG] Включаем агрессивную микро-фрагментацию TLS ClientHello...");
 
-                    if split_pos < data.len() {
-                        let (first_chunk, second_chunk) = data.split_at(split_pos);
+                let mut offset = 0;
+                let data_len = data.len();
+                let mut chunk_count = 0;
 
-                        println!(
-                            "[✂️ SNI SPLIT] Домен '{}' найден на позиции {}. Режем на индексе {}.",
-                            domain_only, sni_idx, split_pos
-                        );
-                        println!(
-                            "    -> Часть 1 улетит как: {:?}",
-                            String::from_utf8_lossy(&data[sni_idx..split_pos])
-                        );
-                        println!(
-                            "    -> Часть 2 улетит как: {:?}",
-                            String::from_utf8_lossy(&data[split_pos..sni_idx + domain_only.len()])
-                        );
+                while offset < data_len {
+                    // Вызываем random_range напрямую, не сохраняя ThreadRng в переменную через .await
+                    let chunk_size = rand::random_range(2..=5).min(data_len - offset);
+                    let chunk = &data[offset..offset + chunk_size];
 
-                        let msg1 = format!("[HTTPS => Server] Чанк 1: {} байт", first_chunk.len());
-                        print_payload(&msg1, first_chunk);
-                        if server_writer.write_all(first_chunk).await.is_err() { break; }
-                        let _ = server_writer.flush().await;
+                    if server_writer.write_all(chunk).await.is_err() { break; }
+                    let _ = server_writer.flush().await;
 
-                        let random_delay = {
-                            let mut rng = rand::rng();
-                            rng.random_range(ranges.delay_min_ms..=ranges.delay_max_ms)
-                        };
-                        println!("[HTTPS => Server] Пауза: {} мс", random_delay);
-                        tokio::time::sleep(Duration::from_millis(random_delay)).await;
+                    chunk_count += 1;
+                    offset += chunk_size;
 
-                        let msg2 = format!("[HTTPS => Server] Чанк 2: {} байт", second_chunk.len());
-                        print_payload(&msg2, second_chunk);
-                        if server_writer.write_all(second_chunk).await.is_err() { break; }
-                        let _ = server_writer.flush().await;
-                    } else {
-                        if server_writer.write_all(data).await.is_err() { break; }
-                    }
-                } else {
-                    // Фолбэк: если SNI почему-то не обнаружился в буфере, откатываемся на 3-байтовый сплит Клода
-                    println!("[!] SNI домена не найден в первом пакете, применяем фолбэк-сплит (3 байта)");
-                    if data.len() > 3 {
-                        let (first_chunk, second_chunk) = data.split_at(3);
-                        if server_writer.write_all(first_chunk).await.is_err() { break; }
-                        let _ = server_writer.flush().await;
-
-                        let random_delay = {
-                            let mut rng = rand::rng();
-                            rng.random_range(ranges.delay_min_ms..=ranges.delay_max_ms)
-                        };
-                        tokio::time::sleep(Duration::from_millis(random_delay)).await;
-                        if server_writer.write_all(second_chunk).await.is_err() { break; }
-                    } else {
-                        if server_writer.write_all(data).await.is_err() { break; }
-                    }
+                    // Точно так же убираем rng отсюда
+                    let micro_delay = rand::random_range(1..=3);
+                    tokio::time::sleep(Duration::from_millis(micro_delay)).await;
                 }
+
+                println!("[⚡ MICRO-FRAG] Пакет успешно разбит и отправлен в виде {} микро-чанков!", chunk_count);
                 is_first_packet = false;
             } else {
                 if server_writer.write_all(data).await.is_err() { break; }
