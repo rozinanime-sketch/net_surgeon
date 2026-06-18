@@ -1,13 +1,19 @@
 use std::fs;
 use std::time::Duration;
+use std::collections::HashSet;
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::str;
 use std::sync::Arc;
 use rand::prelude::*;
+use std::os::unix::io::AsRawFd;
 
 mod quic;
+mod ui;
+mod menu;
+mod actions;
+
 
 #[derive(Debug, Deserialize, Clone)]
 struct Ranges {
@@ -26,6 +32,15 @@ struct Config {
     udp_target: String,
     enabled: bool,
     ranges: Ranges,
+}
+
+fn load_bypass_domains() -> HashSet<String> {
+    fs::read_to_string("bypass_domains.txt")
+    .unwrap_or_default()
+    .lines()
+    .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+    .map(|l| l.trim().to_lowercase())
+    .collect()
 }
 
 fn print_payload(direction: &str, data: &[u8]) {
@@ -50,6 +65,9 @@ fn print_payload(direction: &str, data: &[u8]) {
 
 #[tokio::main]
 async fn main() {
+    if !menu::run() {
+        return;
+    }
     let config_contents = fs::read_to_string("config.toml")
     .expect("Ошибка: не удалось прочитать config.toml");
     let settings: Config = toml::from_str(&config_contents)
@@ -61,27 +79,38 @@ async fn main() {
     let udp_target = settings.udp_target.clone();
     let ranges = settings.ranges.clone();
 
-    println!("--- Net Surgeon (Модифицированный дебаг-режим) запущен ---");
+    let bypass_domains = Arc::new(load_bypass_domains());
+
+    println!("--- Net Surgeon запущен ---");
     println!("TCP порт (HTTP/HTTPS): {}", listen_address);
     println!("UDP порт: {}", udp_address);
     println!("UDP Upstream: {}", udp_target);
+    println!("Доменов в bypass-листе: {}", bypass_domains.len());
 
-    let tcp_task = tokio::spawn(async move {
-        run_tcp_proxy(listen_address, ranges, is_enabled).await;
-    });
+    let tcp_task = {
+        let bypass = Arc::clone(&bypass_domains);
+        tokio::spawn(async move {
+            run_tcp_proxy(listen_address, ranges, is_enabled, bypass).await;
+        })
+    };
 
     let udp_task = tokio::spawn(async move {
         run_udp_proxy(udp_address, udp_target, settings.ranges.clone()).await;
     });
 
     let quic_task = tokio::spawn(async move {
-        quic::run_quic_proxy(8443, "youtube.com:443".to_string()).await;
+        quic::run_udp_quic_proxy(8443, "172.217.16.206:443".to_string()).await;
     });
 
     let _ = tokio::join!(tcp_task, udp_task, quic_task);
 }
 
-async fn run_tcp_proxy(listen_address: String, ranges: Ranges, is_enabled: bool) {
+async fn run_tcp_proxy(
+    listen_address: String,
+    ranges: Ranges,
+    is_enabled: bool,
+    bypass_domains: Arc<HashSet<String>>,
+) {
     let listener = TcpListener::bind(&listen_address).await
     .expect("Ошибка: не удалось занять TCP порт");
 
@@ -90,8 +119,9 @@ async fn run_tcp_proxy(listen_address: String, ranges: Ranges, is_enabled: bool)
             Ok((client_stream, addr)) => {
                 println!("[TCP] [+] Подключение от: {}", addr);
                 let ranges_clone = ranges.clone();
+                let bypass_clone = Arc::clone(&bypass_domains);
                 tokio::spawn(async move {
-                    handle_connection(client_stream, ranges_clone, is_enabled).await;
+                    handle_connection(client_stream, ranges_clone, is_enabled, bypass_clone).await;
                 });
             }
             Err(e) => println!("[-] Ошибка TCP: {}", e),
@@ -126,15 +156,16 @@ async fn run_udp_proxy(listen_address: String, udp_target: String, ranges: Range
                         let mut resp_buf = [0u8; 65535];
                         if let Ok(Ok((resp_len, _))) = tokio::time::timeout(
                             Duration::from_secs(4),
-                                                                            upstream_socket.recv_from(&mut resp_buf)
+                                                                            upstream_socket.recv_from(&mut resp_buf),
                         ).await {
                             let udp_jitter = {
                                 let mut rng = rand::rng();
-                                rng.random_range(ranges_clone.udp_jitter_min_ms..=ranges_clone.udp_jitter_max_ms)
+                                rng.random_range(
+                                    ranges_clone.udp_jitter_min_ms..=ranges_clone.udp_jitter_max_ms,
+                                )
                             };
                             println!("[UDP <= Server] Задержка джиттера: {} мс", udp_jitter);
                             tokio::time::sleep(Duration::from_millis(udp_jitter)).await;
-
                             let _ = main_socket.send_to(&resp_buf[..resp_len], client_addr).await;
                         }
                     }
@@ -145,10 +176,16 @@ async fn run_udp_proxy(listen_address: String, udp_target: String, ranges: Range
     }
 }
 
-async fn handle_connection(mut client_stream: TcpStream, ranges: Ranges, is_enabled: bool) {
+#[allow(unused_assignments)]
+async fn handle_connection(
+    mut client_stream: TcpStream,
+    ranges: Ranges,
+    is_enabled: bool,
+    bypass_domains: Arc<HashSet<String>>,
+) {
     let mut buffer = [0u8; 8192];
     let mut total_read = 0;
-    let mut header_end_idx = None;
+    let mut header_end_idx: Option<usize> = None;
 
     loop {
         match client_stream.read(&mut buffer[total_read..]).await {
@@ -156,12 +193,10 @@ async fn handle_connection(mut client_stream: TcpStream, ranges: Ranges, is_enab
             Ok(n) => {
                 total_read += n;
                 let current_slice = &buffer[..total_read];
-
                 if let Some(pos) = current_slice.windows(4).position(|w| w == b"\r\n\r\n") {
                     header_end_idx = Some(pos + 4);
                     break;
                 }
-
                 if total_read >= buffer.len() {
                     return;
                 }
@@ -182,9 +217,9 @@ async fn handle_connection(mut client_stream: TcpStream, ranges: Ranges, is_enab
 
     if request.starts_with("CONNECT") {
         let initial_payload = buffer[end_idx..total_read].to_vec();
-        handle_connect(client_stream, &request, initial_payload, ranges, is_enabled).await;
+        handle_connect(client_stream, &request, initial_payload, ranges, is_enabled, bypass_domains).await;
     } else {
-        handle_http(client_stream, &request, &buffer[..total_read], ranges, is_enabled).await;
+        handle_http(client_stream, &request, &buffer[..total_read], ranges, is_enabled, bypass_domains).await;
     }
 }
 
@@ -192,8 +227,9 @@ async fn handle_connect(
     client_stream: TcpStream,
     request: &str,
     initial_payload: Vec<u8>,
-    ranges: Ranges,
-    is_enabled: bool
+    _ranges: Ranges,
+    is_enabled: bool,
+    bypass_domains: Arc<HashSet<String>>,
 ) {
     let target = match parse_connect_target(request) {
         Some(t) => t,
@@ -202,10 +238,10 @@ async fn handle_connect(
             return;
         }
     };
-    println!("[HTTPS] Туннель к: {}", target);
 
-    // Выделяем чистый домен без порта для поиска SNI (например, www.youtube.com)
-    let domain_only = target.split(':').next().unwrap_or(&target).to_string();
+    let domain = target.split(':').next().unwrap_or("").to_lowercase();
+    let needs_bypass = is_enabled && bypass_domains.contains(&domain);
+    println!("[HTTPS] Туннель к: {} (bypass: {})", target, needs_bypass);
 
     let server_stream = match TcpStream::connect(&target).await {
         Ok(s) => s,
@@ -216,6 +252,23 @@ async fn handle_connect(
             return;
         }
     };
+
+    // Window clamp — сервер будет слать маленькими кусками, DPI не соберёт поток
+    if needs_bypass {
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            let fd = server_stream.as_raw_fd();
+            let window: u32 = 4;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_WINDOW_CLAMP,
+                &window as *const u32 as *const libc::c_void,
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            );
+        }
+        println!("[🪟 WCLAMP] Window clamp=4 для {}", target);
+    }
 
     let _ = client_stream.set_nodelay(true);
     let _ = server_stream.set_nodelay(true);
@@ -254,30 +307,25 @@ async fn handle_connect(
                 }
             }
 
-            if is_enabled && is_first_packet {
-                println!("[⚡ MICRO-FRAG] Включаем агрессивную микро-фрагментацию TLS ClientHello...");
-
-                let mut offset = 0;
+            if needs_bypass && is_first_packet {
                 let data_len = data.len();
-                let mut chunk_count = 0;
 
-                while offset < data_len {
-                    // Вызываем random_range напрямую, не сохраняя ThreadRng в переменную через .await
-                    let chunk_size = rand::random_range(2..=5).min(data_len - offset);
-                    let chunk = &data[offset..offset + chunk_size];
+                // Split: отправляем первые 6 байт (до SNI), пауза, остаток
+                // DPI видит неполный ClientHello и сбрасывает состояние сессии
+                let split_pos = 6.min(data_len);
 
-                    if server_writer.write_all(chunk).await.is_err() { break; }
-                    let _ = server_writer.flush().await;
+                println!("[⚡ SPLIT] {} байт -> split {}+{}", data_len, split_pos, data_len - split_pos);
 
-                    chunk_count += 1;
-                    offset += chunk_size;
+                if server_writer.write_all(&data[..split_pos]).await.is_err() { break; }
+                let _ = server_writer.flush().await;
 
-                    // Точно так же убираем rng отсюда
-                    let micro_delay = rand::random_range(1..=3);
-                    tokio::time::sleep(Duration::from_millis(micro_delay)).await;
-                }
+                // Пауза между частями — DPI таймаут
+                tokio::time::sleep(Duration::from_millis(3)).await;
 
-                println!("[⚡ MICRO-FRAG] Пакет успешно разбит и отправлен в виде {} микро-чанков!", chunk_count);
+                if server_writer.write_all(&data[split_pos..]).await.is_err() { break; }
+                let _ = server_writer.flush().await;
+
+                println!("[⚡ SPLIT] Готово для {}", domain);
                 is_first_packet = false;
             } else {
                 if server_writer.write_all(data).await.is_err() { break; }
@@ -294,7 +342,6 @@ async fn handle_connect(
                     let data = &buffer[..bytes_read];
                     let msg = format!("[HTTPS <= Server] Получен ответ: {} байт", bytes_read);
                     print_payload(&msg, data);
-
                     if client_writer.write_all(data).await.is_err() { break; }
                 }
                 Err(_) => break,
@@ -314,7 +361,8 @@ async fn handle_http(
     request_str: &str,
     raw_request: &[u8],
     ranges: Ranges,
-    is_enabled: bool
+    is_enabled: bool,
+    bypass_domains: Arc<HashSet<String>>,
 ) {
     let target = match parse_http_target(request_str) {
         Some(t) => t,
@@ -325,6 +373,9 @@ async fn handle_http(
     };
     println!("[HTTP] Запрос к: {}", target);
 
+    let domain = target.split(':').next().unwrap_or("").to_lowercase();
+    let needs_bypass = is_enabled && bypass_domains.contains(&domain);
+
     let mut server_stream = match TcpStream::connect(&target).await {
         Ok(s) => s,
         Err(e) => {
@@ -333,21 +384,13 @@ async fn handle_http(
         }
     };
 
-    if is_enabled {
-        let mut modified_request = request_str.to_string();
+    if needs_bypass {
+        // Для HTTP обхода — только фрагментация запроса, без обфускации Host
+        // (обфускация Host ломает современные серверы с 400 Bad Request)
+        let request_bytes = request_str.as_bytes();
 
-        if modified_request.contains("Host:") {
-            modified_request = modified_request.replace("Host:", "hOsT :");
-            println!("[HTTP ✂️] Обфускация: Host: -> hOsT :");
-        } else if modified_request.contains("host:") {
-            modified_request = modified_request.replace("host:", "hOsT :");
-            println!("[HTTP ✂️] Обфускация: host: -> hOsT :");
-        }
-
-        let modified_bytes = modified_request.as_bytes();
-
-        let min_bound = ranges.frag_min.min(modified_bytes.len());
-        let max_bound = std::cmp::min(ranges.frag_max, modified_bytes.len()).max(min_bound);
+        let min_bound = ranges.frag_min.min(request_bytes.len());
+        let max_bound = std::cmp::min(ranges.frag_max, request_bytes.len()).max(min_bound);
 
         let frag_size = {
             let mut rng = rand::rng();
@@ -358,10 +401,10 @@ async fn handle_http(
             }
         };
 
-        if modified_bytes.len() > frag_size && frag_size > 0 {
-            let (first_chunk, second_chunk) = modified_bytes.split_at(frag_size);
+        if request_bytes.len() > frag_size && frag_size > 0 {
+            let (first_chunk, second_chunk) = request_bytes.split_at(frag_size);
 
-            let msg1 = format!("[HTTP => Server] Чанк 1: {} байт", first_chunk.len());
+            let msg1 = format!("[HTTP => Server] Чанк 1: {} байт (bypass)", first_chunk.len());
             print_payload(&msg1, first_chunk);
             if server_stream.write_all(first_chunk).await.is_err() { return; }
             let _ = server_stream.flush().await;
@@ -370,7 +413,7 @@ async fn handle_http(
                 let mut rng = rand::rng();
                 rng.random_range(ranges.delay_min_ms..=ranges.delay_max_ms)
             };
-            println!("[HTTP => Server] Искусственная пауза: {} мс", random_delay);
+            println!("[HTTP => Server] Пауза: {} мс", random_delay);
             tokio::time::sleep(Duration::from_millis(random_delay)).await;
 
             let msg2 = format!("[HTTP => Server] Чанк 2: {} байт", second_chunk.len());
@@ -378,13 +421,12 @@ async fn handle_http(
             if server_stream.write_all(second_chunk).await.is_err() { return; }
             let _ = server_stream.flush().await;
         } else {
-            let msg = format!("[HTTP => Server] {} байт", modified_bytes.len());
-            print_payload(&msg, modified_bytes);
-            if server_stream.write_all(modified_bytes).await.is_err() { return; }
+            if server_stream.write_all(request_bytes).await.is_err() { return; }
             let _ = server_stream.flush().await;
         }
     } else {
-        let msg = format!("[HTTP => Server] {} байт (без модификаций)", raw_request.len());
+        // Прямая отправка без изменений
+        let msg = format!("[HTTP => Server] {} байт (прямо)", raw_request.len());
         print_payload(&msg, raw_request);
         if server_stream.write_all(raw_request).await.is_err() { return; }
         let _ = server_stream.flush().await;
@@ -450,10 +492,4 @@ fn parse_http_target(request: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn find_sni_index(data: &[u8], target_domain: &str) -> Option<usize> {
-    let target_bytes = target_domain.as_bytes();
-    data.windows(target_bytes.len())
-    .position(|window| window == target_bytes)
 }
