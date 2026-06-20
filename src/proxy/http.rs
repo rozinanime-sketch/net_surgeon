@@ -1,0 +1,85 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::config::Ranges;
+use crate::bypass::{extract_domain, needs_bypass, fragment};
+use crate::cli::{LogSender, log, LogLevel};
+use super::tcp::parse_http_target;
+
+pub async fn handle_http(
+    client_stream: TcpStream,
+    request_str: &str,
+    raw_request: &[u8],
+    ranges: Ranges,
+    is_enabled: bool,
+    bypass_domains: Arc<HashSet<String>>,
+    log_tx: LogSender,
+) {
+    let target = match parse_http_target(request_str) {
+        Some(t) => t,
+        None => {
+            log(&log_tx, LogLevel::Warning, "Не удалось найти Host");
+            return;
+        }
+    };
+
+    let domain = extract_domain(&target);
+    let bypass = needs_bypass(is_enabled, &domain, &bypass_domains);
+
+    let mut server_stream = match TcpStream::connect(&target).await {
+        Ok(s) => s,
+        Err(e) => {
+            log(&log_tx, LogLevel::Error, format!("Ошибка подключения к HTTP {}: {}", target, e));
+            return;
+        }
+    };
+
+    log(&log_tx, LogLevel::Success, format!("HTTP запрос к: {} (bypass: {})", target, bypass));
+
+    if bypass {
+        let request_bytes = request_str.as_bytes();
+        if fragment::fragment_http_request(&mut server_stream, request_bytes, &ranges).await.is_err() {
+            return;
+        }
+    } else {
+        if server_stream.write_all(raw_request).await.is_err() { return; }
+        let _ = server_stream.flush().await;
+    }
+
+    let (mut client_reader, mut client_writer) = client_stream.into_split();
+    let (mut server_reader, mut server_writer) = server_stream.into_split();
+
+    let client_to_server = async move {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match client_reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    if server_writer.write_all(&buffer[..bytes_read]).await.is_err() { break; }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    let server_to_client = async move {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match server_reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    let data = &buffer[..bytes_read];
+                    if client_writer.write_all(data).await.is_err() { break; }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = client_to_server => {},
+        _ = server_to_client => {},
+    }
+}

@@ -1,0 +1,23 @@
+port = 1080
+udp_port = 8081
+udp_target = "8.8.8.8:53"
+socks5_port = 1081
+socks5_udp_port = 1082
+enabled = true
+
+[ranges]
+frag_min = 3
+frag_max = 7
+delay_min_ms = 3
+delay_max_ms = 8
+udp_jitter_min_ms = 5
+udp_jitter_max_ms = 20
+
+[bypass]
+split_pos = 6
+split_delay_ms = 3
+window_clamp = 4
+
+[quic]
+listen_port = 8443
+target = "172.217.16.206:443"
