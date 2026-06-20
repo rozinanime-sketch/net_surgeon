@@ -1,14 +1,1 @@
-[package]
-name = "net_surgeon"
-version = "0.1.0"
-edition = "2024"
 
-[dependencies]
-nfq = "0.2.5"
-quinn = "0.11.9"
-rand = "0.10.1"
-rcgen = "0.14.8"
-rustls = { version = "0.23.40", features = ["ring"] }
-serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.52.3", features = ["full"] }
-toml = "1.1.2"
