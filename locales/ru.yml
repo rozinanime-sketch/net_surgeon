@@ -53,7 +53,7 @@ diagnostics.running: "Тестирую… результат появится в
 diagnostics.result_hint: "Результат смотрите в панели логов."
 diagnostics.back_hint: "n — новый тест    Esc/q — назад"
 startup.proxy_started: "Прокси-задачи запущены в фоне"
-startup.proxy_already: "Прокси уже запущен"
+startup.already_running: "Прокси уже запущен"
 log.tcp_listening: "TCP прокси слушает: %{addr}"
 log.tcp_error: "Ошибка TCP: %{error}"
 log.https_tunnel: "HTTPS туннель: %{target} (bypass: %{bypass})"
