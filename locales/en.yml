@@ -1,5 +1,5 @@
 _version: 1
-app.title: "NET SURGEON v0.2.0"
+app.title: "NET SURGEON v0.1.0"
 menu.panel_title: "Menu"
 menu.status: "Status"
 menu.bypass: "Bypass Settings"
