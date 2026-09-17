@@ -15,4 +15,15 @@ bbc.com
 deepl.com
 linkedin.com
 patreon.com
-
+ytimg.com
+ggpht.com
+youtu.be
+yt3.ggpht.com
+googleusercontent.com
+discord.gg
+discordapp.com
+discordapp.net
+discord.media
+i.ytimg.com
+media.discordapp.net
+cdn.discordapp.com
