@@ -1,7 +1,11 @@
-use crate::metrics::MetricsSnapshot;
-use super::traffic_history::TrafficHistory;
 use std::collections::VecDeque;
 use tokio_util::sync::CancellationToken;
+
+use crate::observability::metrics::MetricsSnapshot;
+
+use crate::observability::logging::{LogEntry, LogLevel, LogPayload};
+use super::screen::Screen;
+use super::traffic_history::TrafficHistory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuItem {
@@ -26,42 +30,10 @@ impl MenuItem {
     ];
 }
 
-#[derive(Debug, Clone)]
-pub enum LogMessage {
-    Plain(String),
-    Translated { key: String, args: Vec<(String, String)> },
-    NestedTranslated { key: String, nested_arg: String, nested_key: String, args: Vec<(String, String)> },
-}
-
-#[derive(Debug, Clone)]
-pub struct LogEntry {
-    pub level: LogLevel,
-    pub time: String,
-    pub message: LogMessage,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel {
-    Info,
-    Success,
-    Warning,
-    Error,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Menu,
     Logs,
-}
-
-#[derive(Debug, Default)]
-pub struct DiagnosticsScreen {
-    /// Буфер ввода домена; None пока не активен ввод
-    pub input_buffer: Option<String>,
-    /// true пока тест выполняется в фоне
-    pub running: bool,
-    /// Последний результат для отображения
-    pub last_result: Option<DiagnosticsDisplay>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,15 +58,6 @@ impl Language {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DiagnosticsDisplay {
-    pub domain: String,
-    pub direct_connect_ok: bool,
-    pub direct_tls_ok: bool,
-    pub bypass_connect_ok: bool,
-    pub bypass_tls_ok: bool,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ProxyStatus {
     pub tcp_running: bool,
@@ -103,108 +66,61 @@ pub struct ProxyStatus {
     pub udp_port: u16,
     pub socks5_running: bool,
     pub socks5_port: u16,
+    pub transparent_running: bool,
+    pub transparent_udp_running: bool,
+    pub transparent_port: u16,
     pub domains_count: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct ConfigField {
-    pub label_key: &'static str,
-    pub toml_path: &'static str,
-    pub value: String,
-}
-
-#[derive(Debug, Default)]
-pub struct ConfigEditor {
-    pub fields: Vec<ConfigField>,
-    pub selected: usize,
-    /// Если Some — поле редактируется прямо сейчас, здесь буфер ввода
-    pub editing_buffer: Option<String>,
-}
-
-impl ConfigEditor {
-    pub fn next(&mut self) {
-        if !self.fields.is_empty() {
-            self.selected = (self.selected + 1) % self.fields.len();
-        }
-    }
-
-    pub fn previous(&mut self) {
-        if !self.fields.is_empty() {
-            self.selected = if self.selected == 0 {
-                self.fields.len() - 1
-            } else {
-                self.selected - 1
-            };
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct DomainsEditor {
-    pub domains: Vec<String>,
-    pub selected: usize,
-    /// Some(buffer) когда вводим новый домен ИЛИ редактируем существующий
-    pub editing_buffer: Option<String>,
-    /// true если редактируем существующий домен (а не добавляем новый)
-    pub is_editing_existing: bool,
-}
-
-impl DomainsEditor {
-    pub fn next(&mut self) {
-        if !self.domains.is_empty() {
-            self.selected = (self.selected + 1) % self.domains.len();
-        }
-    }
-
-    pub fn previous(&mut self) {
-        if !self.domains.is_empty() {
-            self.selected = if self.selected == 0 {
-                self.domains.len() - 1
-            } else {
-                self.selected - 1
-            };
-        }
-    }
-}
-
 pub struct App {
+    /// Единственное поле состояния экрана — заменяет старые 4 отдельных
+    /// Option<T> (overlay/config_editor/domains_editor/diagnostics), проверка
+    /// которых была продублирована в трёх местах старого проекта.
+    pub screen: Screen,
     pub selected: usize,
     pub logs: VecDeque<LogEntry>,
     pub status: ProxyStatus,
     pub should_quit: bool,
     pub proxy_started: bool,
-    pub overlay: Option<String>,
-    pub config_editor: Option<ConfigEditor>,
-    pub domains_editor: Option<DomainsEditor>,
     pub metrics: MetricsSnapshot,
     pub traffic_history: TrafficHistory,
     pub log_scroll: usize,
     pub log_autoscroll: bool,
     pub focus: Focus,
-    pub diagnostics: Option<DiagnosticsScreen>,
     pub language: Language,
     pub proxy_token: Option<CancellationToken>,
+    /// Идёт ли массовый прогон. Нужен, чтобы автозапуск по расписанию
+    /// не стартовал поверх уже идущего — иначе прогоны наложились бы,
+    /// удвоив нагрузку на сеть и исказив результат.
+    pub diagnostics_running: bool,
+    /// Режим только диагностики: слушатели не поднимаются.
+    pub diagnostics_only: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl App {
     pub fn new() -> Self {
         Self {
+            screen: Screen::Main,
             selected: 0,
             logs: VecDeque::with_capacity(200),
             status: ProxyStatus::default(),
             should_quit: false,
             proxy_started: false,
-            overlay: None,
-            config_editor: None,
-            domains_editor: None,
             metrics: MetricsSnapshot::default(),
             traffic_history: TrafficHistory::new(),
             log_scroll: 0,
             log_autoscroll: true,
             focus: Focus::Menu,
-            diagnostics: None,
             language: Language::Ru,
             proxy_token: None,
+            diagnostics_running: false,
+            diagnostics_only: false,
         }
     }
 
@@ -220,20 +136,24 @@ impl App {
         };
     }
 
-    pub fn push_log(&mut self, level: LogLevel, message: impl Into<String>) {
-        let time = chrono::Local::now().format("%H:%M:%S").to_string();
-        if self.logs.len() >= 200 {
-            self.logs.pop_front();
-        }
-        self.logs.push_back(LogEntry { level, time, message: LogMessage::Plain(message.into()) });
+    pub fn push_log_t(&mut self, level: LogLevel, key: impl Into<String>, args: Vec<(String, String)>) {
+        self.push_payload(level, LogPayload::Translated { key: key.into(), args });
     }
 
-    pub fn push_log_t(&mut self, level: LogLevel, key: impl Into<String>, args: Vec<(String, String)>) {
+    /// Показывает переводимую ошибку в панели логов.
+    pub fn push_err(&mut self, err: crate::observability::error::AppError) {
+        self.push_payload(LogLevel::Error, LogPayload::Translated { key: err.key.to_string(), args: err.args });
+    }
+
+    /// Единая точка приёма лога — используется и внутренними push_log*(),
+    /// и напрямую из event loop при разборе сообщений из фонового канала
+    /// (там уже готовый LogPayload, конвертировать между enum'ами не нужно).
+    pub(crate) fn push_payload(&mut self, level: LogLevel, payload: LogPayload) {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
         if self.logs.len() >= 200 {
             self.logs.pop_front();
         }
-        self.logs.push_back(LogEntry { level, time, message: LogMessage::Translated { key: key.into(), args } });
+        self.logs.push_back(LogEntry { level, time, payload });
     }
 
     pub fn scroll_logs_up(&mut self, amount: usize) {
@@ -264,29 +184,5 @@ impl App {
 
     pub fn current(&self) -> MenuItem {
         MenuItem::ALL[self.selected]
-    }
-
-    pub fn push_log_nested_t(
-        &mut self,
-        level: LogLevel,
-        key: impl Into<String>,
-        nested_arg: impl Into<String>,
-        nested_key: impl Into<String>,
-        args: Vec<(String, String)>,
-    ) {
-        let time = chrono::Local::now().format("%H:%M:%S").to_string();
-        if self.logs.len() >= 200 {
-            self.logs.pop_front();
-        }
-        self.logs.push_back(LogEntry {
-            level,
-            time,
-            message: LogMessage::NestedTranslated {
-                key: key.into(),
-                            nested_arg: nested_arg.into(),
-                            nested_key: nested_key.into(),
-                            args,
-            },
-        });
     }
 }

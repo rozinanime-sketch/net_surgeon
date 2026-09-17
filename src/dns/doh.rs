@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::{LogSender, log_t, LogLevel};
-use crate::metrics::Metrics;
+use crate::observability::logging::{LogSender, log_t, LogLevel};
+use crate::observability::metrics::Metrics;
 use super::ip_cache::{IpDomainCache, extract_qname, extract_ips_from_dns_response};
 
 pub async fn run_doh_relay(
@@ -25,17 +25,29 @@ pub async fn run_doh_relay(
     };
     let socket = Arc::new(socket);
 
+    metrics.set_udp_listening(true);
     log_t(&log_tx, LogLevel::Success, "log.doh_listening", vec![
         ("addr", listen_address.clone()),
-          ("provider", doh_provider.clone()),
+        ("provider", doh_provider.clone()),
     ]);
 
-    let client = reqwest::Client::builder()
-    .timeout(Duration::from_secs(5))
-    .build()
-    .expect("Не удалось создать HTTP-клиент для DoH");
+    // Раньше здесь был .expect(): падение сборки HTTP-клиента паниковало внутри
+    // спавнутой задачи, то есть DoH-релей молча умирал, а TUI продолжал показывать
+    // его как работающий.
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log_t(&log_tx, LogLevel::Error, "log.doh_client_error", vec![("error", e.to_string())]);
+            return;
+        }
+    };
 
-    let mut buffer = [0u8; 4096];
+    // 65535, а не 4096: recv_from не сообщает об усечении — лишние байты
+    // просто пропадают, и запрос уходит провайдеру обрезанным.
+    let mut buffer = [0u8; 65535];
     loop {
         tokio::select! {
             _ = token.cancelled() => break,
@@ -52,20 +64,23 @@ pub async fn run_doh_relay(
 
                         tokio::spawn(async move {
                             metrics.add_rx(query.len() as u64);
-
+                            // Индикатор DNS в интерфейсе теперь отражает СВОЙ
+                            // резолв, а не чужой. Раньше его выставляла проба
+                            // простого UDP-релея; тот удалён, и без этой строки
+                            // панель вечно показывала бы OK, ничего не измеряя.
                             match resolve_via_doh(&client, &doh_provider, &query).await {
                                 Ok(response) => {
+                                    metrics.set_dns_ok(true);
                                     metrics.add_tx(response.len() as u64);
-
                                     if let Some(qname) = extract_qname(&query) {
                                         for ip in extract_ips_from_dns_response(&response) {
                                             ip_cache.insert(ip, qname.clone());
                                         }
                                     }
-
                                     let _ = socket.send_to(&response, client_addr).await;
                                 }
                                 Err(e) => {
+                                    metrics.set_dns_ok(false);
                                     log_t(&log_tx, LogLevel::Warning, "log.doh_error", vec![("error", e)]);
                                 }
                             }
@@ -78,23 +93,23 @@ pub async fn run_doh_relay(
             }
         }
     }
+
+    metrics.set_udp_listening(false);
 }
 
 async fn resolve_via_doh(client: &reqwest::Client, provider: &str, dns_query: &[u8]) -> Result<Vec<u8>, String> {
     let response = client
-    .post(provider)
-    .header("content-type", "application/dns-message")
-    .header("accept", "application/dns-message")
-    .body(dns_query.to_vec())
-    .send()
-    .await
-    .map_err(|e| e.to_string())?;
+        .post(provider)
+        .header("content-type", "application/dns-message")
+        .header("accept", "application/dns-message")
+        .body(dns_query.to_vec())
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
 
     if !response.status().is_success() {
         return Err(format!("DoH HTTP status: {}", response.status()));
     }
 
-    response.bytes().await
-    .map(|b| b.to_vec())
-    .map_err(|e| e.to_string())
+    response.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
 }

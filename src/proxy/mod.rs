@@ -1,16 +1,22 @@
+mod adaptive;
 mod tcp;
+mod handshake;
 mod http;
 mod https;
+mod transparent;
+mod transparent_udp;
+// pub, потому что подмодули ходят друг к другу (socks5/udp.rs читает
+// udp::quic_parser) и на них смотрят интеграционные тесты.
+pub mod socks5;
+pub mod udp;
 
 use std::sync::Arc;
 use std::collections::HashSet;
-use std::str;
 use crate::config::Config;
-use crate::udp;
-use crate::socks5;
-use crate::cli::{LogSender, log_t, LogLevel};
-use crate::metrics::Metrics;
+use crate::observability::logging::{LogSender, log_t, LogLevel};
+use crate::observability::metrics::Metrics;
 use crate::dns::ip_cache::IpDomainCache;
+use crate::engine::strategy::StrategyStore;
 use tokio_util::sync::CancellationToken;
 
 pub async fn run_all(
@@ -20,14 +26,20 @@ pub async fn run_all(
     metrics: Arc<Metrics>,
     token: CancellationToken,
     ip_cache: Arc<IpDomainCache>,
+    strategies: Arc<StrategyStore>,
 ) {
-    let listen_address = format!("0.0.0.0:{}", config.port);
-    let udp_address = format!("0.0.0.0:{}", config.udp_port);
-    let socks5_udp_address = format!("0.0.0.0:{}", config.socks5_udp_port);
+    let host = config.listen_host.clone();
+    let listen_address = format!("{}:{}", host, config.port);
+    let udp_address = format!("{}:{}", host, config.udp_port);
+    let socks5_udp_address = format!("{}:{}", host, config.socks5_udp_port);
 
     log_t(&log_tx, LogLevel::Info, "log.proxy_port_tcp", vec![("addr", listen_address.clone())]);
-    log_t(&log_tx, LogLevel::Info, "log.proxy_port_udp", vec![("addr", udp_address.clone()), ("target", config.udp_target.clone())]);
-    log_t(&log_tx, LogLevel::Info, "log.proxy_port_quic", vec![("port", config.quic.listen_port.to_string()), ("target", config.quic.target.clone())]);
+    if config.udp_port > 0 {
+        log_t(&log_tx, LogLevel::Info, "log.proxy_port_doh", vec![
+            ("addr", udp_address.clone()),
+            ("provider", config.doh_provider.clone()),
+        ]);
+    }
     log_t(&log_tx, LogLevel::Info, "log.proxy_port_socks5", vec![("port", config.socks5_port.to_string()), ("udp_port", config.socks5_udp_port.to_string())]);
 
     let tcp_task = {
@@ -37,21 +49,14 @@ pub async fn run_all(
         let metrics = Arc::clone(&metrics);
         let token = token.clone();
         let ip_cache = Arc::clone(&ip_cache);
+        let strategies = Arc::clone(&strategies);
         tokio::spawn(async move {
-            tcp::run_tcp_proxy(
-                listen_address,
-                config.ranges.clone(),
-                               config.enabled,
-                               domains,
-                               config.bypass.clone(),
-                               log_tx,
-                               metrics,
-                               token,
-                               ip_cache,
-            ).await;
+            tcp::run_tcp_proxy(listen_address, config.enabled, domains, config.bypass.clone(), config.strategy_ttl_hours, log_tx, metrics, token, ip_cache, strategies).await;
         })
     };
 
+    // DoH-релей. Выбора режима больше нет: простой форвардер DNS удалён,
+    // так что порт либо занят релеем, либо выключен нулём.
     let udp_task = {
         let config = Arc::clone(&config);
         let log_tx = log_tx.clone();
@@ -59,61 +64,111 @@ pub async fn run_all(
         let token = token.clone();
         let ip_cache = Arc::clone(&ip_cache);
         tokio::spawn(async move {
-            if config.dns_mode == "doh" {
+            if config.udp_port > 0 {
                 crate::dns::doh::run_doh_relay(udp_address, config.doh_provider.clone(), log_tx, metrics, token, ip_cache).await;
-            } else {
-                udp::proxy::run_udp_proxy(udp_address, config.udp_target.clone(), config.ranges.clone(), log_tx, metrics, token).await;
             }
-        })
-    };
-
-    let quic_task = {
-        let config = Arc::clone(&config);
-        let log_tx = log_tx.clone();
-        let metrics = Arc::clone(&metrics);
-        let token = token.clone();
-        tokio::spawn(async move {
-            udp::quic::run_udp_quic_proxy(config.quic.listen_port, config.quic.target.clone(), log_tx, metrics, token).await;
         })
     };
 
     let socks5_task = {
         let config = Arc::clone(&config);
+        let domains = Arc::clone(&domains);
         let log_tx = log_tx.clone();
+        let metrics = Arc::clone(&metrics);
         let token = token.clone();
+        let strategies = Arc::clone(&strategies);
         tokio::spawn(async move {
-            socks5::tcp::run_socks5_server(config.socks5_port, config.socks5_udp_port, log_tx, token).await;
+            socks5::tcp::run_socks5_server(
+                &config.listen_host,
+                config.socks5_port,
+                config.socks5_udp_port,
+                config.enabled,
+                domains,
+                config.bypass.clone(),
+                config.strategy_ttl_hours,
+                log_tx,
+                metrics,
+                token,
+                strategies,
+            ).await;
+        })
+    };
+
+    // Прозрачный режим — только если порт задан: он требует правила iptables,
+    // без которого слушатель просто никого не дождётся.
+    let transparent_task = {
+        let config = Arc::clone(&config);
+        let domains = Arc::clone(&domains);
+        let log_tx = log_tx.clone();
+        let metrics = Arc::clone(&metrics);
+        let token = token.clone();
+        let ip_cache = Arc::clone(&ip_cache);
+        let strategies = Arc::clone(&strategies);
+        tokio::spawn(async move {
+            if config.transparent_port > 0 {
+                transparent::run_transparent_proxy(
+                    &config.listen_host,
+                    config.transparent_port,
+                    config.enabled,
+                    domains,
+                    config.bypass.clone(),
+                    config.strategy_ttl_hours,
+                    log_tx,
+                    metrics,
+                    token,
+                    ip_cache,
+                    strategies,
+                ).await;
+            }
+        })
+    };
+
+    // Тот же порт, что у TCP-части прозрачного режима: протоколы разные,
+    // за порт они не спорят, а конфиг остаётся с одним понятным числом.
+    //
+    // Слушатель поднимается отдельной задачей, потому что требует
+    // CAP_NET_ADMIN и может не стартовать там, где TCP-часть работает.
+    // Его отказ не должен утаскивать за собой остальное.
+    let transparent_udp_task = {
+        let config = Arc::clone(&config);
+        let domains = Arc::clone(&domains);
+        let log_tx = log_tx.clone();
+        let metrics = Arc::clone(&metrics);
+        let token = token.clone();
+        let ip_cache = Arc::clone(&ip_cache);
+        tokio::spawn(async move {
+            if config.transparent_port > 0 {
+                transparent_udp::run_transparent_udp(
+                    &config.listen_host,
+                    config.transparent_port,
+                    config.enabled,
+                    domains,
+                    config.socks5_junk.clone(),
+                    log_tx,
+                    metrics,
+                    token,
+                    ip_cache,
+                ).await;
+            }
         })
     };
 
     let socks5_udp_task = {
+        let config = Arc::clone(&config);
         let log_tx = log_tx.clone();
+        let metrics = Arc::clone(&metrics);
         let token = token.clone();
         tokio::spawn(async move {
-            socks5::udp::run_socks5_udp_processor(&socks5_udp_address, log_tx, token).await;
+            socks5::udp::run_socks5_udp_processor(&socks5_udp_address, config.socks5_junk.clone(), log_tx, metrics, token).await;
         })
     };
 
-    let _ = tokio::join!(tcp_task, udp_task, quic_task, socks5_task, socks5_udp_task);
-}
-
-#[allow(dead_code)]
-pub fn print_payload(direction: &str, data: &[u8]) {
-    println!("{}", direction);
-    if let Ok(text) = str::from_utf8(data) {
-        for line in text.lines().take(4) {
-            if !line.trim().is_empty() {
-                println!("    | {}", line);
-            }
-        }
-    } else {
-        print!("     | [HEX]: ");
-        for byte in data.iter().take(16) {
-            print!("{:02X} ", byte);
-        }
-        if data.len() > 16 {
-            print!("... (+{} байт)", data.len() - 16);
-        }
-        println!();
-    }
+    let _ = tokio::join!(
+        tcp_task,
+        udp_task,
+        socks5_task,
+        socks5_udp_task,
+        transparent_task,
+        transparent_udp_task
+    );
 }
