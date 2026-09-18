@@ -110,6 +110,7 @@ pub fn bootstrap() -> Result<Startup, String> {
     dns::resolver::init(
         config.resolve_via_doh,
         config.doh_provider.clone(),
+        config.doh_bootstrap_ip,
         Arc::clone(&ip_cache),
     );
 

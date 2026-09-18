@@ -8,8 +8,9 @@
 #   ./run.sh off          — аварийно снять перехват и вернуть сеть
 #   ./run.sh status       — показать, есть ли сейчас правила перехвата
 #
-# Перехватывается и TCP/443 (через nat/REDIRECT), и UDP/443 — то есть QUIC —
-# через TPROXY. Второе требует у бинаря CAP_NET_ADMIN; run.sh выдаёт его сам
+# Перехватывается TCP/443 (через nat/REDIRECT), UDP/443 — то есть QUIC —
+# через TPROXY, и UDP/53, то есть DNS: запросы уходят встроенному DoH-релею,
+# и шифрованный DNS получают все приложения сразу, без настройки в каждом. Второе требует у бинаря CAP_NET_ADMIN; run.sh выдаёт его сам
 # после сборки. Если не вышло, QUIC просто пойдёт мимо обхода, а TCP-часть
 # продолжит работать.
 #
@@ -87,9 +88,18 @@ TPROXY_PAT="-j TPROXY --on-port ${PORT}( |\$)"
 MARK_PAT="--dport 443 .*-j MARK --set-xmark ${MARK}/0xffffffff( |\$)"
 RULE_PAT="fwmark ${MARK} lookup ${RT_TABLE}( |\$)"
 
+# Порт DoH-релея берём из конфига, а не хардкодим: релей может быть выключен
+# (udp_port = 0), и тогда заворачивать DNS некуда.
+DNS_PORT="$(sed -nE 's/^[[:space:]]*udp_port[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' config.toml | head -n1)"
+DNS_PORT="${DNS_PORT:-0}"
+DNS_PAT="--dport 53 .*-j REDIRECT --to-ports ${DNS_PORT}( |\$)"
+DOH_PROVIDER="$(sed -nE 's/^[[:space:]]*doh_provider[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' config.toml | head -n1)"
+DOH_BOOTSTRAP="$(sed -nE 's/^[[:space:]]*doh_bootstrap_ip[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' config.toml | head -n1)"
+
 MODE="${1:-transparent}"
 RULE_ADDED=0
 UDP_ADDED=0
+DNS_ADDED=0
 CLEANED=0
 SUDO_KEEPALIVE=""
 
@@ -145,6 +155,43 @@ sweep_rules() {
     done
 
     sweep_udp_rules
+    sweep_dns_rules
+}
+
+# Заворачивает системный DNS на встроенный DoH-релей.
+#
+# Зачем: без этого шифрованный DNS надо включать в каждом приложении по
+# отдельности (в браузере — своя галочка, у остальных её просто нет).
+# Здесь запросы перехватываются у всех сразу и уходят провайдеру по HTTPS.
+#
+# Только UDP: TCP/53 клиенты используют для ответов, не влезающих в датаграмму,
+# а релей слушает UDP. Завернуть TCP было бы хуже, чем не заворачивать, —
+# отвечать на той стороне некому, и запрос завис бы до таймаута.
+#
+# ! -d 127.0.0.0/8 — не трогаем локальные резолверы: systemd-resolved слушает
+# 127.0.0.53, и если завернуть обращения к нему, он окажется не у дел вместе
+# со своим кэшем, /etc/hosts и настройками отдельных интерфейсов. Наружу он
+# ходит уже на настоящий адрес, и вот там правило его и ловит.
+enable_dns() {
+    sudo iptables -t nat -A OUTPUT -p udp --dport 53 ! -d 127.0.0.0/8 \
+        -m owner ! --gid-owner "$GID" -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    return 0
+}
+
+dns_rule_present() {
+    [[ $DNS_PORT -gt 0 ]] || return 1
+    sudo iptables -t nat -S OUTPUT 2>/dev/null | grep -qE -- "$DNS_PAT"
+}
+
+sweep_dns_rules() {
+    [[ $DNS_PORT -gt 0 ]] || return 0
+    local spec
+    while IFS= read -r spec; do
+        [[ -n $spec ]] || continue
+        # shellcheck disable=SC2086
+        sudo iptables -t nat -D OUTPUT ${spec#-A OUTPUT } 2>/dev/null || true
+    done < <(sudo iptables -t nat -S OUTPUT 2>/dev/null | grep -E -- "$DNS_PAT" || true)
+    return 0
 }
 
 # Есть ли хоть что-то от перехвата QUIC: правило TPROXY, метка в OUTPUT
@@ -272,7 +319,7 @@ cleanup() {
     [[ $CLEANED -eq 1 ]] && return 0
     CLEANED=1
 
-    if [[ $RULE_ADDED -eq 1 || $UDP_ADDED -eq 1 ]]; then
+    if [[ $RULE_ADDED -eq 1 || $UDP_ADDED -eq 1 || $DNS_ADDED -eq 1 ]]; then
         echo
         say "Снимаю перехват…"
         sweep_rules
@@ -280,7 +327,7 @@ cleanup() {
         # Проверяем результат, а не надеемся на него: без проверки скрипт
         # печатал «Готово» даже тогда, когда правило осталось на месте,
         # и причину падения сети приходилось искать вручную.
-        if rule_present || udp_rule_present; then
+        if rule_present || udp_rule_present || dns_rule_present; then
             warn "НЕ УДАЛОСЬ снять перехват — интернет останется сломанным."
             warn "Снимите вручную:  ./run.sh off"
             warn "в крайнем случае найдите правила с портом $PORT и удалите их по одному (-D):"
@@ -323,22 +370,23 @@ if [[ $MODE == off || $MODE == --off ]]; then
     say "Нужны права root, чтобы снять перехват."
     sudo -v || die "Без sudo правило не снять."
     sweep_rules
-    if rule_present || udp_rule_present; then
+    if rule_present || udp_rule_present || dns_rule_present; then
         die "Снять не удалось. Найдите правила с портом $PORT (sudo iptables -t nat -S OUTPUT; sudo iptables -t mangle -S) и удалите их по одному через -D. Не используйте -F: это снесёт и правила Docker/VPN."
     fi
-    say "Перехват снят (TCP и QUIC), сеть в обычном режиме."
+    say "Перехват снят (TCP, QUIC и DNS), сеть в обычном режиме."
     exit 0
 fi
 
 if [[ $MODE == status || $MODE == --status ]]; then
     sudo -v || die "Нужны права root, чтобы прочитать таблицу nat."
-    if rule_present || udp_rule_present; then
+    if rule_present || udp_rule_present || dns_rule_present; then
         warn "Перехват на порт $PORT ВКЛЮЧЁН. Действующие правила:"
         sudo iptables -t nat -S OUTPUT 2>/dev/null | grep -E -- "$NAT_PAT" || true
         have_ip6 && { sudo ip6tables -t nat -S OUTPUT 2>/dev/null | grep -E -- "$NAT_PAT" | sed 's/^/[IPv6] /' || true; }
         sudo iptables -t mangle -S PREROUTING 2>/dev/null | grep -E -- "$TPROXY_PAT" || true
         sudo iptables -t mangle -S OUTPUT 2>/dev/null | grep -E -- "$MARK_PAT" || true
         ip rule list 2>/dev/null | grep -E "$RULE_PAT" || true
+        sudo iptables -t nat -S OUTPUT 2>/dev/null | grep -E -- "$DNS_PAT" || true
     else
         say "Перехвата нет, сеть в обычном режиме."
     fi
@@ -447,6 +495,28 @@ else
     sweep_udp_rules
 fi
 
+# Перехват DNS. Включается сам, если релей не выключен в конфиге: тогда
+# шифрованный DNS получают все приложения разом, без настройки в каждом.
+#
+# Неудача здесь не повод ронять режим: без правила DNS просто идёт как шёл,
+# провайдеру видно, какие домены вы спрашиваете, но TCP- и QUIC-обход
+# работают по-прежнему.
+if [[ $DNS_PORT -gt 0 ]]; then
+    say "Включаю перехват DNS: UDP/53 -> 127.0.0.1:$DNS_PORT (провайдер: $DOH_PROVIDER)"
+    if enable_dns; then
+        DNS_ADDED=1
+        if [[ -z $DOH_BOOTSTRAP ]]; then
+            warn "В config.toml не задан doh_bootstrap_ip — релей не сможет узнать"
+            warn "адрес самого провайдера, потому что спросит об этом сам себя."
+            warn "Добавьте строку вида:  doh_bootstrap_ip = \"1.2.3.4\""
+        fi
+    else
+        warn "Не вышло завернуть DNS — запросы пойдут напрямую, как раньше."
+    fi
+else
+    say "Перехват DNS выключен: в config.toml udp_port = 0."
+fi
+
 # Сторож на случай, когда скрипт не выполнит уже ничего: kill -9, OOM,
 # падение ядра. Он живёт от root в СВОЕЙ сессии (setsid), поэтому его не
 # заденет ни закрытие терминала, ни убийство группы процессов, и снимает
@@ -459,6 +529,7 @@ sudo setsid --fork bash -c '
     port=$2
     mark=$3
     table=$4
+    dns_port=$5
     while kill -0 "$parent" 2>/dev/null; do sleep 2; done
 
     # Шаблоны те же, что NAT_PAT и остальные выше: только свои правила.
@@ -485,7 +556,13 @@ sudo setsid --fork bash -c '
         guard=$((guard + 1))
         [ "$guard" -gt 16 ] && break
     done
-' _ "$$" "$PORT" "$MARK" "$RT_TABLE" >/dev/null 2>&1 || true
+
+    [ "$dns_port" -gt 0 ] 2>/dev/null && iptables -t nat -S OUTPUT 2>/dev/null |
+        grep -E -- "--dport 53 .*-j REDIRECT --to-ports $dns_port( |\$)" |
+        while read -r spec; do
+            iptables -t nat -D OUTPUT ${spec#-A OUTPUT } 2>/dev/null || true
+        done
+' _ "$$" "$PORT" "$MARK" "$RT_TABLE" "$DNS_PORT" >/dev/null 2>&1 || true
 
 say "Готово. Приложения настраивать не нужно."
 warn "При выходе перехват снимется автоматически — в том числе если окно закрыть."

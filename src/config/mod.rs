@@ -158,6 +158,19 @@ pub struct Config {
     pub resolve_via_doh: bool,
     #[serde(default = "default_doh_provider")]
     pub doh_provider: String,
+
+    /// IP-адрес самого DoH-провайдера, если его имя нельзя резолвить обычным
+    /// путём.
+    ///
+    /// Нужен ровно в одном случае: когда системный DNS завёрнут на наш же
+    /// релей (`run.sh` умеет перехватывать UDP/53). Тогда, чтобы ответить на
+    /// первый же запрос, релею пришлось бы сначала узнать адрес провайдера —
+    /// у самого себя. Здесь этот круг разрывается: адрес берётся из конфига,
+    /// и резолв имени провайдера не выполняется вообще.
+    ///
+    /// Пустое поле — обычное поведение, имя провайдера резолвится системой.
+    #[serde(default)]
+    pub doh_bootstrap_ip: Option<std::net::IpAddr>,
 }
 
 fn default_listen_host() -> String { "127.0.0.1".to_string() }
@@ -200,4 +213,44 @@ pub fn load_bypass_domains() -> (HashSet<String>, Option<String>) {
         .map(|l| l.trim().to_lowercase())
         .collect();
     (set, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Конфиг, который лежит в репозитории, обязан разбираться этой же
+    /// структурой. Опечатка в нём или забытое поле обнаруживались только
+    /// при запуске — программа падала на старте с сообщением от serde,
+    /// а тесты при этом оставались зелёными.
+    #[test]
+    fn shipped_config_parses() {
+        let text = paths::read_to_string("config.toml").expect("config.toml должен читаться");
+        let config: Config = toml::from_str(&text).expect("config.toml должен разбираться");
+
+        // Заодно проверяем, что значения доезжают, а не подставляются
+        // умолчаниями из-за неверной секции.
+        assert!(config.port > 0);
+        assert!(!config.doh_provider.is_empty());
+    }
+
+    /// Закреплённый адрес провайдера имеет смысл, только если из адреса
+    /// провайдера вообще извлекается имя хоста: `doh_client` молча
+    /// игнорирует `doh_bootstrap_ip`, когда URL разобрать не удалось.
+    /// Тогда перехват DNS замкнулся бы сам на себя, и понять почему —
+    /// по логам невозможно.
+    #[test]
+    fn pinned_provider_address_is_actually_usable() {
+        let text = paths::read_to_string("config.toml").expect("config.toml должен читаться");
+        let config: Config = toml::from_str(&text).expect("config.toml должен разбираться");
+
+        if config.doh_bootstrap_ip.is_some() {
+            assert!(
+                crate::dns::provider_endpoint(&config.doh_provider).is_some(),
+                "задан doh_bootstrap_ip, но из doh_provider ({}) не извлекается хост — \
+                 закреплённый адрес не будет использован",
+                config.doh_provider,
+            );
+        }
+    }
 }

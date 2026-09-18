@@ -137,11 +137,14 @@ fn note_recovered(host: &str) {
 
 /// Инициализация при старте. `None` — резолв через DoH выключен, всё идёт
 /// через системный резолвер.
-pub fn init(enabled: bool, provider: String, ip_cache: Arc<IpDomainCache>) {
+pub fn init(
+    enabled: bool,
+    provider: String,
+    bootstrap: Option<std::net::IpAddr>,
+    ip_cache: Arc<IpDomainCache>,
+) {
     let resolver = if enabled {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
+        super::doh_client(&provider, bootstrap, Duration::from_secs(5))
             .ok()
             .map(|client| Resolver {
                 client,

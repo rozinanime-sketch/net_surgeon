@@ -6,9 +6,11 @@ use crate::observability::logging::{LogSender, log_t, LogLevel};
 use crate::observability::metrics::Metrics;
 use super::ip_cache::{IpDomainCache, extract_qname, extract_ips_from_dns_response};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_doh_relay(
     listen_address: String,
     doh_provider: String,
+    bootstrap: Option<std::net::IpAddr>,
     log_tx: LogSender,
     metrics: Arc<Metrics>,
     token: CancellationToken,
@@ -34,10 +36,7 @@ pub async fn run_doh_relay(
     // Раньше здесь был .expect(): падение сборки HTTP-клиента паниковало внутри
     // спавнутой задачи, то есть DoH-релей молча умирал, а TUI продолжал показывать
     // его как работающий.
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
+    let client = match super::doh_client(&doh_provider, bootstrap, Duration::from_secs(5)) {
         Ok(c) => c,
         Err(e) => {
             log_t(&log_tx, LogLevel::Error, "log.doh_client_error", vec![("error", e.to_string())]);
