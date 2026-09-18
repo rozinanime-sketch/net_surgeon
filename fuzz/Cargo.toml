@@ -1,0 +1,61 @@
+# Отдельный крейт: фаззер собирается только nightly-компилятором (libFuzzer
+# живёт в нём), а основной проект должен оставаться на stable. Поэтому здесь
+# свой `[workspace]` — `cargo build` в корне сюда не заглядывает.
+
+[package]
+name = "net_surgeon-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# default-features = false — интерфейс (ratatui/crossterm) фаззеру не нужен
+# и только удлиняет каждую пересборку.
+[dependencies.net_surgeon]
+path = ".."
+default-features = false
+
+[profile.release]
+debug = true
+
+[[bin]]
+name = "tls_client_hello"
+path = "fuzz_targets/tls_client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_response"
+path = "fuzz_targets/dns_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_header"
+path = "fuzz_targets/quic_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socks5_target"
+path = "fuzz_targets/socks5_target.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_head"
+path = "fuzz_targets/http_head.rs"
+test = false
+doc = false
+bench = false

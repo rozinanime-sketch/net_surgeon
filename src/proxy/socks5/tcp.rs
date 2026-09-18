@@ -95,15 +95,23 @@ async fn handle_socks5(
     // TCP не обязан отдавать сообщение целиком: запрос с длинным доменным
     // именем (до 262 байт) спокойно приходит двумя сегментами, и одиночный
     // read давал обрезанный буфер — разбор падал, и соединение молча умирало.
-    let Some(n) = read_greeting(&mut stream, &mut buf).await else { return };
+    let Some((n, carried)) = read_greeting(&mut stream, &mut buf).await else { return };
     if n < 2 || buf[0] != SOCKS5_VERSION {
         log_t(&log_tx, LogLevel::Warning, "log.socks5_bad_version", vec![]);
         return;
     }
 
+    // Хвост, пришедший в одном сегменте с приветствием, — это уже запрос.
+    // По RFC 1928 клиент обязан дождаться выбора метода, но некоторые шлют
+    // оба сообщения одним пакетом. Раньше этот хвост затирался следующим
+    // чтением, и соединение висело: запроса прокси так и не дожидался,
+    // а клиент — ответа на него. Переносим хвост в начало буфера, дальше
+    // `read_request` дочитывает поверх него.
+    buf.copy_within(n..n + carried, 0);
+
     if stream.write_all(&[SOCKS5_VERSION, NO_AUTH]).await.is_err() { return; }
 
-    let Some(n) = read_request(&mut stream, &mut buf).await else { return };
+    let Some(n) = read_request(&mut stream, &mut buf, carried).await else { return };
     if n < 7 || buf[0] != SOCKS5_VERSION { return; }
 
     let cmd = buf[1];
@@ -122,18 +130,27 @@ async fn handle_socks5(
 }
 
 /// Приветствие RFC 1928: VER(1) NMETHODS(1) METHODS(NMETHODS).
-async fn read_greeting(stream: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
+///
+/// Возвращает длину самого приветствия и сколько байт СЛЕДУЮЩЕГО сообщения
+/// уже лежит в буфере сразу за ним: клиент мог прислать приветствие и запрос
+/// одним сегментом, и эти байты из сети больше не придут.
+async fn read_greeting(stream: &mut TcpStream, buf: &mut [u8]) -> Option<(usize, usize)> {
     let mut have = 0usize;
     loop {
         match stream.read(&mut buf[have..]).await {
             Ok(0) | Err(_) => return None,
             Ok(n) => have += n,
         }
-        if have >= 2 && have >= 2 + buf[1] as usize {
-            return Some(have);
+        if have >= 2 {
+            let greeting_len = 2 + buf[1] as usize;
+            if have >= greeting_len {
+                return Some((greeting_len, have - greeting_len));
+            }
         }
+        // Недостижимо для корректного приветствия: NMETHODS не больше 255,
+        // то есть приветствие не длиннее 257 байт и в буфер всегда влезает.
         if have >= buf.len() {
-            return Some(have);
+            return Some((have, 0));
         }
     }
 }
@@ -143,15 +160,19 @@ async fn read_greeting(stream: &mut TcpStream, buf: &mut [u8]) -> Option<usize> 
 /// Признак «дочитали» — успешный разбор адреса: он знает длины всех вариантов
 /// ATYP. Хвост за адресом (клиент мог сразу дослать ClientHello) остаётся
 /// в буфере и подхватывается по `consumed`.
-async fn read_request(stream: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
-    let mut have = 0usize;
+///
+/// `carried` — сколько байт запроса уже лежит в начале буфера: они пришли
+/// вместе с приветствием. Проверка стоит до чтения, иначе запрос, целиком
+/// уместившийся в тот же сегмент, ждал бы из сети данных, которых не будет.
+async fn read_request(stream: &mut TcpStream, buf: &mut [u8], carried: usize) -> Option<usize> {
+    let mut have = carried;
     loop {
+        if parse_socks5_target(&buf[..have]).is_some() || have >= buf.len() {
+            return Some(have);
+        }
         match stream.read(&mut buf[have..]).await {
             Ok(0) | Err(_) => return None,
             Ok(n) => have += n,
-        }
-        if parse_socks5_target(&buf[..have]).is_some() || have >= buf.len() {
-            return Some(have);
         }
     }
 }

@@ -37,10 +37,18 @@ pub fn extract_ips_from_dns_response(buf: &[u8]) -> Vec<IpAddr> {
     let an = u16::from_be_bytes([buf[6], buf[7]]);
     if qd == 0 { return ips; }
 
+    // Пропускаем ВСЕ секции вопроса, а не одну. Раньше пропускалась ровно
+    // одна, и при QDCOUNT больше единицы второй вопрос разбирался как
+    // ответная запись: у вопроса нет TTL и RDLENGTH, курсор уезжал на восемь
+    // байт вперёд и читал длину из мусора. В кэш «адрес → домен» мог попасть
+    // выдуманный адрес, а по нему решается, обходить ли соединение.
     let mut p = 12usize;
-    if skip_name(buf, &mut p).is_none() { return ips; }
-    if p + 4 > buf.len() { return ips; }
-    p += 4;
+    for _ in 0..qd {
+        if skip_name(buf, &mut p).is_none() { return ips; }
+        // QTYPE(2) + QCLASS(2)
+        if p + 4 > buf.len() { return ips; }
+        p += 4;
+    }
 
     for _ in 0..an {
         if skip_name(buf, &mut p).is_none() { return ips; }
@@ -107,4 +115,63 @@ fn read_name(buf: &[u8], cursor: &mut usize) -> Option<String> {
 
     *cursor = if jumped { original_cursor } else { p };
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Собирает DNS-ответ: `questions` секций вопроса и один A-ответ.
+    fn response(questions: usize, name: &[u8], ip: [u8; 4]) -> Vec<u8> {
+        let mut out = vec![0x00, 0x00, 0x81, 0x80];
+        out.extend_from_slice(&(questions as u16).to_be_bytes()); // QDCOUNT
+        out.extend_from_slice(&[0x00, 0x01]); // ANCOUNT
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NS + AR
+
+        let question = |out: &mut Vec<u8>| {
+            for label in name.split(|b| *b == b'.') {
+                out.push(label.len() as u8);
+                out.extend_from_slice(label);
+            }
+            out.push(0x00);
+            out.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE=A QCLASS=IN
+        };
+        for _ in 0..questions {
+            question(&mut out);
+        }
+
+        out.extend_from_slice(&[0xc0, 0x0c]); // указатель на имя из вопроса
+        out.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // TYPE=A CLASS=IN
+        out.extend_from_slice(&[0x00, 0x00, 0x01, 0x2c]); // TTL
+        out.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
+        out.extend_from_slice(&ip);
+        out
+    }
+
+    #[test]
+    fn reads_the_address_from_an_ordinary_response() {
+        let buf = response(1, b"example.com", [93, 184, 216, 34]);
+        assert_eq!(
+            extract_ips_from_dns_response(&buf),
+            vec![IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34))]
+        );
+    }
+
+    /// При QDCOUNT больше единицы пропускались не все вопросы, и второй
+    /// разбирался как ответная запись: в кэш попадал выдуманный адрес.
+    #[test]
+    fn skips_every_question_section() {
+        let buf = response(2, b"example.com", [93, 184, 216, 34]);
+        assert_eq!(
+            extract_ips_from_dns_response(&buf),
+            vec![IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34))]
+        );
+    }
+
+    #[test]
+    fn truncated_response_yields_nothing() {
+        let buf = response(1, b"example.com", [93, 184, 216, 34]);
+        assert!(extract_ips_from_dns_response(&buf[..buf.len() - 3]).is_empty());
+        assert!(extract_ips_from_dns_response(&buf[..8]).is_empty());
+    }
 }

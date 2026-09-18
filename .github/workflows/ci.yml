@@ -1,0 +1,101 @@
+# Проверки, которые гоняются на каждый push и pull request.
+#
+# Зачем: clippy и тесты легко прогнать руками, но ровно поэтому их и
+# забывают прогнать перед тем, как что-то отправить. CI забывать не умеет.
+#
+# Чего здесь намеренно НЕТ: `cargo fmt --check`. Код отформатирован вручную
+# (выровненные литералы, длинные строки логов), rustfmt это переломает, а
+# гонять его насильно ради единообразия смысла нет — компилятору всё равно.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Раз в неделю фаззер работает дольше: на коротких прогонах он успевает
+    # только пощупать поверхность, а редкие пути находит за минуты.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: clippy и тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # -D warnings: любое предупреждение валит сборку. Проект сейчас
+      # полностью чистый, и планка держится только так — иначе
+      # предупреждения копятся, пока их не перестают читать.
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: тесты
+        run: cargo test --all-features
+
+      # Ядро обязано собираться и проходить тесты без интерфейса: так его
+      # собирают под сервер и под Android. Сломать это легко одним `use`,
+      # и локально этого не видно, потому что по умолчанию tui включён.
+      - name: сборка и тесты без интерфейса
+        run: cargo test --no-default-features
+
+  fuzz:
+    name: фаззинг разборщиков
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # libFuzzer живёт только в nightly — сам проект при этом остаётся
+      # на stable, фаззер лежит отдельным крейтом в fuzz/.
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+
+      - name: установить cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: сколько времени давать каждой цели
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "FUZZ_SECONDS=600" >> "$GITHUB_ENV"
+          else
+            echo "FUZZ_SECONDS=60" >> "$GITHUB_ENV"
+          fi
+
+      - name: прогон
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::$target"
+            cargo +nightly fuzz run "$target" -- \
+              -max_total_time="$FUZZ_SECONDS" \
+              -max_len=4096 \
+              -print_final_stats=1
+            echo "::endgroup::"
+          done
+
+      # Упавший вход — это файл с байтами, на которых разборщик сломался.
+      # Без него падение невоспроизводимо, поэтому забираем его из CI.
+      - name: сохранить упавшие входы
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

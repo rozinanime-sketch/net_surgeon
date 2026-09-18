@@ -5,3 +5,4 @@
 //! которой здесь нет.
 
 mod integration;
+mod robustness;
