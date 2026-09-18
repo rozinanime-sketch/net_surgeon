@@ -65,7 +65,15 @@ pub async fn run_all(
         let ip_cache = Arc::clone(&ip_cache);
         tokio::spawn(async move {
             if config.udp_port > 0 {
-                crate::dns::doh::run_doh_relay(udp_address, config.doh_provider.clone(), log_tx, metrics, token, ip_cache).await;
+                crate::dns::doh::run_doh_relay(
+                    udp_address,
+                    config.doh_provider.clone(),
+                    config.doh_bootstrap_ip,
+                    log_tx,
+                    metrics,
+                    token,
+                    ip_cache,
+                ).await;
             }
         })
     };
