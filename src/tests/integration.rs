@@ -412,3 +412,75 @@ async fn socks5_connect_relays_server_greeting_before_client_speaks() {
 
     token.cancel();
 }
+
+/// Приветствие и запрос, пришедшие одним сегментом, не теряются.
+///
+/// RFC 1928 велит клиенту дождаться выбора метода, но некоторые клиенты шлют
+/// оба сообщения сразу. Приветствие дочитывалось «сколько дали», а следующее
+/// чтение начинало писать в тот же буфер с нуля — запрос затирался. Прокси
+/// ждал запрос, которого уже не будет, клиент ждал ответ, и соединение
+/// висело до таймаута.
+#[tokio::test]
+async fn socks5_accepts_greeting_and_request_in_one_segment() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::engine::strategy::StrategyStore;
+    use crate::observability::logging;
+    use crate::observability::metrics::Metrics;
+    use crate::proxy::socks5::tcp::run_socks5_server;
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = upstream.accept().await {
+            let _ = sock.write_all(b"SSH-2.0-test\r\n").await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    let socks_port = {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        probe.local_addr().unwrap().port()
+    };
+
+    let token = CancellationToken::new();
+    let (log_tx, _log_rx) = logging::channel();
+    {
+        let token = token.clone();
+        tokio::spawn(async move {
+            run_socks5_server(
+                "127.0.0.1", socks_port, 0, true, Arc::new(HashSet::new()),
+                test_bypass_params(), 24, log_tx, Metrics::new(), token,
+                Arc::new(StrategyStore::new()),
+            ).await;
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpStream::connect(("127.0.0.1", socks_port)).await.unwrap();
+
+    // Приветствие и CONNECT одним write_all — ядро отдаст их прокси вместе.
+    let mut both = vec![0x05, 0x01, 0x00];
+    both.extend_from_slice(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1]);
+    both.extend_from_slice(&upstream_port.to_be_bytes());
+    client.write_all(&both).await.unwrap();
+
+    let mut greeting = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut greeting))
+        .await
+        .expect("прокси не ответил на приветствие")
+        .unwrap();
+    assert_eq!(greeting, [0x05, 0x00]);
+
+    let mut reply = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut reply))
+        .await
+        .expect("ответа на CONNECT нет: запрос из того же сегмента потерян")
+        .unwrap();
+    assert_eq!(reply[1], 0x00, "CONNECT должен пройти");
+
+    token.cancel();
+}

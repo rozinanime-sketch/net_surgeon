@@ -386,10 +386,19 @@ fi
 build_match
 
 # Порт в конфиге — правим сами, чтобы не заставлять лезть в редактор.
-if grep -qE '^\s*transparent_port\s*=' config.toml; then
-    sed -i -E "s/^(\s*transparent_port\s*=\s*).*/\1$PORT/" config.toml
+# Но config.toml принадлежит пользователю, поэтому: трогаем его только когда
+# значение действительно другое, и вслух говорим, что именно поменяли.
+# Раньше sed отрабатывал каждый запуск молча и заодно срезал комментарий
+# в конце строки, даже если порт и так был нужный.
+if grep -qE '^[[:space:]]*transparent_port[[:space:]]*=' config.toml; then
+    CURRENT_PORT="$(sed -nE 's/^[[:space:]]*transparent_port[[:space:]]*=[[:space:]]*([^#[:space:]]*).*/\1/p' config.toml | head -n1)"
+    if [[ $CURRENT_PORT != "$PORT" ]]; then
+        sed -i -E "s/^([[:space:]]*transparent_port[[:space:]]*=).*/\1 $PORT/" config.toml
+        warn "В config.toml изменён transparent_port: ${CURRENT_PORT:-пусто} -> $PORT"
+    fi
 else
     printf '\ntransparent_port = %s\n' "$PORT" >> config.toml
+    warn "В config.toml добавлена строка transparent_port = $PORT"
 fi
 
 # Правила с прошлого запуска (или от `setup-transparent.sh on`) могли

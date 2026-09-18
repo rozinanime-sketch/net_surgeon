@@ -305,6 +305,15 @@ fn parse_entries(text: &str) -> HashMap<Key, Entry> {
         // Поля появились позже: их отсутствие означает старый формат.
         let confidence = parts.next().and_then(|c| c.trim().parse::<f64>().ok()).unwrap_or(0.0);
         let version = parts.next().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+
+        // Вердикт, снятый другой версией методики, не просто игнорируется при
+        // чтении — он и не загружается. Иначе такие строки жили бы в файле
+        // вечно: `usable` их не признаёт, а `save` честно пишет обратно всё,
+        // что лежит в памяти, и strategies.txt только растёт. Домен всё равно
+        // переизмеряется и записывается заново.
+        if version != crate::engine::diagnostics::DIAGNOSTIC_VERSION {
+            continue;
+        }
         let live_ok = parts.next().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
         let live_fail = parts.next().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
         let class = if has_hello_column {
@@ -477,6 +486,11 @@ impl StrategyStore {
                 && entry.version == crate::engine::diagnostics::DIAGNOSTIC_VERSION
         };
 
+        // Точная запись решает всё: если она протухла, наследовать стратегию
+        // у родителя НЕЛЬЗЯ. Наследование заодно отменяет переизмерение
+        // (см. `adaptive::select`), и поддомен с протухшей записью навсегда
+        // застрял бы на родительской стратегии, ни разу не перепроверившись.
+        // Лучше дефолт на несколько секунд и честная диагностика.
         if let Some(entry) = guard.get(&(key.clone(), class)) {
             return usable(entry).then_some((entry.strategy, MatchKind::Exact));
         }
@@ -486,11 +500,17 @@ impl StrategyStore {
         // отдельно: gateway.discord.gg получал `none` от discord.gg и шёл
         // напрямую, а проверки в бою у `none` нет, так что ошибка жила
         // до конца TTL. Лучше дефолтный обход, чем уверенно выключенный.
+        //
+        // Протухший предок не обрывает подъём: раньше здесь стоял `return`, и
+        // стоило `googlevideo.com` протухнуть, как поддомен получал None, хотя
+        // выше по дереву могла лежать свежая запись. Теперь перебор идёт
+        // дальше, до первого предка, который годится.
         for parent in crate::bypass::parent_domains(&key) {
             if let Some(entry) = guard.get(&(parent.to_string(), class))
                 && entry.strategy != Strategy::None
+                && usable(entry)
             {
-                return usable(entry).then_some((entry.strategy, MatchKind::Inherited));
+                return Some((entry.strategy, MatchKind::Inherited));
             }
         }
 
@@ -1060,6 +1080,62 @@ mod tests {
         assert!(store.claim_auto_diagnosis("example.com", HelloClass::Large, cooldown));
         // Пауза истекла
         assert!(store.claim_auto_diagnosis("example.com", HelloClass::Small, std::time::Duration::ZERO));
+    }
+
+    /// Строка store с заданными доменом, стратегией и возрастом.
+    fn store_line(domain: &str, strategy: Strategy, age_secs: u64, version: u32) -> String {
+        format!(
+            "{}\t{}\t{}\t0.44\t{}\t0\t0\tlarge\n",
+            domain,
+            strategy.as_str(),
+            now_secs() - age_secs,
+            version,
+        )
+    }
+
+    fn store_from(lines: &str) -> StrategyStore {
+        let text = format!(
+            "# format=4 columns=domain,strategy,decided_at,confidence,version,live_ok,live_fail,hello\n{lines}"
+        );
+        let store = StrategyStore::new();
+        *store.inner.write().unwrap() = parse_entries(&text);
+        store
+    }
+
+    /// Протухший предок не должен обрывать подъём по дереву: выше может
+    /// лежать свежая запись, и раньше она не находилась.
+    #[test]
+    fn a_stale_parent_does_not_hide_a_fresh_grandparent() {
+        let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
+        let store = store_from(&format!(
+            "{}{}",
+            store_line("b.example.com", Strategy::SniSplit, 10 * 3600, v),
+            store_line("example.com", Strategy::TlsRecord, 0, v),
+        ));
+
+        assert_eq!(
+            store.lookup_detailed("a.b.example.com", HelloClass::Large, 1),
+            Some((Strategy::TlsRecord, MatchKind::Inherited)),
+        );
+    }
+
+    /// Записи чужой версии методики не доживают до памяти, иначе они навсегда
+    /// оставались бы в файле: пользоваться ими нельзя, а `save` их сохраняет.
+    #[test]
+    fn entries_from_another_methodology_version_are_dropped_on_load() {
+        let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
+        let store = store_from(&format!(
+            "{}{}",
+            store_line("old.example.com", Strategy::SniSplit, 0, v.wrapping_add(1)),
+            store_line("fresh.example.com", Strategy::TlsRecord, 0, v),
+        ));
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.lookup_detailed("fresh.example.com", HelloClass::Large, 24).map(|(s, _)| s),
+            Some(Strategy::TlsRecord),
+        );
+        assert_eq!(store.lookup_detailed("old.example.com", HelloClass::Large, 24), None);
     }
 
     #[test]

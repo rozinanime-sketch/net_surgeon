@@ -95,6 +95,11 @@ struct Session {
     /// убивала бы её посреди просмотра.
     last_seen: Arc<std::sync::Mutex<Instant>>,
     cancel: CancellationToken,
+    /// Начался ли разговор с QUIC Initial. Счётчик QUIC-сессий в интерфейсе
+    /// должен означать одно и то же везде: в SOCKS5-режиме он считает только
+    /// такие сессии, а здесь раньше считал любую UDP-сессию, и одно и то же
+    /// поле показывало разные величины в зависимости от режима.
+    is_quic: bool,
 }
 
 /// Ключ — пара «клиент, назначение»: один клиентский порт разговаривает
@@ -377,8 +382,11 @@ async fn handle_datagram(
             return;
         }
         // Обратный путь умер — сессию открываем заново.
-        table.remove(&key);
-        metrics.quic_session_closed();
+        if let Some(dead) = table.remove(&key)
+            && dead.is_quic
+        {
+            metrics.quic_session_closed();
+        }
     }
 
     // Имя домена в QUIC зашифровано, поэтому решение об обходе
@@ -390,13 +398,16 @@ async fn handle_datagram(
         Some(d) => needs_bypass(is_enabled, d, bypass_domains),
         None => false,
     };
-    let junk_plan = bypass.then(|| (junk.clone(), session::is_quic_initial(&payload)));
+    let is_quic = session::is_quic_initial(&payload);
+    let junk_plan = bypass.then(|| (junk.clone(), is_quic));
 
-    let Some(session) = open_session(client_addr, orig_dst, junk_plan, log_tx, metrics, token).await else {
+    let Some(session) = open_session(client_addr, orig_dst, is_quic, junk_plan, log_tx, metrics, token).await else {
         return;
     };
 
-    metrics.quic_session_opened();
+    if is_quic {
+        metrics.quic_session_opened();
+    }
     log_t(log_tx, LogLevel::Info, "log.tproxy_session", vec![
         ("addr", orig_dst.to_string()),
         ("domain", domain.unwrap_or_else(|| orig_dst.ip().to_string())),
@@ -414,6 +425,7 @@ async fn handle_datagram(
 async fn open_session(
     client_addr: SocketAddr,
     orig_dst: SocketAddr,
+    is_quic: bool,
     junk: Option<(Socks5JunkParams, bool)>,
     log_tx: &LogSender,
     metrics: &Arc<Metrics>,
@@ -491,7 +503,7 @@ async fn open_session(
         },
     );
 
-    Some(Session { sender, last_seen, cancel })
+    Some(Session { sender, last_seen, cancel, is_quic })
 }
 
 async fn return_path(
@@ -549,7 +561,9 @@ fn spawn_gc(
                         let alive = now.duration_since(last) < SESSION_TIMEOUT;
                         if !alive {
                             session.cancel.cancel();
-                            closed += 1;
+                            if session.is_quic {
+                                closed += 1;
+                            }
                         }
                         alive
                     });
