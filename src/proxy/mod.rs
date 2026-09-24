@@ -19,6 +19,18 @@ use crate::dns::ip_cache::IpDomainCache;
 use crate::engine::strategy::StrategyStore;
 use tokio_util::sync::CancellationToken;
 
+/// Сколько ждать от клиента начала разговора: заголовков HTTP-запроса,
+/// приветствия и запроса SOCKS5, первого пакета в прозрачном режиме.
+///
+/// Без предела соединение, которое открыли и замолчали, жило вечно: задача,
+/// сокет и буфер на каждое. Сканер портов, зависшее приложение или просто
+/// много полуоткрытых соединений понемногу выедали дескрипторы, пока прокси
+/// не упирался в `ulimit -n` и не переставал принимать всех остальных.
+///
+/// Только до начала пересылки: дальше молчание нормально (keep-alive,
+/// long polling), и обрывать его нельзя.
+pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub async fn run_all(
     config: Arc<Config>,
     domains: Arc<HashSet<String>>,
@@ -85,6 +97,7 @@ pub async fn run_all(
         let metrics = Arc::clone(&metrics);
         let token = token.clone();
         let strategies = Arc::clone(&strategies);
+        let ip_cache = Arc::clone(&ip_cache);
         tokio::spawn(async move {
             socks5::tcp::run_socks5_server(
                 &config.listen_host,
@@ -98,6 +111,7 @@ pub async fn run_all(
                 metrics,
                 token,
                 strategies,
+                ip_cache,
             ).await;
         })
     };

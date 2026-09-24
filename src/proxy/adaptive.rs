@@ -70,6 +70,9 @@ pub struct Context<'a> {
 /// Стратегия для соединения, которому нужен обход.
 pub fn select(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selected {
     let class = HelloClass::of(hello_len);
+    // Ручная и массовая диагностика мерят пакетом того же размера, что
+    // шлёт браузер: все три боевых пути проходят здесь.
+    diagnostics::note_battle_hello(hello_len);
 
     if let Some((cached, kind)) = ctx.strategies.lookup_detailed(domain, class, ctx.ttl_hours) {
         let key = match kind {
@@ -91,9 +94,14 @@ pub fn select(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selected {
     // Кроме двух TLS-записей: с маленьким ClientHello они как раз и не
     // проходят (ради этого случая размеры и разделены), так что брать их
     // у большого пакета значит заведомо повесить соединение.
+    //
+    // И кроме отказа: «ничего не помогло» снято с большим пакетом и о
+    // маленьком ничего не говорит, а одолжить его значит отправить маленький
+    // ClientHello вовсе без обхода, хотя его ещё никто не мерил.
     if class == HelloClass::Small
         && let Some((other, _)) = ctx.strategies.lookup_detailed(domain, HelloClass::Large, ctx.ttl_hours)
         && other != Strategy::TlsRecord
+        && !ctx.strategies.is_resigned(domain, HelloClass::Large, ctx.ttl_hours)
     {
         log_nested_t(ctx.log_tx, LogLevel::Info, "log.strategy_other_size", "strategy", other.label_key(), vec![
             ("domain", domain.to_string()),
@@ -122,10 +130,10 @@ fn unmeasured_default(class: HelloClass) -> Strategy {
 
 /// Отмечает исход соединения и, если запись сброшена, сохраняет это на диск.
 pub fn record_outcome(ctx: &Context<'_>, domain: &str, selected: Selected, responded: bool) {
+    // Стратегия `None` из собственной записи домена тоже проверяется: это
+    // вердикт «прямое соединение работает», и он может оказаться ошибочным.
+    // Отказ («ничего не помогло») хранилище само не засчитывает.
     let Some(class) = selected.source else { return };
-    if selected.strategy == Strategy::None {
-        return;
-    }
     if !ctx.strategies.record_outcome(domain, class, responded) {
         return;
     }
@@ -187,10 +195,26 @@ fn spawn_diagnosis(ctx: &Context<'_>, domain: &str, class: HelloClass, hello_len
                 .await;
             }
             None => {
-                log_t(&log_tx, LogLevel::Warning, "log.auto_diag_nothing", vec![
+                // Запоминаем именно как решение, а не просто пишем в лог.
+                // Иначе следующее же соединение снова возьмёт стратегию по
+                // умолчанию и применит технику, которая только что провалила
+                // все пробы, — а обратной связи по такому выбору нет.
+                let key = if store.record_nothing_worked(&domain, class, &result) {
+                    "log.auto_diag_nothing"
+                } else {
+                    "log.auto_diag_unreachable"
+                };
+                log_t(&log_tx, LogLevel::Warning, key, vec![
                     ("domain", domain.clone()),
                     ("bytes", hello_len.to_string()),
                 ]);
+                let save_log = log_tx.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = store.save() {
+                        log_t(&save_log, LogLevel::Error, "error.strategy_write", vec![("error", e.to_string())]);
+                    }
+                })
+                .await;
             }
         }
     });
@@ -246,6 +270,39 @@ mod tests {
         store.set("updates.discord.com", HelloClass::Large, Strategy::TlsRecord, 0.44);
         let borrowed = select(&ctx, "updates.discord.com", 273);
         assert_eq!((borrowed.strategy, borrowed.source), (Strategy::Oob, None));
+    }
+
+    /// Отказ, снятый с большим пакетом, маленькому не одалживается: иначе
+    /// неизмеренный маленький ClientHello ушёл бы вовсе без обхода.
+    #[tokio::test]
+    async fn small_hello_does_not_borrow_large_resignation() {
+        let (store, params, tx) = ctx_parts();
+        store.set_resigned("stable.dl2.discordapp.net", HelloClass::Large);
+        store.claim_auto_diagnosis("stable.dl2.discordapp.net", HelloClass::Small, AUTO_DIAGNOSIS_COOLDOWN);
+
+        let ctx = Context { strategies: &store, bypass_params: &params, ttl_hours: 24, log_tx: &tx };
+        let small = select(&ctx, "stable.dl2.discordapp.net", 274);
+        assert_eq!((small.strategy, small.source), (unmeasured_default(HelloClass::Small), None));
+
+        // Сам большой пакет отказ соблюдает
+        let large = select(&ctx, "stable.dl2.discordapp.net", 1800);
+        assert_eq!((large.strategy, large.source), (Strategy::None, Some(HelloClass::Large)));
+    }
+
+    /// «Прямое соединение работает» проверяется в бою: соединения без
+    /// ответа сбрасывают запись, и домен уходит на переизмерение.
+    #[tokio::test]
+    async fn direct_verdict_is_verified_in_battle() {
+        let (store, params, tx) = ctx_parts();
+        store.set("flaky.example.com", HelloClass::Large, Strategy::None, 1.0);
+        let ctx = Context { strategies: &store, bypass_params: &params, ttl_hours: 24, log_tx: &tx };
+
+        let selected = select(&ctx, "flaky.example.com", 1800);
+        assert_eq!((selected.strategy, selected.source), (Strategy::None, Some(HelloClass::Large)));
+        for _ in 0..3 {
+            record_outcome(&ctx, "flaky.example.com", selected, false);
+        }
+        assert_eq!(store.lookup_detailed("flaky.example.com", HelloClass::Large, 24), None);
     }
 
     #[tokio::test]

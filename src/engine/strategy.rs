@@ -19,6 +19,10 @@
 //! ```
 //! Строки старого формата (три поля) читаются как version = 0 и потому
 //! считаются протухшими — домен просто переизмеряется.
+//!
+//! Вместо стратегии может стоять `resigned` — вывод «ни одна техника не
+//! сработала». Пакет тогда уходит как есть, как и при `none`, но запись
+//! живёт час, а не TTL (см. `RESIGNED_TTL_HOURS`).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -32,7 +36,15 @@ const STORE_PATH: &str = "strategies.txt";
 /// Методика отвечает на «сопоставимы ли измерения», формат — на «как
 /// разобрать строку». Раньше версионировалось только первое, и добавление
 /// нового поля пришлось бы угадывать по числу колонок.
-const STORE_FORMAT: u32 = 4;
+const STORE_FORMAT: u32 = 5;
+
+/// Формат, где вывод «ничего не помогло» писался как `none` с нулевой
+/// уверенностью, а не отдельным словом `resigned`. Колонки те же, что
+/// в текущем; при чтении такие строки переводятся в явный признак.
+const STORE_FORMAT_IMPLICIT_RESIGNED: u32 = 4;
+
+/// Как в файле записывается вывод «ни одна техника не сработала».
+const RESIGNED_STORE_STRING: &str = "resigned";
 
 /// Формат без колонки `hello`: все его записи сняты пробой браузерного
 /// размера и читаются как [`HelloClass::Large`].
@@ -284,11 +296,15 @@ fn parse_entries(text: &str) -> HashMap<Key, Entry> {
     let format = parse_store_format(text);
     if let Some(found) = format
         && found != STORE_FORMAT
+        && found != STORE_FORMAT_IMPLICIT_RESIGNED
         && found != STORE_FORMAT_WITHOUT_HELLO
     {
         return HashMap::new();
     }
-    let has_hello_column = format == Some(STORE_FORMAT);
+    let has_hello_column = matches!(format, Some(STORE_FORMAT | STORE_FORMAT_IMPLICIT_RESIGNED));
+    // В файлах до пятого формата признак отказа выражался нулевой уверенностью
+    // у `none`. Прямой успех всегда писался с 1.0, так что перевод однозначен.
+    let implicit_resigned = format != Some(STORE_FORMAT);
 
     let mut map = HashMap::new();
     for line in text.lines() {
@@ -299,11 +315,16 @@ fn parse_entries(text: &str) -> HashMap<Key, Entry> {
         let (Some(domain), Some(strategy), Some(ts)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
-        let (Some(strategy), Ok(decided_at)) = (Strategy::parse(strategy.trim()), ts.trim().parse::<u64>()) else {
+        let strategy = strategy.trim();
+        let explicit_resigned = strategy == RESIGNED_STORE_STRING;
+        let strategy = if explicit_resigned { Some(Strategy::None) } else { Strategy::parse(strategy) };
+        let (Some(strategy), Ok(decided_at)) = (strategy, ts.trim().parse::<u64>()) else {
             continue;
         };
         // Поля появились позже: их отсутствие означает старый формат.
         let confidence = parts.next().and_then(|c| c.trim().parse::<f64>().ok()).unwrap_or(0.0);
+        let resigned = explicit_resigned
+            || (implicit_resigned && strategy == Strategy::None && confidence <= f64::EPSILON);
         let version = parts.next().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
 
         // Вердикт, снятый другой версией методики, не просто игнорируется при
@@ -327,6 +348,7 @@ fn parse_entries(text: &str) -> HashMap<Key, Entry> {
 
         map.insert((normalize_domain(domain), class), Entry {
             strategy, decided_at, confidence, version,
+            resigned,
             failures: 0,
             live_ok, live_fail,
         });
@@ -366,6 +388,15 @@ fn now_secs() -> u64 {
 /// закономерность.
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
+/// Сколько часов помнить вывод «ничего не помогло».
+///
+/// Меньше обычного TTL, и намеренно: это не измеренное решение, а признание
+/// поражения. Провайдер мог перенастроить DPI, домен мог переехать — такое
+/// стоит перепроверять скоро. Но не при каждом соединении: диагностика это
+/// десяток проб с паузами, и гонять её на каждый запрос дороже, чем час
+/// походить без обхода.
+const RESIGNED_TTL_HOURS: u64 = 1;
+
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     strategy: Strategy,
@@ -376,6 +407,15 @@ struct Entry {
     /// Версия методики. Записи, снятые другой версией, несопоставимы
     /// с текущей логикой и считаются протухшими.
     version: u32,
+    /// Вывод «ни одна техника не сработала»: пакет уходит как есть, но не
+    /// потому, что прямое соединение работает.
+    ///
+    /// Стратегия у обоих выводов одна — `None`, — а обращаться с ними надо
+    /// по-разному: у отказа короткий TTL, его не проверяют в бою и не
+    /// одалживают маленькому ClientHello. Раньше отказ опознавался по нулевой
+    /// уверенности; такой признак ломается от любой правки формулы
+    /// уверенности и не читается глазами в strategies.txt.
+    resigned: bool,
     /// Неудач подряд при реальном использовании. Обнуляется при успехе.
     failures: u32,
     /// Накопленные исходы применения в бою за всё время жизни записи.
@@ -424,6 +464,8 @@ pub struct StrategyStore {
     /// соединение нельзя — это файл на диске в горячем пути, — поэтому
     /// изменения помечаются, а сбрасывает их по таймеру event loop.
     dirty: std::sync::atomic::AtomicBool,
+    /// Упорядочивает сохранения на диск (см. `save`).
+    save_lock: std::sync::Mutex<()>,
 }
 
 /// Накопленная обратная связь по применению стратегий.
@@ -476,13 +518,15 @@ impl StrategyStore {
         let key = normalize_domain(domain);
         let guard = self.inner.read().unwrap();
         let ttl_secs = ttl_hours.saturating_mul(3600);
+        let resigned_ttl_secs = RESIGNED_TTL_HOURS.saturating_mul(3600).min(ttl_secs);
         let now = now_secs();
 
         // Запись годится, если не протухла по времени И снята текущей
         // версией методики: после смены профиля ClientHello или набора
         // техник прошлые вердикты несопоставимы с новыми.
         let usable = |entry: &Entry| {
-            now.saturating_sub(entry.decided_at) < ttl_secs
+            let ttl = if entry.resigned { resigned_ttl_secs } else { ttl_secs };
+            now.saturating_sub(entry.decided_at) < ttl
                 && entry.version == crate::engine::diagnostics::DIAGNOSTIC_VERSION
         };
 
@@ -498,8 +542,8 @@ impl StrategyStore {
         // «Без обхода» по наследству не передаётся. Поддомен, который сам
         // записан в bypass_domains.txt, живёт на своих адресах и режется
         // отдельно: gateway.discord.gg получал `none` от discord.gg и шёл
-        // напрямую, а проверки в бою у `none` нет, так что ошибка жила
-        // до конца TTL. Лучше дефолтный обход, чем уверенно выключенный.
+        // напрямую, и ошибка жила, пока её не ловила проверка в бою самого
+        // discord.gg. Лучше дефолтный обход, чем уверенно выключенный.
         //
         // Протухший предок не обрывает подъём: раньше здесь стоял `return`, и
         // стоило `googlevideo.com` протухнуть, как поддомен получал None, хотя
@@ -524,7 +568,53 @@ impl StrategyStore {
         self.mark_dirty();
     }
 
+    /// Запоминает вывод «ни одна техника не сработала».
+    ///
+    /// Без этой записи `lookup_detailed` возвращал None, вызывающий код брал
+    /// стратегию по умолчанию — и применял технику, про которую диагностика
+    /// только что выяснила, что она не работает. Хуже того, у такого выбора
+    /// нет `source`, поэтому проверка в бою (три провала — запись долой) к
+    /// нему не применялась: сломанная техника применялась к домену вечно и
+    /// без обратной связи. Именно так ломалась закачка обновлений Discord —
+    /// напрямую файл качался, через обход рвался с битой TLS-записью.
+    pub fn set_resigned(&self, domain: &str, class: HelloClass) {
+        self.insert(domain, class, Strategy::None, 0.0, true);
+    }
+
     pub fn set(&self, domain: &str, class: HelloClass, strategy: Strategy, confidence: f64) {
+        self.insert(domain, class, strategy, confidence, false);
+    }
+
+    /// Итог диагностики, в которой не прошла ни одна техника.
+    ///
+    /// Отказ записывается, только если сервер вообще был досягаем. Если
+    /// прямая проба не открыла даже TCP (`ConnectFailed`), провалились все
+    /// пробы разом — а это сбой сети, DNS или блокировка по IP, и о техниках
+    /// такой прогон ничего не говорит. Записать его как отказ значило бы
+    /// после минутного обрыва связи на час оставить домен без обхода.
+    /// Тогда старая запись просто убирается, как было до появления отказа.
+    ///
+    /// Возвращает true, если записан отказ.
+    pub fn record_nothing_worked(&self, domain: &str, class: HelloClass, result: &DiagnosticResult) -> bool {
+        if result.direct == ProbeOutcome::ConnectFailed {
+            self.remove(domain, class);
+            false
+        } else {
+            self.set_resigned(domain, class);
+            true
+        }
+    }
+
+    /// Есть ли для пары «домен + размер» действующий вывод «ничего не
+    /// помогло». Нужен `adaptive::select`: такой вывод не одалживается
+    /// ClientHello другого размера.
+    pub fn is_resigned(&self, domain: &str, class: HelloClass, ttl_hours: u64) -> bool {
+        let key = (normalize_domain(domain), class);
+        let resigned = self.inner.read().unwrap().get(&key).is_some_and(|e| e.resigned);
+        resigned && self.lookup_detailed(domain, class, ttl_hours).is_some()
+    }
+
+    fn insert(&self, domain: &str, class: HelloClass, strategy: Strategy, confidence: f64, resigned: bool) {
         let key = (normalize_domain(domain), class);
         let mut guard = self.inner.write().unwrap();
 
@@ -533,7 +623,9 @@ impl StrategyStore {
         // повторное подтверждение того же выбора их не обесценивает. При
         // смене техники счётчики обнуляются — они относились бы к другой.
         let (live_ok, live_fail) = match guard.get(&key) {
-            Some(existing) if existing.strategy == strategy => (existing.live_ok, existing.live_fail),
+            Some(existing) if existing.strategy == strategy && existing.resigned == resigned => {
+                (existing.live_ok, existing.live_fail)
+            }
             _ => (0, 0),
         };
 
@@ -542,6 +634,7 @@ impl StrategyStore {
             decided_at: now_secs(),
             confidence,
             version: crate::engine::diagnostics::DIAGNOSTIC_VERSION,
+            resigned,
             failures: 0,
             live_ok,
             live_fail,
@@ -597,6 +690,18 @@ impl StrategyStore {
         let Some(entry) = guard.get_mut(&key) else {
             return false;
         };
+
+        // Отказ не проверяется: что прямое соединение не проходит, он и так
+        // утверждает, и счёт его провалов сбрасывал бы запись через три
+        // соединения вместо часа — с новой диагностикой каждый раз.
+        //
+        // Запись «прямое соединение работает» проверяется наравне с
+        // техниками. Раньше её пропускали, и вердикт, снятый одной удачной
+        // пробой, жил сутки без обратной связи: если DPI пропускал пакеты
+        // через раз, домен до конца TTL ходил без обхода и не открывался.
+        if entry.resigned {
+            return false;
+        }
 
         self.verifications.fetch_add(1, Ordering::Relaxed);
         if !succeeded {
@@ -662,27 +767,46 @@ impl StrategyStore {
     /// Сохраняет весь кэш на диск. Возвращает ошибку строкой — вызывающий код
     /// решает, как её показать.
     pub fn save(&self) -> Result<(), std::io::Error> {
+        use std::sync::atomic::Ordering;
+
+        // Сохранения идут строго по одному. Иначе два параллельных `save()`
+        // (автодиагностика, сброс по таймеру, инвалидация) могли закончиться
+        // так, что последним переименовывался более старый снимок, и на диске
+        // оставалось состояние без свежих изменений.
+        let _serial = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Флаг снимается ДО снимка: изменение, сделанное во время записи,
+        // снова поднимет его и попадёт в следующее сохранение. Раньше флаг
+        // сбрасывался после записи и стирал такую пометку.
+        self.dirty.store(false, Ordering::Relaxed);
+
         let guard = self.inner.read().unwrap();
         let mut lines: Vec<String> = guard
             .iter()
             .map(|((domain, class), e)| format!(
                 "{}\t{}\t{}\t{:.2}\t{}\t{}\t{}\t{}",
-                domain, e.strategy.to_store_string(), e.decided_at,
+                domain,
+                if e.resigned { RESIGNED_STORE_STRING.to_string() } else { e.strategy.to_store_string() },
+                e.decided_at,
                 e.confidence, e.version, e.live_ok, e.live_fail, class.as_str()
             ))
             .collect();
+        // Блокировка не держится на время записи на диск: иначе `set` и
+        // `record_outcome` из обработчиков соединений ждали бы файловую
+        // систему на синхронном замке, занимая рабочие потоки tokio.
+        drop(guard);
         lines.sort();
 
         let header = format!(
             "# format={} columns=domain,strategy,decided_at,confidence,version,live_ok,live_fail,hello\n",
             STORE_FORMAT
         );
-        crate::config::paths::write_atomic(STORE_PATH, &(header + &lines.join("\n") + "\n"))?;
-
-        // Сбрасываем флаг только после успешной записи: иначе накопленные
-        // исходы считались бы сохранёнными, а на диск не попали.
-        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        let written = crate::config::paths::write_atomic(STORE_PATH, &(header + &lines.join("\n") + "\n"));
+        // Запись не удалась — изменения по-прежнему не на диске.
+        if written.is_err() {
+            self.mark_dirty();
+        }
+        written
     }
 
     /// Есть ли несохранённые изменения. Читает `cli`, чтобы сбрасывать
@@ -1095,7 +1219,7 @@ mod tests {
 
     fn store_from(lines: &str) -> StrategyStore {
         let text = format!(
-            "# format=4 columns=domain,strategy,decided_at,confidence,version,live_ok,live_fail,hello\n{lines}"
+            "# format=5 columns=domain,strategy,decided_at,confidence,version,live_ok,live_fail,hello\n{lines}"
         );
         let store = StrategyStore::new();
         *store.inner.write().unwrap() = parse_entries(&text);
@@ -1136,6 +1260,139 @@ mod tests {
             Some(Strategy::TlsRecord),
         );
         assert_eq!(store.lookup_detailed("old.example.com", HelloClass::Large, 24), None);
+    }
+
+    /// Вывод «ничего не помогло» должен возвращаться из хранилища как
+    /// решение. Иначе вызывающий код берёт стратегию по умолчанию и
+    /// применяет технику, которая только что провалила все пробы.
+    #[test]
+    fn resignation_is_remembered_as_a_decision() {
+        let store = StrategyStore::new();
+        store.set_resigned("stable.dl2.discordapp.net", HelloClass::Large);
+
+        assert_eq!(
+            store.lookup_detailed("stable.dl2.discordapp.net", HelloClass::Large, 24),
+            Some((Strategy::None, MatchKind::Exact)),
+        );
+    }
+
+    /// Признание поражения живёт меньше измеренного вердикта: DPI могли
+    /// перенастроить, и проверить это стоит скоро.
+    #[test]
+    fn resignation_expires_sooner_than_a_measured_verdict() {
+        let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
+        let two_hours_ago = now_secs() - 2 * 3600;
+        let store = store_from(&format!(
+            "resigned.example.com\tresigned\t{two_hours_ago}\t0.00\t{v}\t0\t0\tlarge\n\
+             measured.example.com\ttls_record\t{two_hours_ago}\t0.44\t{v}\t0\t0\tlarge\n",
+        ));
+
+        // Настроенный TTL — сутки: измеренная запись двухчасовой давности жива.
+        assert_eq!(
+            store.lookup_detailed("measured.example.com", HelloClass::Large, 24).map(|(s, _)| s),
+            Some(Strategy::TlsRecord),
+        );
+        // А признание поражения уже протухло: ему отведён час.
+        assert_eq!(store.lookup_detailed("resigned.example.com", HelloClass::Large, 24), None);
+    }
+
+    /// «Прямое соединение работает» и «ничего не помогло» — разные выводы с
+    /// одной стратегией. Различает их уверенность, и путать их нельзя:
+    /// у первого полный TTL, у второго час.
+    #[test]
+    fn direct_success_is_not_mistaken_for_resignation() {
+        let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
+        let two_hours_ago = now_secs() - 2 * 3600;
+        let store = store_from(&format!(
+            "direct.example.com\tnone\t{two_hours_ago}\t1.00\t{v}\t0\t0\tlarge\n",
+        ));
+
+        assert_eq!(
+            store.lookup_detailed("direct.example.com", HelloClass::Large, 24).map(|(s, _)| s),
+            Some(Strategy::None),
+            "запись «прямое соединение работает» не должна протухать за час",
+        );
+    }
+
+    /// В файлах четвёртого формата отказ писался как `none` с нулевой
+    /// уверенностью. При чтении он должен стать отказом (час жизни), а не
+    /// «прямое соединение работает» (сутки без обхода).
+    #[test]
+    fn format_4_zero_confidence_none_is_read_as_resignation() {
+        let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
+        let two_hours_ago = now_secs() - 2 * 3600;
+        let text = format!(
+            "# format=4 columns=domain,strategy,decided_at,confidence,version,live_ok,live_fail,hello\n\
+             resigned.example.com\tnone\t{two_hours_ago}\t0.00\t{v}\t0\t0\tlarge\n\
+             direct.example.com\tnone\t{two_hours_ago}\t1.00\t{v}\t0\t0\tlarge\n",
+        );
+        let store = StrategyStore::new();
+        *store.inner.write().unwrap() = parse_entries(&text);
+
+        assert_eq!(store.lookup_detailed("resigned.example.com", HelloClass::Large, 24), None, "отказ живёт час");
+        assert_eq!(
+            store.lookup_detailed("direct.example.com", HelloClass::Large, 24).map(|(s, _)| s),
+            Some(Strategy::None),
+        );
+    }
+
+    /// В пятом формате отказ опознаётся только по слову `resigned`: нулевая
+    /// уверенность у `none` больше ничего не означает.
+    #[test]
+    fn resignation_is_explicit_in_the_current_format() {
+        let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
+        let now = now_secs();
+        let store = store_from(&format!(
+            "a.example.com\tresigned\t{now}\t0.00\t{v}\t0\t0\tlarge\n\
+             b.example.com\tnone\t{now}\t0.00\t{v}\t0\t0\tlarge\n",
+        ));
+        assert!(store.is_resigned("a.example.com", HelloClass::Large, 24));
+        assert!(!store.is_resigned("b.example.com", HelloClass::Large, 24));
+    }
+
+    /// Сервер не открыл даже TCP — это сеть или блокировка по IP, а не вывод
+    /// о техниках. Отказ не записывается, старая запись убирается.
+    #[test]
+    fn unreachable_server_is_not_recorded_as_resignation() {
+        let store = StrategyStore::new();
+        store.set("down.example.com", HelloClass::Large, Strategy::Oob, 0.44);
+
+        let unreachable = result(ProbeOutcome::ConnectFailed, false);
+        assert!(!store.record_nothing_worked("down.example.com", HelloClass::Large, &unreachable));
+        assert_eq!(store.lookup_detailed("down.example.com", HelloClass::Large, 24), None);
+        assert!(!store.is_resigned("down.example.com", HelloClass::Large, 24));
+
+        let blocked = result(ProbeOutcome::SilentDrop, false);
+        assert!(store.record_nothing_worked("down.example.com", HelloClass::Large, &blocked));
+        assert!(store.is_resigned("down.example.com", HelloClass::Large, 24));
+    }
+
+    /// Вердикт «прямое соединение работает» проверяется в бою, как и
+    /// техники: три соединения подряд без ответа — и запись сброшена.
+    #[test]
+    fn direct_verdict_is_invalidated_by_live_failures() {
+        let store = StrategyStore::new();
+        store.set("flaky.example.com", HelloClass::Large, Strategy::None, 1.0);
+
+        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, false));
+        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, false));
+        assert!(store.record_outcome("flaky.example.com", HelloClass::Large, false));
+        assert_eq!(store.lookup_detailed("flaky.example.com", HelloClass::Large, 24), None);
+        assert_eq!(store.verification_stats().invalidations, 1);
+    }
+
+    /// Отказ в бою не проверяется: что напрямую не проходит, он и так
+    /// утверждает. Иначе он сбрасывался бы через три соединения, а не через час.
+    #[test]
+    fn resignation_is_not_invalidated_by_live_failures() {
+        let store = StrategyStore::new();
+        store.set_resigned("hopeless.example.com", HelloClass::Large);
+
+        for _ in 0..10 {
+            assert!(!store.record_outcome("hopeless.example.com", HelloClass::Large, false));
+        }
+        assert!(store.is_resigned("hopeless.example.com", HelloClass::Large, 24));
+        assert_eq!(store.verification_stats().total, 0);
     }
 
     #[test]

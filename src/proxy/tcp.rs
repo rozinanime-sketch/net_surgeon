@@ -85,9 +85,15 @@ async fn handle_connection(
     let mut buffer = [0u8; 8192];
     let mut total_read = 0;
     let mut header_end_idx: Option<usize> = None;
+    // Срок на заголовки целиком, а не на каждый `read`: иначе клиент,
+    // присылающий по байту раз в девять секунд, держал бы соединение вечно.
+    let deadline = tokio::time::Instant::now() + super::HANDSHAKE_TIMEOUT;
 
     loop {
-        match client_stream.read(&mut buffer[total_read..]).await {
+        let Ok(read) = tokio::time::timeout_at(deadline, client_stream.read(&mut buffer[total_read..])).await else {
+            return;
+        };
+        match read {
             Ok(0) => return,
             Ok(n) => {
                 total_read += n;

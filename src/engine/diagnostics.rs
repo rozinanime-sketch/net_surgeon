@@ -14,7 +14,21 @@ pub enum ProbeOutcome {
     ResetOnWrite,
     SilentDrop,
     ResetAfterHello,
+    /// Соединение закрыто штатно (FIN) после ClientHello, без единого байта
+    /// ответа: разговор оборвал сервер или DPI от его имени.
+    ///
+    /// Раньше FIN записывался в «молча дропаются», если пришёл позже 500 мс,
+    /// и в «сброшено», если раньше. Ни то ни другое не правда: пакеты не
+    /// пропадали, и RST не было, — а по отчёту читалась другая блокировка.
+    ClosedAfterHello,
     Success,
+    /// В ответ пришли байты, но не TLS: заглушка, редирект или мусор,
+    /// подставленный по пути. Сервер пробу не получил.
+    ///
+    /// Раньше успехом считался любой байт ответа, и DPI, отвечающий вместо
+    /// сервера, выглядел как «прямое соединение работает» — обход домену
+    /// выключался на сутки.
+    Injected,
     /// Ответ на QUIC Version Negotiation получен: UDP/443 доходит до сервера.
     ///
     /// Отдельно от `Success`, потому что это принципиально более слабое
@@ -35,7 +49,9 @@ impl ProbeOutcome {
             ProbeOutcome::ResetOnWrite => "verdict.reset_on_write",
             ProbeOutcome::SilentDrop => "verdict.silent_drop",
             ProbeOutcome::ResetAfterHello => "verdict.reset_after_hello",
+            ProbeOutcome::ClosedAfterHello => "verdict.closed_after_hello",
             ProbeOutcome::Success => "verdict.success",
+            ProbeOutcome::Injected => "verdict.injected",
             ProbeOutcome::NotApplicable => "verdict.not_applicable",
         }
     }
@@ -96,7 +112,44 @@ pub struct ProbeTiming {
 
 impl Default for ProbeTiming {
     fn default() -> Self {
-        Self { gap_min_ms: 250, gap_max_ms: 700, hello_size: crate::bypass::tls::BROWSER_HELLO_SIZE }
+        Self { gap_min_ms: 250, gap_max_ms: 700, hello_size: browser_hello_size() }
+    }
+}
+
+/// Размер последнего большого ClientHello, прошедшего через прокси в бою.
+/// 0 — такого ещё не было.
+static OBSERVED_BROWSER_HELLO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Больше одной TLS-записи ClientHello не бывает: RFC 8446 ограничивает
+/// запись 16384 байтами нагрузки. Длина приходит от клиента, и проба
+/// такого размера была бы отвергнута сервером как record_overflow.
+const MAX_PROBE_HELLO: usize = 5 + 16384;
+
+/// Запоминает размер ClientHello, увиденного в бою.
+///
+/// Ручная и массовая диагностика мерят пакетом того размера, что реально
+/// шлёт браузер: размер сам по себе меняет вердикт, а с появлением
+/// постквантового key share браузерный ClientHello вырос с ~1500 до ~1900
+/// байт, и любая зашитая константа рано или поздно устареет так же.
+/// Маленькие пакеты (программы, rustls) не учитываются: их мерит
+/// автодиагностика своим размером, по классам.
+pub fn note_battle_hello(len: usize) {
+    if is_browser_sized(len) {
+        OBSERVED_BROWSER_HELLO.store(len, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn is_browser_sized(len: usize) -> bool {
+    use crate::engine::strategy::HelloClass;
+    HelloClass::of(len) == HelloClass::Large && len <= MAX_PROBE_HELLO
+}
+
+/// Размер ClientHello для ручной и массовой диагностики: последний
+/// увиденный в бою, а пока его нет — `BROWSER_HELLO_SIZE`.
+pub fn browser_hello_size() -> usize {
+    match OBSERVED_BROWSER_HELLO.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => crate::bypass::tls::BROWSER_HELLO_SIZE,
+        seen => seen,
     }
 }
 
@@ -140,7 +193,11 @@ const RESPONSE_TIMEOUT_MAX: Duration = Duration::from_secs(3);
 /// и домен переизмеряется. За время работы профиль ClientHello менялся
 /// дважды, и оба раза старые вердикты становились недействительными —
 /// без версии это приходилось замечать вручную.
-pub const DIAGNOSTIC_VERSION: u32 = 2;
+///
+/// 3: успехом пробы считается только ответ, похожий на TLS (см.
+/// `classify_reply`), а не любой байт. Прежние вердикты «прямое соединение
+/// работает» могли быть сняты по заглушке провайдера.
+pub const DIAGNOSTIC_VERSION: u32 = 3;
 
 /// Минимальная нижняя граница Уилсона, при которой техника считается рабочей.
 ///
@@ -220,6 +277,20 @@ pub struct DiagnosticResult {
 
 fn classify_write_error(_e: &std::io::Error) -> ProbeOutcome { ProbeOutcome::ResetOnWrite }
 
+/// Чем был ответ на пробу: сервер ответил по TLS или ответил кто-то другой.
+///
+/// Засчитывается и alert, не только ServerHello: на синтетический ClientHello
+/// сервер вправе ответить отказом (не тот набор шифров, неизвестное имя), и
+/// это всё равно доказывает, что проба до него дошла — а только это
+/// диагностика и выясняет.
+fn classify_reply(reply: &[u8]) -> ProbeOutcome {
+    if crate::bypass::tls::looks_like_tls_reply(reply) {
+        ProbeOutcome::Success
+    } else {
+        ProbeOutcome::Injected
+    }
+}
+
 fn classify_read_error(e: &std::io::Error) -> ProbeOutcome {
     use std::io::ErrorKind::*;
     match e.kind() {
@@ -259,6 +330,15 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
     };
     let connect_rtt = connect_started.elapsed();
 
+    // Как в бою: боевые пути выключают Nagle на соединении с сервером, и
+    // проба обязана делать то же. Иначе вторая часть разрезанного ClientHello
+    // ждала ACK на первую: disorder вырождался в обычный сплит (первая
+    // половина с низким TTL не доходит, ACK нет, вторая стоит до ретрансмита),
+    // а остальные техники уходили с паузой в RTT между частями. Причём только
+    // при пробе короче ~1500 байт — вторая часть длиннее MSS уходит и так.
+    // Проба мерила не то, что прокси потом применяет.
+    let _ = stream.set_nodelay(true);
+
     // Ждём ответа пропорционально измеренному RTT, а не фиксированные 3 с.
     // На заблокированных доменах именно это ожидание и съедало всё время:
     // проба «молчание» всегда стоила полный таймаут.
@@ -285,7 +365,6 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
 
     let (mut reader, mut writer) = stream.into_split();
 
-    let write_started = Instant::now();
     // Каждая стратегия возвращает своё (SplitInfo / число чанков / ()) — здесь важен
     // только факт успеха записи, поэтому приводим всё к io::Result<()>.
     let write_result: std::io::Result<()> = match strategy {
@@ -303,10 +382,8 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
 
     let mut buf = [0u8; 64];
     match tokio::time::timeout(response_timeout, reader.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => ProbeOutcome::Success,
-        Ok(Ok(_)) => {
-            if write_started.elapsed() < Duration::from_millis(500) { ProbeOutcome::ResetAfterHello } else { ProbeOutcome::SilentDrop }
-        }
+        Ok(Ok(n)) if n > 0 => classify_reply(&buf[..n]),
+        Ok(Ok(_)) => ProbeOutcome::ClosedAfterHello,
         Ok(Err(e)) => classify_read_error(&e),
         Err(_) => ProbeOutcome::SilentDrop,
     }
@@ -587,4 +664,69 @@ async fn diagnose_with(
     };
 
     DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn params() -> BypassParams {
+        toml::from_str("split_pos_min = 4\nsplit_pos_max = 12\nsplit_delay_ms = 1\nwindow_clamp = 0\n")
+            .expect("параметры обхода")
+    }
+
+    /// Локальный «сервер»: дочитывает ClientHello и отвечает `reply`
+    /// (пустой ответ — закрыть соединение без единого байта).
+    async fn server(reply: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut hello = vec![0u8; 5];
+            stream.read_exact(&mut hello).await.unwrap();
+            let len = u16::from_be_bytes([hello[3], hello[4]]) as usize;
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).await.unwrap();
+            if !reply.is_empty() {
+                stream.write_all(reply).await.unwrap();
+            }
+            stream.shutdown().await.unwrap();
+        });
+        addr
+    }
+
+    async fn probe(reply: &'static [u8], strategy: FragStrategy) -> ProbeOutcome {
+        let addr = server(reply).await;
+        let hello = crate::bypass::tls::build_client_hello_sized("probe.example", 1850);
+        probe_tcp_inner(&addr, &hello, strategy, &params()).await
+    }
+
+    #[tokio::test]
+    async fn tls_reply_counts_as_success() {
+        assert_eq!(probe(&[0x16, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00], FragStrategy::None).await, ProbeOutcome::Success);
+        assert_eq!(probe(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28], FragStrategy::TlsRecord).await, ProbeOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn block_page_is_not_success() {
+        assert_eq!(
+            probe(b"HTTP/1.1 302 Found\r\nLocation: http://blocked.example\r\n\r\n", FragStrategy::None).await,
+            ProbeOutcome::Injected,
+        );
+    }
+
+    /// FIN без ответа — не «молча дропаются» и не «сброшено»: пакеты
+    /// дошли, RST не было, соединение закрыли.
+    #[tokio::test]
+    async fn fin_without_reply_is_its_own_outcome() {
+        assert_eq!(probe(b"", FragStrategy::SniSplit).await, ProbeOutcome::ClosedAfterHello);
+    }
+
+    #[test]
+    fn only_browser_sized_hellos_calibrate_the_probe() {
+        assert!(is_browser_sized(1889));
+        assert!(!is_browser_sized(273), "маленький пакет мерит автодиагностика по своему классу");
+        assert!(!is_browser_sized(MAX_PROBE_HELLO + 1), "больше одной TLS-записи ClientHello не бывает");
+    }
 }

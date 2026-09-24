@@ -61,6 +61,19 @@ fn find_upwards(start: &Path, name: &str, limit: usize) -> Option<PathBuf> {
 /// Каталог, относительно которого лежат все файлы данных.
 pub fn data_dir() -> &'static Path {
     DATA_DIR.get_or_init(|| {
+        // Тесты не должны трогать настоящие файлы. Каталог ищется от
+        // текущего, а `cargo test` запускается из корня проекта, где лежит
+        // config.toml, — и любой тест, дошедший до `StrategyStore::save()`
+        // (например, через сброс стратегии в `adaptive::record_outcome`),
+        // перезаписывал рабочий strategies.txt содержимым тестового хранилища.
+        #[cfg(test)]
+        {
+            let dir = std::env::temp_dir().join(format!("net_surgeon-test-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            return dir;
+        }
+
+        #[allow(unreachable_code)]
         if let Some(dir) = std::env::var_os("NET_SURGEON_DIR") {
             return PathBuf::from(dir);
         }

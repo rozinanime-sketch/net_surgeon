@@ -189,10 +189,15 @@ async fn handle(
     // Собираем его целиком — SNI может лежать за границей первого сегмента.
     let mut payload: Vec<u8> = Vec::with_capacity(4096);
     {
+        // Молчание клиента не повод держать соединение без пересылки вечно,
+        // но и не повод его рвать: на 443 бывает и протокол, где первым
+        // говорит сервер. По истечении срока соединение просто пересылается
+        // как есть, без стратегии — обходить нечего, ClientHello нет.
         let mut buf = [0u8; 4096];
-        match client.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => payload.extend_from_slice(&buf[..n]),
+        match tokio::time::timeout(super::HANDSHAKE_TIMEOUT, client.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return,
+            Ok(Ok(n)) => payload.extend_from_slice(&buf[..n]),
+            Err(_) => {}
         }
     }
     if super::handshake::complete_client_hello(&mut client, &mut payload).await
@@ -241,7 +246,7 @@ async fn handle(
     let adaptive_ctx = crate::proxy::adaptive::Context {
         strategies, bypass_params, ttl_hours: strategy_ttl_hours, log_tx,
     };
-    let selected = if needs_bypass(is_enabled, &domain, bypass_domains) {
+    let selected = if !payload.is_empty() && needs_bypass(is_enabled, &domain, bypass_domains) {
         crate::proxy::adaptive::select(&adaptive_ctx, &domain, payload.len())
     } else {
         crate::proxy::adaptive::Selected::DIRECT

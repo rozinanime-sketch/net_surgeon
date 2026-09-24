@@ -57,6 +57,19 @@ pub fn record_len(data: &[u8]) -> Option<usize> {
     Some(5 + u16::from_be_bytes([data[3], data[4]]) as usize)
 }
 
+/// Похож ли ответ сервера на TLS: запись рукопожатия (ServerHello) или
+/// alert, с версией 3.x во втором байте.
+///
+/// Нужна, чтобы отличать ответ сервера от ответа, подставленного по пути:
+/// HTTP-заглушка провайдера начинается с `H`, и засчитывать её как успех
+/// нельзя. Одного байта хватает для решения по типу записи — второй может
+/// прийти следующим сегментом, и тогда он просто не проверяется.
+pub fn looks_like_tls_reply(data: &[u8]) -> bool {
+    const HANDSHAKE: u8 = 0x16;
+    const ALERT: u8 = 0x15;
+    matches!(data, [HANDSHAKE | ALERT] | [HANDSHAKE | ALERT, 0x03, ..])
+}
+
 /// Похоже ли начало буфера на TLS handshake. Отличается от [`record_len`]
 /// тем, что отвечает и на неполном заголовке: первого байта достаточно.
 pub fn looks_like_handshake(data: &[u8]) -> bool {
@@ -143,7 +156,7 @@ pub fn find_sni(data: &[u8]) -> Option<SniLocation> {
 ///
 /// Раньше здесь был минимальный вариант: 4 cipher suite, пустой session_id,
 /// две крошечные extensions — итого ~130 байт. Реальный ClientHello от curl
-/// или браузера весит ~1500-1700 байт и содержит ALPN, key_share, длинный
+/// или браузера весит ~1500-1900 байт и содержит ALPN, key_share, длинный
 /// список шифров и групп.
 ///
 /// Разница оказалась решающей: диагностика сообщала «две TLS-записи — 0/2»
@@ -155,8 +168,15 @@ pub fn build_client_hello(sni: &str) -> Vec<u8> {
     build_client_hello_sized(sni, BROWSER_HELLO_SIZE)
 }
 
-/// Размер ClientHello браузера по умолчанию — около 1500 байт.
-pub const BROWSER_HELLO_SIZE: usize = 1500;
+/// Размер ClientHello браузера, пока реальный не наблюдался в бою
+/// (см. `diagnostics::browser_hello_size`).
+///
+/// Было 1500, но браузеры с постквантовым key share (X25519MLKEM768, это
+/// больше килобайта ключа) шлют 1800–1900 байт: в логах прокси 1817–1898.
+/// Проба в 1500 байт мерила не тот пакет: автодиагностика реальным размером
+/// находила для youtube.com две TLS-записи, а ручная и массовая с 1500 —
+/// ничего.
+pub const BROWSER_HELLO_SIZE: usize = 1850;
 
 /// То же, но с заданным итоговым размером.
 ///
@@ -326,6 +346,20 @@ pub fn split_into_two_records(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_reply_is_told_apart_from_an_injected_one() {
+        // ServerHello и alert — ответ сервера
+        assert!(looks_like_tls_reply(&[0x16, 0x03, 0x03, 0x00, 0x7a]));
+        assert!(looks_like_tls_reply(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]));
+        // Первый байт пришёл отдельным сегментом — решаем по типу записи
+        assert!(looks_like_tls_reply(&[0x16]));
+        // Заглушка провайдера, мусор, запись с чужой версией — нет
+        assert!(!looks_like_tls_reply(b"HTTP/1.1 302 Found\r\nLocation: http://warning.rt.ru\r\n"));
+        assert!(!looks_like_tls_reply(&[0x17, 0x03, 0x03]));
+        assert!(!looks_like_tls_reply(&[0x16, 0x48]));
+        assert!(!looks_like_tls_reply(&[]));
+    }
 
     /// Собирает минимальный ClientHello с заданным SNI — та же схема, что
     /// в diagnostics.rs, но локально, чтобы тест не зависел от чужого кода.

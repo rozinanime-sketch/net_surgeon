@@ -119,8 +119,9 @@ where
 
     // TTL возвращаем в любом случае: ретрансмит первой половины должен уйти
     // с нормальным TTL, иначе он тоже не дойдёт и соединение зависнет.
-    socket::set_ttl(fd, original_ttl);
+    let restored = restore_ttl(fd, original_ttl);
     first_result?;
+    restored?;
 
     // Небольшая пауза, чтобы первый сегмент действительно ушёл до второго.
     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -129,6 +130,24 @@ where
     server_writer.flush().await?;
 
     Ok(Some(SplitInfo { first: split_pos, second: data.len() - split_pos }))
+}
+
+/// Возвращает сокету обычный TTL после низкого.
+///
+/// Результат проверяется, а не выбрасывается: если вернуть не удалось, всё
+/// дальнейшее, включая ретрансмит первой половины, уходит с TTL в пару
+/// хопов и до сервера не доходит. Соединение при этом не рвётся, а тихо
+/// виснет — и в бою это выглядит как провал стратегии, а не как сбой.
+/// Честная ошибка закрывает соединение сразу, и клиент переподключается.
+fn restore_ttl(fd: RawFd, ttl: u32) -> std::io::Result<()> {
+    if socket::set_ttl(fd, ttl) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "не удалось вернуть TTL {ttl} после низкого: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
 }
 
 /// Как прошла техника fake — для лога вызывающей стороны.
@@ -213,8 +232,9 @@ where
     // Вернуть TTL раньше — и приманка уйдёт с обычным, дойдёт до сервера
     // и всё сломает вместо того, чтобы обмануть DPI.
     tokio::time::sleep(Duration::from_millis(3)).await;
-    socket::set_ttl(fd, original_ttl);
+    let restored = restore_ttl(fd, original_ttl);
     sent?;
+    restored?;
 
     if !socket::set_tcp_send_seq(fd, saved_seq) {
         // Приманка уже в сети, а откатить нумерацию не вышло. Продолжать

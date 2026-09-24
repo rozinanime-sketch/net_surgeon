@@ -385,6 +385,7 @@ async fn socks5_connect_relays_server_greeting_before_client_speaks() {
                 "127.0.0.1", socks_port, 0, true, Arc::new(HashSet::new()),
                 test_bypass_params(), 24, log_tx, Metrics::new(), token,
                 Arc::new(StrategyStore::new()),
+                Arc::new(crate::dns::ip_cache::IpDomainCache::new()),
             ).await;
         });
     }
@@ -455,6 +456,7 @@ async fn socks5_accepts_greeting_and_request_in_one_segment() {
                 "127.0.0.1", socks_port, 0, true, Arc::new(HashSet::new()),
                 test_bypass_params(), 24, log_tx, Metrics::new(), token,
                 Arc::new(StrategyStore::new()),
+                Arc::new(crate::dns::ip_cache::IpDomainCache::new()),
             ).await;
         });
     }

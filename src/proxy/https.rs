@@ -57,8 +57,13 @@ pub async fn handle_connect(
         }
     };
 
+    // Кэш спрашивается только когда клиент пришёл с голым IP. Если имя
+    // известно, оно и есть истина: на общих адресах CDN за одним IP живут
+    // сотни сайтов, и `some-site.com` получал из кэша `discord.com` — чужую
+    // стратегию, а его провалы засчитывались записи Discord и сбрасывали её.
     if is_enabled
         && !needs
+        && domain.parse::<std::net::IpAddr>().is_ok()
         && let Ok(peer) = server_stream.peer_addr()
         && let Some(cached_domain) = ip_cache.lookup(&peer.ip())
         // Тоже по суффиксу: DoH мог зарезолвить поддомен вроде

@@ -72,6 +72,18 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 /// Тот же приём, что в ip_cache.
 const CACHE_MAX_ENTRIES: usize = 10_000;
 
+/// Сколько считать провайдера недоступным после неудачного запроса.
+///
+/// Неудача не запоминалась, а запросы к одному домену стоят в очереди на
+/// замке (`in_flight`). Когда DoH заблокирован, каждый следующий в очереди
+/// заново ждал полный таймаут клиента: десять параллельных соединений
+/// браузера — и последнее ждало около 50 секунд, прежде чем уйти на
+/// системный резолвер. Отказ транспорта — это отказ провайдера, а не
+/// домена, поэтому пауза общая для всех имён.
+///
+/// Коротко, чтобы разовый сбой не уводил резолв в системный DNS надолго.
+const PROVIDER_BACKOFF: Duration = Duration::from_secs(15);
+
 struct Entry {
     ips: Vec<IpAddr>,
     expires: Instant,
@@ -91,6 +103,8 @@ struct Resolver {
     /// Теперь первый идёт за ответом, остальные ждут на замке и забирают
     /// уже готовую запись из кэша.
     in_flight: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// До какого момента провайдер считается недоступным (см. `PROVIDER_BACKOFF`).
+    down_until: std::sync::Mutex<Option<Instant>>,
     ip_cache: Arc<IpDomainCache>,
 }
 
@@ -151,6 +165,7 @@ pub fn init(
                 provider,
                 forward: RwLock::new(HashMap::new()),
                 in_flight: tokio::sync::Mutex::new(HashMap::new()),
+                down_until: std::sync::Mutex::new(None),
                 ip_cache,
             })
     } else {
@@ -327,6 +342,10 @@ impl Resolver {
             return Err(());
         };
 
+        if self.provider_down() {
+            return Err(());
+        }
+
         // Единственный запрос на домен: остальные ждут здесь.
         let gate = {
             let mut map = self.in_flight.lock().await;
@@ -339,10 +358,26 @@ impl Resolver {
             self.release_gate(host).await;
             return Ok(cached);
         }
+        // А мог и выяснить, что провайдер не отвечает: тогда повторять
+        // его таймаут незачем.
+        if self.provider_down() {
+            self.release_gate(host).await;
+            return Err(());
+        }
 
         let outcome = self.query_provider(query, host).await;
+        self.set_provider_down(outcome.is_err());
         self.release_gate(host).await;
         outcome
+    }
+
+    fn provider_down(&self) -> bool {
+        let guard = self.down_until.lock().unwrap();
+        guard.is_some_and(|until| Instant::now() < until)
+    }
+
+    fn set_provider_down(&self, down: bool) {
+        *self.down_until.lock().unwrap() = down.then(|| Instant::now() + PROVIDER_BACKOFF);
     }
 
     /// Снимает запись о «запрос в полёте», чтобы карта не росла по домену
@@ -478,6 +513,57 @@ mod tests {
         assert_eq!(q[24], 0);
         // QTYPE=A, QCLASS=IN
         assert_eq!(&q[25..29], &[0x00, 0x01, 0x00, 0x01]);
+    }
+
+    /// Провайдер принимает соединение и молчит — так выглядит DoH,
+    /// заблокированный по-тихому. Параллельные запросы одного имени не должны
+    /// ждать его таймаут по очереди: первый упирается в таймаут, остальные
+    /// сразу уходят на системный резолвер.
+    #[tokio::test]
+    async fn silent_provider_is_waited_for_once_not_per_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+
+        let timeout = Duration::from_millis(400);
+        let resolver = Arc::new(Resolver {
+            client: crate::dns::doh_client(&format!("http://{addr}/dns-query"), None, timeout).unwrap(),
+            provider: format!("http://{addr}/dns-query"),
+            forward: RwLock::new(HashMap::new()),
+            in_flight: tokio::sync::Mutex::new(HashMap::new()),
+            down_until: std::sync::Mutex::new(None),
+            ip_cache: Arc::new(IpDomainCache::new()),
+        });
+
+        let started = Instant::now();
+        let lookups: Vec<_> = (0..5)
+            .map(|_| {
+                let r = Arc::clone(&resolver);
+                tokio::spawn(async move { r.lookup("blocked.example").await })
+            })
+            .collect();
+        for l in lookups {
+            assert!(l.await.unwrap().is_err());
+        }
+
+        // Без паузы на провайдера это было бы 5 × 400 мс.
+        assert!(started.elapsed() < timeout * 2, "ждали {:?}", started.elapsed());
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "к молчащему провайдеру должен уйти один запрос");
+
+        // Другое имя тоже не ждёт: отказ транспорта — это отказ провайдера.
+        let other = Instant::now();
+        assert!(resolver.lookup("other.example").await.is_err());
+        assert!(other.elapsed() < timeout / 2);
     }
 
     #[test]

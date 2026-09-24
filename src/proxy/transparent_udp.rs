@@ -198,7 +198,11 @@ fn recv_with_orig_dst(
         iov_len: buf.len(),
     };
     // Места с запасом на одно сообщение IP_ORIGDSTADDR плюс выравнивание.
-    let mut control = [0u8; 128];
+    // Буфер служебных данных обязан быть выровнен как `cmsghdr`: ниже на
+    // заголовок берётся ссылка (`&*cmsg`), а ссылка на невыровненные данные
+    // в Rust — неопределённое поведение, даже там, где x86 это прощает.
+    // Массив u64 даёт нужное выравнивание при том же размере в 128 байт.
+    let mut control = [0u64; 16];
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = &mut src as *mut libc::sockaddr_in as *mut libc::c_void;
@@ -206,7 +210,7 @@ fn recv_with_orig_dst(
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = control.len() as _;
+    msg.msg_controllen = std::mem::size_of_val(&control) as _;
 
     let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
     if n < 0 {

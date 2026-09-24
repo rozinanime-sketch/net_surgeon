@@ -219,13 +219,21 @@ pub fn load_bypass_domains() -> (HashSet<String>, Option<String>) {
 mod tests {
     use super::*;
 
+    /// config.toml из репозитория. Читается по пути крейта, а не через
+    /// каталог данных: в тестах тот указывает во временный каталог, чтобы
+    /// тесты не перезаписывали рабочие файлы.
+    fn shipped_config() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
+        std::fs::read_to_string(path).expect("config.toml должен читаться")
+    }
+
     /// Конфиг, который лежит в репозитории, обязан разбираться этой же
     /// структурой. Опечатка в нём или забытое поле обнаруживались только
     /// при запуске — программа падала на старте с сообщением от serde,
     /// а тесты при этом оставались зелёными.
     #[test]
     fn shipped_config_parses() {
-        let text = paths::read_to_string("config.toml").expect("config.toml должен читаться");
+        let text = shipped_config();
         let config: Config = toml::from_str(&text).expect("config.toml должен разбираться");
 
         // Заодно проверяем, что значения доезжают, а не подставляются
@@ -241,7 +249,7 @@ mod tests {
     /// по логам невозможно.
     #[test]
     fn pinned_provider_address_is_actually_usable() {
-        let text = paths::read_to_string("config.toml").expect("config.toml должен читаться");
+        let text = shipped_config();
         let config: Config = toml::from_str(&text).expect("config.toml должен разбираться");
 
         if config.doh_bootstrap_ip.is_some() {

@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::bypass::{extract_domain, needs_bypass};
+use crate::bypass::{extract_domain, matches_list, needs_bypass};
+use crate::dns::ip_cache::IpDomainCache;
 use crate::observability::logging::{LogSender, log_t, LogLevel};
 use crate::config::BypassParams;
 use crate::observability::metrics::Metrics;
@@ -33,6 +34,7 @@ pub async fn run_socks5_server(
     metrics: Arc<Metrics>,
     token: CancellationToken,
     strategies: Arc<StrategyStore>,
+    ip_cache: Arc<IpDomainCache>,
 ) {
     let addr = format!("{}:{}", listen_host, port);
     let listener = match TcpListener::bind(&addr).await {
@@ -58,9 +60,10 @@ pub async fn run_socks5_server(
                         let bypass_params = bypass_params.clone();
                         let strategies = Arc::clone(&strategies);
                         let metrics = Arc::clone(&metrics);
+                        let ip_cache = Arc::clone(&ip_cache);
                         tokio::spawn(async move {
                             metrics.conn_opened();
-                            handle_socks5(stream, udp_port, is_enabled, bypass_domains, bypass_params, strategy_ttl_hours, log_tx, Arc::clone(&metrics), strategies).await;
+                            handle_socks5(stream, udp_port, is_enabled, bypass_domains, bypass_params, strategy_ttl_hours, log_tx, Arc::clone(&metrics), strategies, ip_cache).await;
                             metrics.conn_closed();
                         });
                     }
@@ -84,6 +87,7 @@ async fn handle_socks5(
     log_tx: LogSender,
     metrics: Arc<Metrics>,
     strategies: Arc<StrategyStore>,
+    ip_cache: Arc<IpDomainCache>,
 ) {
     // 512, а не 256: запрос с ATYP=0x03 это 4 байта заголовка + 1 байт длины
     // + до 255 байт имени + 2 байта порта = 262. В прежний буфер такой запрос
@@ -95,7 +99,11 @@ async fn handle_socks5(
     // TCP не обязан отдавать сообщение целиком: запрос с длинным доменным
     // именем (до 262 байт) спокойно приходит двумя сегментами, и одиночный
     // read давал обрезанный буфер — разбор падал, и соединение молча умирало.
-    let Some((n, carried)) = read_greeting(&mut stream, &mut buf).await else { return };
+    //
+    // Оба шага укладываются в общий срок (см. `HANDSHAKE_TIMEOUT`): иначе
+    // клиент, открывший соединение и замолчавший, держал его вечно.
+    let deadline = tokio::time::Instant::now() + crate::proxy::HANDSHAKE_TIMEOUT;
+    let Ok(Some((n, carried))) = tokio::time::timeout_at(deadline, read_greeting(&mut stream, &mut buf)).await else { return };
     if n < 2 || buf[0] != SOCKS5_VERSION {
         log_t(&log_tx, LogLevel::Warning, "log.socks5_bad_version", vec![]);
         return;
@@ -111,7 +119,7 @@ async fn handle_socks5(
 
     if stream.write_all(&[SOCKS5_VERSION, NO_AUTH]).await.is_err() { return; }
 
-    let Some(n) = read_request(&mut stream, &mut buf, carried).await else { return };
+    let Ok(Some(n)) = tokio::time::timeout_at(deadline, read_request(&mut stream, &mut buf, carried)).await else { return };
     if n < 7 || buf[0] != SOCKS5_VERSION { return; }
 
     let cmd = buf[1];
@@ -121,7 +129,7 @@ async fn handle_socks5(
             handle_udp_associate(&mut stream, udp_port, &log_tx).await;
         }
         0x01 => {
-            handle_connect(&mut stream, &buf[..n], is_enabled, &bypass_domains, &bypass_params, strategy_ttl_hours, &log_tx, &metrics, &strategies).await;
+            handle_connect(&mut stream, &buf[..n], is_enabled, &bypass_domains, &bypass_params, strategy_ttl_hours, &log_tx, &metrics, &strategies, &ip_cache).await;
         }
         _ => {
             log_t(&log_tx, LogLevel::Warning, "log.socks5_unknown_cmd", vec![("cmd", cmd.to_string())]);
@@ -229,6 +237,7 @@ async fn handle_connect(
     log_tx: &LogSender,
     metrics: &Arc<Metrics>,
     strategies: &Arc<StrategyStore>,
+    ip_cache: &IpDomainCache,
 ) {
     let (target, consumed) = match parse_socks5_target(request) {
         Some(v) => v,
@@ -266,7 +275,25 @@ async fn handle_connect(
         server.as_raw_fd()
     };
 
-    let domain = extract_domain(&target);
+    let mut domain = extract_domain(&target);
+
+    // Клиент прислал голый IP (ATYP 0x01/0x04): так делают приложения,
+    // которые резолвят имена сами. Имя восстанавливается по кэшу ответов DoH
+    // так же, как в HTTPS-туннеле и прозрачном режиме, — иначе такие
+    // клиенты не получали обхода вовсе. Только для голого IP: известное имя
+    // кэшем не подменяется (на общих адресах CDN за одним IP много сайтов).
+    if is_enabled
+        && let Ok(ip) = domain.parse::<std::net::IpAddr>()
+        && let Some(cached) = ip_cache.lookup(&ip)
+        && matches_list(&cached, bypass_domains)
+    {
+        log_t(log_tx, LogLevel::Info, "log.bypass_via_ip_cache", vec![
+            ("ip", ip.to_string()),
+            ("domain", cached.clone()),
+        ]);
+        domain = cached;
+    }
+
     let adaptive_ctx = crate::proxy::adaptive::Context {
         strategies, bypass_params, ttl_hours: strategy_ttl_hours, log_tx,
     };

@@ -74,6 +74,18 @@ fn warn_if_fake_unavailable(log_tx: &LogSender) {
     }
 }
 
+/// Сохраняет хранилище стратегий в блокирующем пуле.
+///
+/// Диагностика идёт задачей на рабочем потоке tokio, и синхронная запись
+/// файла занимала бы его вместе со всеми соединениями, которые он
+/// обслуживает. Так же сохраняет `proxy::adaptive`.
+async fn save_store(strategies: &Arc<StrategyStore>) -> std::io::Result<()> {
+    let store = Arc::clone(strategies);
+    tokio::task::spawn_blocking(move || store.save())
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 /// Единый отчёт по результатам диагностики одного домена.
 ///
 /// Раньше одиночная и массовая диагностика логировали по-разному: одиночная
@@ -171,7 +183,7 @@ pub fn run(
                 let timing = crate::engine::diagnostics::ProbeTiming {
                     gap_min_ms: config.probe_gap_min_ms,
                     gap_max_ms: config.probe_gap_max_ms,
-                    hello_size: crate::bypass::tls::BROWSER_HELLO_SIZE,
+                    hello_size: crate::engine::diagnostics::browser_hello_size(),
                 };
                 let result = crate::engine::diagnostics::diagnose(&domain, &config.bypass, timing).await;
 
@@ -189,7 +201,7 @@ pub fn run(
                         // чтобы стратегия попала в strategies.txt, приходилось
                         // гонять весь список целиком.
                         strategies.set(&domain, HelloClass::Large, chosen, strategy::confidence_of(&result, chosen));
-                        if let Err(e) = strategies.save() {
+                        if let Err(e) = save_store(&strategies).await {
                             log::log_t(&log_tx, LogLevel::Error, "error.strategy_write", vec![("error", e.to_string())]);
                         }
 
@@ -198,10 +210,10 @@ pub fn run(
                         ]);
                     }
                     None => {
-                        // Ни одна TCP-техника не прошла — уточняем, почему,
-                        // и убираем протухшую запись, если она была.
-                        strategies.remove(&domain, HelloClass::Large);
-                        if let Err(e) = strategies.save() {
+                        // Ни одна TCP-техника не прошла — запоминаем отказ
+                        // (если сервер был досягаем) и уточняем, почему.
+                        strategies.record_nothing_worked(&domain, HelloClass::Large, &result);
+                        if let Err(e) = save_store(&strategies).await {
                             log::log_t(&log_tx, LogLevel::Error, "error.strategy_write", vec![("error", e.to_string())]);
                         }
 
@@ -313,7 +325,7 @@ pub fn run(
                             let timing = crate::engine::diagnostics::ProbeTiming {
                     gap_min_ms: config.probe_gap_min_ms,
                     gap_max_ms: config.probe_gap_max_ms,
-                    hello_size: crate::bypass::tls::BROWSER_HELLO_SIZE,
+                    hello_size: crate::engine::diagnostics::browser_hello_size(),
                 };
                 let result = crate::engine::diagnostics::diagnose(&domain, &config.bypass, timing).await;
                             (domain, result)
@@ -360,7 +372,7 @@ pub fn run(
                                 let timing = crate::engine::diagnostics::ProbeTiming {
                                     gap_min_ms: config.probe_gap_min_ms,
                                     gap_max_ms: config.probe_gap_max_ms,
-                                    hello_size: crate::bypass::tls::BROWSER_HELLO_SIZE,
+                                    hello_size: crate::engine::diagnostics::browser_hello_size(),
                                 };
                                 let result = crate::engine::diagnostics::diagnose_thorough(&domain, &config.bypass, timing).await;
                                 (domain, result)
@@ -394,10 +406,11 @@ pub fn run(
                                     ]);
                                 }
                                 None => {
-                                    // Убираем старую запись: иначе одна случайная удача
+                                    // Старая запись заменяется отказом (или убирается, если
+                                    // сервер был недосягаем): иначе одна случайная удача
                                     // прошлого прогона живёт до конца TTL и применяется
                                     // в бою, хотя воспроизводимо не работает.
-                                    strategies.remove(&domain, HelloClass::Large);
+                                    strategies.record_nothing_worked(&domain, HelloClass::Large, &result);
                                     log::log_t(&log_tx, LogLevel::Warning, "log.strategy_not_found", vec![("domain", domain.clone())]);
                                     report_diagnostics(&log_tx, &domain, &result);
                                 }
@@ -406,7 +419,7 @@ pub fn run(
                     }
                 }
 
-                match strategies.save() {
+                match save_store(&strategies).await {
                     Ok(()) => {
                         log::log_t(&log_tx, LogLevel::Success, "log.diag_all_done", vec![
                             ("found", found.to_string()),
