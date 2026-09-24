@@ -101,6 +101,7 @@ RULE_ADDED=0
 UDP_ADDED=0
 DNS_ADDED=0
 CLEANED=0
+WATCHDOG_STARTED=0
 SUDO_KEEPALIVE=""
 
 # --- вспомогательное -------------------------------------------------------
@@ -322,6 +323,22 @@ cleanup() {
     if [[ $RULE_ADDED -eq 1 || $UDP_ADDED -eq 1 || $DNS_ADDED -eq 1 ]]; then
         echo
         say "Снимаю перехват…"
+
+        # Без прав root ни снять правила, ни даже прочитать их нельзя: grep
+        # по пустому выводу `sudo iptables -S` ничего не находил, и скрипт
+        # объявлял «Готово», хотя перехват оставался. Так бывает, когда кэш
+        # sudo истёк или терминал уже закрыт и пароль спросить негде.
+        if ! sudo -n true 2>/dev/null && ! { [[ -t 0 ]] && sudo -v; }; then
+            warn "Нет прав sudo — снять перехват отсюда не получилось."
+            if [[ $WATCHDOG_STARTED -eq 1 ]]; then
+                warn "Его снимет сторож в течение пары секунд после выхода."
+            fi
+            warn "Проверить:  ./run.sh status     Снять вручную:  ./run.sh off"
+            warn "Если sudo недоступен совсем — перезагрузитесь: правила не переживают перезагрузку."
+            stop_helpers
+            return 0
+        fi
+
         sweep_rules
 
         # Проверяем результат, а не надеемся на него: без проверки скрипт
@@ -562,7 +579,14 @@ sudo setsid --fork bash -c '
         while read -r spec; do
             iptables -t nat -D OUTPUT ${spec#-A OUTPUT } 2>/dev/null || true
         done
-' _ "$$" "$PORT" "$MARK" "$RT_TABLE" "$DNS_PORT" >/dev/null 2>&1 || true
+' _ "$$" "$PORT" "$MARK" "$RT_TABLE" "$DNS_PORT" >/dev/null 2>&1 && WATCHDOG_STARTED=1
+
+# Раньше провал здесь проглатывался молча, и о том, что страховки от
+# kill -9 и закрытия окна нет, никто не узнавал.
+if [[ $WATCHDOG_STARTED -ne 1 ]]; then
+    warn "Не удалось запустить сторожа (нет setsid?). Перехват снимется при"
+    warn "обычном выходе, но не при kill -9 или падении — тогда ./run.sh off."
+fi
 
 say "Готово. Приложения настраивать не нужно."
 warn "При выходе перехват снимется автоматически — в том числе если окно закрыть."
