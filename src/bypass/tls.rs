@@ -251,9 +251,13 @@ pub fn build_client_hello_sized(sni: &str, target: usize) -> Vec<u8> {
     // psk_key_exchange_modes
     push_ext(&mut ext, 0x002d, &[0x01, 0x01]);
 
-    // key_share: x25519 с 32 случайными байтами
+    // key_share: x25519 с 32 случайными байтами.
+    // Длина списка — 36 (группа 2 + длина 2 + ключ 32), без своих 2 байт.
+    // Здесь стояло 38 (0x26), и строгие серверы отвечали decode_error,
+    // а через разрезанную пробу молчали — диагностика видела блокировку там,
+    // где обход работал.
     let mut ks = Vec::new();
-    ks.extend_from_slice(&[0x00, 0x26, 0x00, 0x1d, 0x00, 0x20]);
+    ks.extend_from_slice(&[0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
     ks.extend_from_slice(&super::random::bytes(32));
     push_ext(&mut ext, 0x0033, &ks);
 
@@ -505,6 +509,38 @@ mod tests {
         assert!(small.len() < 400, "короткий вариант: {} байт", small.len());
         assert!(find_sni(&small).is_some());
         assert!(split_into_two_records(&small).is_some());
+    }
+
+    /// Каждое поле длины в пробе сходится с тем, что за ним лежит.
+    /// Ошибка в одном из них не видна ни DPI, ни `find_sni`, но строгий
+    /// сервер отвечает на такой пакет decode_error.
+    #[test]
+    fn probe_hello_lengths_are_consistent() {
+        let be16 = |b: &[u8], at: usize| u16::from_be_bytes([b[at], b[at + 1]]) as usize;
+        for target in [0, 1500, 1850] {
+            let h = build_client_hello_sized("www.wattpad.com", target);
+            assert_eq!(be16(&h, 3), h.len() - 5, "длина записи");
+            let hs_len = u32::from_be_bytes([0, h[6], h[7], h[8]]) as usize;
+            assert_eq!(hs_len, h.len() - 9, "длина handshake");
+
+            let mut p = 9 + 2 + 32;
+            p += 1 + h[p] as usize; // session_id
+            p += 2 + be16(&h, p); // cipher_suites
+            p += 1 + h[p] as usize; // compression_methods
+            assert_eq!(be16(&h, p), h.len() - p - 2, "длина расширений");
+            p += 2;
+
+            while p < h.len() {
+                let (ty, len) = (be16(&h, p), be16(&h, p + 2));
+                let data = &h[p + 4..p + 4 + len];
+                // У этих расширений внутри ещё один список со своей длиной
+                if matches!(ty, 0x0000 | 0x000a | 0x000d | 0x0010 | 0x0033) {
+                    assert_eq!(be16(data, 0), len - 2, "внутренняя длина расширения {ty:#06x}");
+                }
+                p += 4 + len;
+            }
+            assert_eq!(p, h.len());
+        }
     }
 
     #[test]

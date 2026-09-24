@@ -197,7 +197,15 @@ const RESPONSE_TIMEOUT_MAX: Duration = Duration::from_secs(3);
 /// 3: успехом пробы считается только ответ, похожий на TLS (см.
 /// `classify_reply`), а не любой байт. Прежние вердикты «прямое соединение
 /// работает» могли быть сняты по заглушке провайдера.
-pub const DIAGNOSTIC_VERSION: u32 = 3;
+///
+/// 4: исправлена длина списка в key_share пробного ClientHello. Строгие
+/// серверы отвечали на пробу decode_error, а на разрезанную молчали, и
+/// рабочие техники проваливались — отсюда ложные `resigned`.
+///
+/// 5: каждая проба шлёт свежий ClientHello. DPI помнит пакет, увиденный
+/// прямой пробой, и резал его повторы в любой нарезке — вердикты версии 4
+/// тоже ложные `resigned`.
+pub const DIAGNOSTIC_VERSION: u32 = 5;
 
 /// Минимальная нижняя граница Уилсона, при которой техника считается рабочей.
 ///
@@ -499,7 +507,14 @@ async fn diagnose_with(
     timing: ProbeTiming,
 ) -> DiagnosticResult {
     let target = format!("{}:443", domain);
-    let hello = crate::bypass::tls::build_client_hello_sized(domain, timing.hello_size);
+
+    // ClientHello собирается заново для КАЖДОЙ пробы, со своими random,
+    // session_id и ключом. DPI запоминает ClientHello, который видел целиком
+    // с запрещённым именем, и потом режет те же байты даже разрезанными.
+    // Раньше один пакет уходил сначала прямой пробой, а затем им же
+    // проверялись все техники — и все проваливались: ложный `resigned` там,
+    // где браузер (он шлёт свежий ClientHello на каждое соединение) проходил.
+    let fresh_hello = || crate::bypass::tls::build_client_hello_sized(domain, timing.hello_size);
 
     let empty = SplitScore {
             successes: 0, attempts: 0, confidence: 0.0, median_ms: None };
@@ -507,7 +522,7 @@ async fn diagnose_with(
     // Серия проб одной техники с досрочным прекращением на двух неудачах подряд.
     async fn trials(
         target: &str,
-        hello: &[u8],
+        domain: &str,
         strategy: FragStrategy,
         bypass_params: &BypassParams,
         trials_count: u32,
@@ -530,7 +545,8 @@ async fn diagnose_with(
                 tokio::time::sleep(Duration::from_millis(gap)).await;
             }
 
-            let (outcome, ms) = probe_tcp(target, hello, strategy, bypass_params).await;
+            let hello = crate::bypass::tls::build_client_hello_sized(domain, timing.hello_size);
+            let (outcome, ms) = probe_tcp(target, &hello, strategy, bypass_params).await;
             attempts += 1;
             if outcome == ProbeOutcome::Success {
                 successes += 1;
@@ -558,7 +574,7 @@ async fn diagnose_with(
         }
     }
 
-    let (direct, _direct_ms) = probe_tcp(&target, &hello, FragStrategy::None, bypass_params).await;
+    let (direct, _direct_ms) = probe_tcp(&target, &fresh_hello(), FragStrategy::None, bypass_params).await;
 
     // Домен открывается напрямую — обход не нужен, остальное измерять незачем.
     if direct == ProbeOutcome::Success {
@@ -575,7 +591,7 @@ async fn diagnose_with(
 
     // Ступень 1: две TLS-записи — единственная техника, которой не мешает
     // пересборка TCP-потока, поэтому пробуется первой.
-    let tls_record = trials(&target, &hello, FragStrategy::TlsRecord, bypass_params, trials_count, early_abandon, timing).await;
+    let tls_record = trials(&target, domain, FragStrategy::TlsRecord, bypass_params, trials_count, early_abandon, timing).await;
     if early_abandon && tls_record.is_convincing() {
         return DiagnosticResult {
             direct,
@@ -589,7 +605,7 @@ async fn diagnose_with(
     }
 
     // Ступень 2: разрыв точно по SNI.
-    let sni_split = trials(&target, &hello, FragStrategy::SniSplit, bypass_params, trials_count, early_abandon, timing).await;
+    let sni_split = trials(&target, domain, FragStrategy::SniSplit, bypass_params, trials_count, early_abandon, timing).await;
     if early_abandon && sni_split.is_convincing() {
         return DiagnosticResult {
             direct,
@@ -606,7 +622,7 @@ async fn diagnose_with(
     // На платформах без MSG_OOB и управления TTL пробу не гоняем: она бы
     // просто откатилась на обычный сплит и дала бессмысленный результат.
     let oob = if crate::bypass::socket::supports_ttl_tricks() {
-        trials(&target, &hello, FragStrategy::Oob, bypass_params, trials_count, early_abandon, timing).await
+        trials(&target, domain, FragStrategy::Oob, bypass_params, trials_count, early_abandon, timing).await
     } else {
         empty
     };
@@ -640,7 +656,7 @@ async fn diagnose_with(
     // Ступень 5: disorder — последним, потому что работает через ретрансмит
     // и добавляет сотни миллисекунд к каждому соединению.
     let disorder = if crate::bypass::socket::supports_ttl_tricks() {
-        trials(&target, &hello, FragStrategy::Disorder, bypass_params, trials_count, early_abandon, timing).await
+        trials(&target, domain, FragStrategy::Disorder, bypass_params, trials_count, early_abandon, timing).await
     } else {
         empty
     };
@@ -649,7 +665,7 @@ async fn diagnose_with(
     // только когда режим ремонта TCP реально доступен, иначе техника молча
     // откатилась бы на обычный сплит и мы бы измерили не её.
     let fake = if crate::bypass::socket::fake_supported() && crate::bypass::socket::tcp_repair_available() {
-        trials(&target, &hello, FragStrategy::Fake, bypass_params, trials_count, early_abandon, timing).await
+        trials(&target, domain, FragStrategy::Fake, bypass_params, trials_count, early_abandon, timing).await
     } else {
         empty
     };
