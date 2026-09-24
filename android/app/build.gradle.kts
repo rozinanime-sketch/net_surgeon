@@ -47,7 +47,12 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 выбрасывает неиспользуемую стандартную библиотеку Kotlin:
+            // classes.dex с 2 МБ до сотни КБ. Имена методов для JNI правила
+            // по умолчанию сохраняют сами (-keepclasseswithmembernames native).
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
             signingConfig = signingConfigs.findByName("release")
                 ?: signingConfigs.getByName("debug")
         }

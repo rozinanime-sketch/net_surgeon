@@ -23,6 +23,9 @@ say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 
 say "Rust-ядро под arm64"
 (cd native && cargo ndk -t arm64-v8a -P 26 -o ../app/src/main/jniLibs build --release)
+# cargo ndk кладёт в jniLibs все cdylib из сборки, включая libtun2proxy-*.so
+# зависимости. Ядру она не нужна, tun2proxy вшит в него: это 3,6 МБ лишнего.
+find app/src/main/jniLibs -name '*.so' ! -name 'libnet_surgeon_android.so' -delete
 
 # Файлы данных — те же, что на компьютере, с двумя отличиями. Прозрачного
 # режима на телефоне нет (его роль играет VpnService), а DNS отвечает

@@ -1,24 +1,36 @@
 package io.github.netsurgeon
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
+import android.service.quicksettings.TileService
 import java.util.Locale
 
 /**
  * VPN без сервера: весь трафик телефона приходит сюда через TUN и уходит
  * в Rust-ядро, которое само выходит в интернет с техниками обхода.
+ *
+ * Сервис работает на переднем плане, с уведомлением. Без этого его нельзя
+ * запустить, когда экрана приложения не видно: из плитки, при загрузке
+ * телефона или системой в режиме «Постоянная VPN».
  */
 class SurgeonVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> {
-                shutdown()
-                return START_NOT_STICKY
-            }
-            else -> launch()
+        if (intent?.action == ACTION_STOP) {
+            shutdown()
+            return START_NOT_STICKY
         }
+        // Первым делом: после startForegroundService у сервиса есть
+        // несколько секунд, иначе система убьёт приложение.
+        startForeground(NOTIFICATION_ID, notification())
+        launch()
         return START_STICKY
     }
 
@@ -42,7 +54,7 @@ class SurgeonVpnService : VpnService() {
             .establish()
             ?: run {
                 // null — пользователь отозвал разрешение на VPN.
-                stopSelf()
+                shutdown()
                 return
             }
 
@@ -51,13 +63,17 @@ class SurgeonVpnService : VpnService() {
         // из-под него при сборке мусора.
         val error = NativeBridge.start(tun.detachFd(), DataFiles.dir(this).absolutePath, lang)
         if (error != null) {
-            stopSelf()
+            shutdown()
+            return
         }
+        refreshTile(this)
     }
 
     private fun shutdown() {
         NativeBridge.stop()
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        refreshTile(this)
     }
 
     /** Пользователь выключил VPN в системных настройках или включил другой. */
@@ -67,11 +83,48 @@ class SurgeonVpnService : VpnService() {
 
     override fun onDestroy() {
         NativeBridge.stop()
+        refreshTile(this)
         super.onDestroy()
+    }
+
+    private fun notification(): Notification {
+        val nm = getSystemService(NotificationManager::class.java)
+        // Важность низкая: уведомление без звука и не всплывает, оно лишь
+        // показывает, что обход включён, и даёт его выключить.
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL, "Обход включён", NotificationManager.IMPORTANCE_LOW)
+        )
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        )
+        val stop = PendingIntent.getService(
+            this, 1, stopIntent(this), PendingIntent.FLAG_IMMUTABLE
+        )
+        return Notification.Builder(this, CHANNEL)
+            .setSmallIcon(R.drawable.ic_surgeon)
+            .setContentTitle("Обход включён")
+            .setContentText("Нажмите, чтобы открыть net surgeon")
+            .setContentIntent(open)
+            .setOngoing(true)
+            .addAction(Notification.Action.Builder(null, "Выключить", stop).build())
+            .build()
     }
 
     companion object {
         const val ACTION_STOP = "io.github.netsurgeon.STOP"
         private const val MTU = 1500
+        private const val CHANNEL = "vpn"
+        private const val NOTIFICATION_ID = 1
+
+        fun startIntent(context: Context) = Intent(context, SurgeonVpnService::class.java)
+
+        fun stopIntent(context: Context) = startIntent(context).setAction(ACTION_STOP)
+
+        /** Плитка в шторке перерисуется при следующем показе. */
+        fun refreshTile(context: Context) {
+            TileService.requestListeningState(
+                context, ComponentName(context, SurgeonTileService::class.java)
+            )
+        }
     }
 }

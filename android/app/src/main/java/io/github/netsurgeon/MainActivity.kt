@@ -1,17 +1,23 @@
 package io.github.netsurgeon
 
+import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.Uri
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -28,6 +34,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var log: TextView
     private lateinit var logScroll: ScrollView
+    private lateinit var update: TextView
     private val handler = Handler(Looper.getMainLooper())
 
     private val refresh = object : Runnable {
@@ -92,6 +99,30 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         root.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
+        root.addView(CheckBox(this).apply {
+            text = "Включать при запуске телефона"
+            setTextColor(Color.LTGRAY)
+            isChecked = Prefs.autostart(this@MainActivity)
+            setOnCheckedChangeListener { _, on -> Prefs.setAutostart(this@MainActivity, on) }
+        })
+        root.addView(TextView(this).apply {
+            text = "Надёжнее системная «Постоянная VPN»: Настройки → VPN → " +
+                "net surgeon. Нажмите, чтобы открыть."
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setOnClickListener {
+                startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS))
+            }
+        })
+
+        update = TextView(this).apply {
+            textSize = 15f
+            setTextColor(Color.rgb(255, 200, 90))
+            setPadding(0, pad / 2, 0, 0)
+            visibility = View.GONE
+        }
+        root.addView(update, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
         root.addView(TextView(this).apply {
             text = "Лог"
             setTextColor(Color.GRAY)
@@ -108,11 +139,37 @@ class MainActivity : Activity() {
         root.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
 
         setContentView(root)
+        // После поворота экрана intent тот же: второй раз не включаем.
+        if (savedInstanceState == null) startIfAsked(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        startIfAsked(intent)
+    }
+
+    /** Экран открыт плиткой, у которой не было разрешения на VPN. */
+    private fun startIfAsked(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_START, false) != true) return
+        intent.removeExtra(EXTRA_START)
+        if (!NativeBridge.isRunning()) onToggle()
     }
 
     override fun onResume() {
         super.onResume()
         handler.post(refresh)
+        showUpdate()
+        UpdateCheck.maybeRun(this) { runOnUiThread { showUpdate() } }
+    }
+
+    private fun showUpdate() {
+        val (version, url) = UpdateCheck.available(this) ?: run {
+            update.visibility = View.GONE
+            return
+        }
+        update.text = "Вышла версия $version. Нажмите, чтобы открыть страницу загрузки."
+        update.setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+        update.visibility = View.VISIBLE
     }
 
     override fun onPause() {
@@ -138,7 +195,7 @@ class MainActivity : Activity() {
 
     private fun onToggle() {
         if (NativeBridge.isRunning()) {
-            startService(Intent(this, SurgeonVpnService::class.java).setAction(SurgeonVpnService.ACTION_STOP))
+            startService(SurgeonVpnService.stopIntent(this))
             return
         }
         // Первый раз система спрашивает разрешение на VPN.
@@ -159,7 +216,14 @@ class MainActivity : Activity() {
     }
 
     private fun startVpn() {
-        startService(Intent(this, SurgeonVpnService::class.java))
+        // Без разрешения обход тоже работает, только уведомление с кнопкой
+        // «Выключить» не видно. Спрашиваем один раз, при первом включении.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+        }
+        startForegroundService(SurgeonVpnService.startIntent(this))
     }
 
     private fun openEditor(file: String, title: String, hint: String? = null) {
@@ -174,6 +238,8 @@ class MainActivity : Activity() {
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     companion object {
+        const val EXTRA_START = "start"
         private const val REQUEST_VPN = 1
+        private const val REQUEST_NOTIFICATIONS = 2
     }
 }
