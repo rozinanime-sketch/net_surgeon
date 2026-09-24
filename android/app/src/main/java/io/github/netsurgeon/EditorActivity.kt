@@ -15,8 +15,9 @@ import android.widget.TextView
 import android.widget.Toast
 
 /**
- * Правка списка доменов как текста: домен на строку, `#` — комментарий.
- * Тот же формат, что на компьютере, поэтому файл можно перенести как есть.
+ * Правка файла данных как текста: списка доменов (домен на строку, `#` —
+ * комментарий) или адреса ретранслятора Telegram. Формат тот же, что на
+ * компьютере, поэтому файл можно перенести как есть.
  */
 class EditorActivity : Activity() {
 
@@ -24,6 +25,8 @@ class EditorActivity : Activity() {
         super.onCreate(savedInstanceState)
         val file = intent.getStringExtra(EXTRA_FILE) ?: return finish()
         val title = intent.getStringExtra(EXTRA_TITLE) ?: file
+        val hint = intent.getStringExtra(EXTRA_HINT)
+            ?: "Домен на строку, поддомены учитываются. Применится после перезапуска обхода."
 
         val pad = (16 * resources.displayMetrics.density).toInt()
         val root = LinearLayout(this).apply {
@@ -39,7 +42,7 @@ class EditorActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
         })
         root.addView(TextView(this).apply {
-            text = "Домен на строку, поддомены учитываются. Применится после перезапуска обхода."
+            text = hint
             setTextColor(Color.GRAY)
             setPadding(0, pad / 2, 0, pad / 2)
         })
@@ -83,5 +86,6 @@ class EditorActivity : Activity() {
     companion object {
         const val EXTRA_FILE = "file"
         const val EXTRA_TITLE = "title"
+        const val EXTRA_HINT = "hint"
     }
 }

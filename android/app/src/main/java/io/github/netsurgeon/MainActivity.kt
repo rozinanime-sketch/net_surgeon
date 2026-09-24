@@ -78,6 +78,18 @@ class MainActivity : Activity() {
             text = "Трекеры"
             setOnClickListener { openEditor(DataFiles.BLOCK, "Блокировка трекеров") }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        row.addView(Button(this).apply {
+            text = "Telegram"
+            setOnClickListener {
+                openEditor(
+                    DataFiles.TELEGRAM_RELAY, "Ретранслятор Telegram",
+                    "Адрес своего воркера Cloudflare, например " +
+                        "net-surgeon-tg.<поддомен>.workers.dev. Как его завести — " +
+                        "cloudflare/README.md в репозитории. Пусто — Telegram идёт " +
+                        "напрямую. Применится после перезапуска обхода."
+                )
+            }
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         root.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
         root.addView(TextView(this).apply {
@@ -150,11 +162,12 @@ class MainActivity : Activity() {
         startService(Intent(this, SurgeonVpnService::class.java))
     }
 
-    private fun openEditor(file: String, title: String) {
+    private fun openEditor(file: String, title: String, hint: String? = null) {
         startActivity(
             Intent(this, EditorActivity::class.java)
                 .putExtra(EditorActivity.EXTRA_FILE, file)
                 .putExtra(EditorActivity.EXTRA_TITLE, title)
+                .putExtra(EditorActivity.EXTRA_HINT, hint)
         )
     }
 
