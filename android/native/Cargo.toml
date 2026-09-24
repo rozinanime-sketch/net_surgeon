@@ -1,0 +1,33 @@
+[package]
+name = "net_surgeon_android"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Мост между ядром net_surgeon и приложением на Kotlin.
+#
+# Отдельный крейт, а не модуль ядра: ему нужны jni и tun2proxy, которые на
+# компьютере ни к чему, а собирается он только под Android через cargo-ndk.
+[lib]
+name = "net_surgeon_android"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+net_surgeon = { path = "../..", default-features = false }
+# udpgw — протокол для UDP через TCP-прокси, у нас SOCKS5 с UDP ASSOCIATE.
+tun2proxy = { version = "0.8.3", default-features = false }
+jni = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = "0.7"
+chrono = "0.4"
+log = "0.4"
+libc = "0.2"
+android_logger = "0.15"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"

@@ -1,0 +1,9 @@
+# Собирается build.sh из корня проекта и Rust-крейта
+app/src/main/jniLibs/
+app/src/main/assets/
+native/target/
+native/Cargo.lock
+build/
+app/build/
+.gradle/
+local.properties
