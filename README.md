@@ -39,22 +39,22 @@
 Программа собрана статически и работает на любом дистрибутиве.
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.1.0/net_surgeon-0.1.0-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.1.0-x86_64-linux.tar.gz
-cd net_surgeon-0.1.0
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.2.0/net_surgeon-0.2.0-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.2.0-x86_64-linux.tar.gz
+cd net_surgeon-0.2.0
 ./run.sh
 ```
 
 ### Из исходников
 
 ```sh
-git clone --branch v0.1.0 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.2.0 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```
 
 `run.sh` сам соберёт программу при первом запуске и пересоберёт, если код
-изменился. Без `--branch v0.1.0` скачается текущая версия из `main`, а не релиз.
+изменился. Без `--branch v0.2.0` скачается текущая версия из `main`, а не релиз.
 
 ## Пример использования
 
