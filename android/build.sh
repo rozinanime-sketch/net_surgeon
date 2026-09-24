@@ -55,6 +55,18 @@ else
     APK=app/build/outputs/apk/debug/app-debug.apk
 fi
 say "Готово: android/$APK ($(du -h "$APK" | cut -f1))"
+if [[ ${1:-} == release ]]; then
+    # Чем подписан релиз, видно сразу: отладочный ключ в публичном APK —
+    # ошибка, после которой обновления у пользователей не встанут.
+    APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)/apksigner
+    CERT=$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null \
+        | grep -m1 'certificate DN' | sed 's/.*DN: //')
+    if [[ $CERT == *"Android Debug"* ]]; then
+        printf '\033[1;33m==> Подписан ОТЛАДОЧНЫМ ключом: нет ~/.config/net_surgeon/signing.properties\033[0m\n'
+    else
+        say "Подписан ключом релиза: $CERT"
+    fi
+fi
 
 if [[ ${1:-} == install ]]; then
     say "Ставлю на телефон"

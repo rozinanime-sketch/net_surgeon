@@ -1,6 +1,20 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// Ключ подписи релизов лежит вне репозитория: кто держит ключ, тот может
+// выпускать обновления, которые телефоны примут за наши. Путь можно
+// переопределить через NET_SURGEON_SIGNING. Файла нет (сборка из исходников
+// у другого человека) — релиз подписывается отладочным ключом, как раньше.
+val signingFile = file(
+    System.getenv("NET_SURGEON_SIGNING")
+        ?: "${System.getProperty("user.home")}/.config/net_surgeon/signing.properties"
+)
+val signing = Properties().apply {
+    if (signingFile.exists()) signingFile.inputStream().use { load(it) }
 }
 
 android {
@@ -20,12 +34,22 @@ android {
         }
     }
 
+    signingConfigs {
+        if (!signing.isEmpty) {
+            create("release") {
+                storeFile = file(signing.getProperty("storeFile"))
+                storePassword = signing.getProperty("storePassword")
+                keyAlias = signing.getProperty("keyAlias")
+                keyPassword = signing.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Своего ключа пока нет: релиз подписывается отладочным, чтобы
-            // его можно было поставить на телефон.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
         }
     }
 
