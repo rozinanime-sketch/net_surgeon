@@ -35,6 +35,15 @@ pub async fn handle_http(
     };
 
     let domain = extract_domain(&target);
+    if crate::block::is_blocked(&domain) {
+        log_t(&log_tx, LogLevel::Info, "log.blocked", vec![
+            ("domain", domain),
+            ("via", "HTTP".to_string()),
+        ]);
+        let mut cs = client_stream;
+        let _ = cs.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        return;
+    }
     let bypass = needs_bypass(is_enabled, &domain, &bypass_domains);
 
     let mut server_stream = match crate::dns::resolver::connect(&target).await {

@@ -37,6 +37,15 @@ pub async fn handle_connect(
     };
 
     let mut domain = extract_domain(&target);
+    if crate::block::is_blocked(&domain) {
+        log_t(&log_tx, LogLevel::Info, "log.blocked", vec![
+            ("domain", domain),
+            ("via", "HTTP CONNECT".to_string()),
+        ]);
+        let mut cs = client_stream;
+        let _ = cs.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
+        return;
+    }
     let mut needs = needs_bypass(is_enabled, &domain, &bypass_domains);
 
     // Отсчёт с момента начала подключения: TTFB считается от него, потому что

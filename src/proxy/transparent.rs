@@ -224,6 +224,21 @@ async fn handle(
     // моменту адрес уже опознан.
     if let Some(host) = &sni {
         ip_cache.insert(target_addr.ip(), host.clone());
+
+        // Кэш выше заполнен и для трекера: по нему QUIC на тот же адрес
+        // тоже будет отброшен. Блокируется только по SNI, не по кэшу — за
+        // адресом трекера живут и другие сайты (см. модуль block).
+        //
+        // Сброс, а не закрытие: браузер сразу видит отказ и не повторяет
+        // попытку по таймауту. До сервера соединение не доходит вовсе.
+        if crate::block::is_blocked(host) {
+            log_t(log_tx, LogLevel::Info, "log.blocked", vec![
+                ("domain", host.clone()),
+                ("via", "SNI".to_string()),
+            ]);
+            let _ = client.set_zero_linger();
+            return;
+        }
     }
 
     let from_cache = sni.is_none().then(|| ip_cache.lookup(&target_addr.ip())).flatten();

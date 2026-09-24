@@ -256,6 +256,18 @@ async fn handle_connect(
     // следующую порцию данных, а первая просто пропадала.
     let pipelined = request.get(consumed..).unwrap_or(&[]).to_vec();
 
+    // REP 0x02 — «запрещено правилами»: ровно этот случай, и клиент не
+    // путает его с недоступным сервером.
+    let requested = extract_domain(&target);
+    if crate::block::is_blocked(&requested) {
+        log_t(log_tx, LogLevel::Info, "log.blocked", vec![
+            ("domain", requested),
+            ("via", "SOCKS5".to_string()),
+        ]);
+        let _ = stream.write_all(&[SOCKS5_VERSION, 0x02, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]).await;
+        return;
+    }
+
     log_t(log_tx, LogLevel::Info, "log.socks5_connect_to", vec![("target", target.clone())]);
 
     let mut server = match crate::dns::resolver::connect(&target).await {

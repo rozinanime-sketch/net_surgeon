@@ -77,6 +77,33 @@ pub fn extract_ips_from_dns_response(buf: &[u8]) -> Vec<IpAddr> {
     ips
 }
 
+/// Ответ NXDOMAIN на запрос: тот же ID и вопрос, без записей.
+///
+/// NXDOMAIN, а не адрес 0.0.0.0: он годится для любого типа запроса
+/// (A, AAAA, HTTPS), и клиенту не с чем пытаться соединиться. Секция
+/// дополнительных записей (EDNS) отбрасывается вместе со своим счётчиком.
+pub fn nxdomain_response(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 { return None; }
+    // Только стандартный запрос: ответ на что-то другое — не наше дело.
+    if query[2] & 0x80 != 0 || (query[2] >> 3) & 0x0F != 0 { return None; }
+
+    let qd = u16::from_be_bytes([query[4], query[5]]);
+    let mut p = 12usize;
+    for _ in 0..qd {
+        skip_name(query, &mut p)?;
+        if p + 4 > query.len() { return None; }
+        p += 4;
+    }
+
+    let mut out = query[..p].to_vec();
+    // QR = 1, RD копируется из запроса; RA = 1, RCODE = 3 (NXDOMAIN).
+    out[2] = 0x80 | (query[2] & 0x01);
+    out[3] = 0x80 | 0x03;
+    // ANCOUNT, NSCOUNT, ARCOUNT
+    out[6..12].fill(0);
+    Some(out)
+}
+
 pub fn extract_qname(buf: &[u8]) -> Option<String> {
     if buf.len() < 12 { return None; }
     let mut p = 12usize;
@@ -173,5 +200,42 @@ mod tests {
         let buf = response(1, b"example.com", [93, 184, 216, 34]);
         assert!(extract_ips_from_dns_response(&buf[..buf.len() - 3]).is_empty());
         assert!(extract_ips_from_dns_response(&buf[..8]).is_empty());
+    }
+
+    /// Запрос mc.yandex.ru типа A с EDNS-записью в конце, как шлёт резолвер.
+    fn query(name: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xab, 0xcd, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+        for label in name.split(|b| *b == b'.') {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label);
+        }
+        out.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+        // OPT: имя корня, TYPE=41, размер UDP, флаги, RDLENGTH=0
+        out.extend_from_slice(&[0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        out
+    }
+
+    #[test]
+    fn nxdomain_keeps_id_and_question_and_drops_the_rest() {
+        let q = query(b"mc.yandex.ru");
+        let r = nxdomain_response(&q).expect("стандартный запрос");
+
+        assert_eq!(&r[..2], &[0xab, 0xcd], "ID запроса");
+        assert_eq!(r[2], 0x81, "QR и RD из запроса");
+        assert_eq!(r[3] & 0x0f, 3, "RCODE = NXDOMAIN");
+        assert_eq!(&r[4..12], &[0, 1, 0, 0, 0, 0, 0, 0], "один вопрос, записей нет");
+        assert_eq!(extract_qname(&r).as_deref(), Some("mc.yandex.ru"));
+        // Вопрос целиком, EDNS отброшен.
+        assert_eq!(r.len(), 12 + 14 + 4);
+        assert!(extract_ips_from_dns_response(&r).is_empty());
+    }
+
+    #[test]
+    fn nxdomain_refuses_what_is_not_a_query() {
+        let mut q = query(b"mc.yandex.ru");
+        assert!(nxdomain_response(&q[..10]).is_none());
+        assert!(nxdomain_response(&q[..20]).is_none(), "обрезанный вопрос");
+        q[2] |= 0x80;
+        assert!(nxdomain_response(&q).is_none(), "это уже ответ");
     }
 }

@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::observability::logging::{LogSender, log_t, LogLevel};
 use crate::observability::metrics::Metrics;
-use super::ip_cache::{IpDomainCache, extract_qname, extract_ips_from_dns_response};
+use super::ip_cache::{IpDomainCache, extract_qname, extract_ips_from_dns_response, nxdomain_response};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_doh_relay(
@@ -63,6 +63,20 @@ pub async fn run_doh_relay(
 
                         tokio::spawn(async move {
                             metrics.add_rx(query.len() as u64);
+                            // Трекер получает «такого домена нет» сразу, без
+                            // похода к провайдеру: соединения не будет вовсе.
+                            if let Some(qname) = extract_qname(&query)
+                                && crate::block::is_blocked(&qname)
+                                && let Some(response) = nxdomain_response(&query)
+                            {
+                                log_t(&log_tx, LogLevel::Info, "log.blocked", vec![
+                                    ("domain", qname),
+                                    ("via", "DNS".to_string()),
+                                ]);
+                                metrics.add_tx(response.len() as u64);
+                                let _ = socket.send_to(&response, client_addr).await;
+                                return;
+                            }
                             // Индикатор DNS в интерфейсе теперь отражает СВОЙ
                             // резолв, а не чужой. Раньше его выставляла проба
                             // простого UDP-релея; тот удалён, и без этой строки

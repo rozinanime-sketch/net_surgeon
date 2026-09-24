@@ -85,6 +85,12 @@ diagnostics_only = false
 probe_gap_min_ms = 250
 probe_gap_max_ms = 700
 
+# Блокировать трекеры из block_domains.txt: Яндекс.Метрику, Google Analytics
+# и подобные счётчики. Соединение с ними рвётся сразу, до сервера оно не
+# доходит — это дешевле, чем пропускать. Правки списка применяются при
+# перезапуске прокси.
+block_trackers = true
+
 
 [bypass]
 split_pos_min = 4

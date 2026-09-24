@@ -54,6 +54,11 @@ pub async fn run_all(
     }
     log_t(&log_tx, LogLevel::Info, "log.proxy_port_socks5", vec![("port", config.socks5_port.to_string()), ("udp_port", config.socks5_udp_port.to_string())]);
 
+    // Здесь, а не при старте программы: run_all зовётся и при перезапуске
+    // прокси из интерфейса, и правки списка применяются тогда же, когда
+    // правки config.toml и bypass_domains.txt.
+    crate::block::reload(config.block_trackers, &log_tx);
+
     let tcp_task = {
         let config = Arc::clone(&config);
         let domains = Arc::clone(&domains);

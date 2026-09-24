@@ -171,6 +171,12 @@ pub struct Config {
     /// Пустое поле — обычное поведение, имя провайдера резолвится системой.
     #[serde(default)]
     pub doh_bootstrap_ip: Option<std::net::IpAddr>,
+
+    /// Блокировать домены из block_domains.txt — счётчики вроде
+    /// Яндекс.Метрики. По умолчанию выключено: прокси, который молча режет
+    /// часть трафика, неожиданен, и включать это должен сам пользователь.
+    #[serde(default)]
+    pub block_trackers: bool,
 }
 
 fn default_listen_host() -> String { "127.0.0.1".to_string() }

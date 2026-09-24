@@ -1,0 +1,30 @@
+# Трекеры, которые блокируются при block_trackers = true в config.toml.
+#
+# Домен на строку, поддомены блокируются вместе с ним. Здесь только имена,
+# которые целиком служат слежке: заблокировать их — значит потерять одну
+# статистику. Общие домены вроде yastatic.net или googletagmanager.com сюда
+# не входят — с них грузится и полезное, и сайты без них ломаются.
+#
+# Правки применяются при перезапуске прокси.
+
+# Яндекс.Метрика и Вебвизор
+mc.yandex.ru
+mc.yandex.com
+mc.yandex.by
+mc.yandex.kz
+mc.yandex.ua
+mc.yandex.uz
+mc.yandex.com.tr
+mc.webvisor.org
+mc.webvisor.com
+
+# Google Analytics
+google-analytics.com
+analytics.google.com
+stats.g.doubleclick.net
+
+# Top@Mail.ru
+top-fwz1.mail.ru
+
+# LiveInternet
+counter.yadro.ru

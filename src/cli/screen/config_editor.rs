@@ -42,6 +42,7 @@ const FULL_FIELD_DEFS: &[(&str, &str)] = &[
     ("field.probe_gap_max", "probe_gap_max_ms"),
     ("field.resolve_via_doh", "resolve_via_doh"),
     ("field.doh_provider", "doh_provider"),
+    ("field.block_trackers", "block_trackers"),
 ];
 
 const BYPASS_FIELD_DEFS: &[(&str, &str)] = &[

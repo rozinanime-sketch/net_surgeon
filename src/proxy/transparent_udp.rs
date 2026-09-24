@@ -398,6 +398,24 @@ async fn handle_datagram(
     // DoH-релей и прозрачный TCP-режим (по SNI): браузер обычно сначала
     // открывает сайт по TCP и лишь потом переходит на QUIC.
     let domain = ip_cache.lookup(&orig_dst.ip());
+
+    // Здесь блокировка по кэшу допустима, в отличие от TCP: если адрес
+    // общий и кэш ошибся, браузер просто откатится на TCP, где имя видно
+    // в SNI. Сессия не открывается — следующие датаграммы придут сюда же
+    // и отбросятся так же дёшево. В лог — только первая, по Initial:
+    // повторы браузера и хвосты старых соединений его бы засыпали.
+    if let Some(d) = &domain
+        && crate::block::is_blocked(d)
+    {
+        if session::is_quic_initial(&payload) {
+            log_t(log_tx, LogLevel::Info, "log.blocked", vec![
+                ("domain", d.clone()),
+                ("via", "QUIC".to_string()),
+            ]);
+        }
+        return;
+    }
+
     let bypass = match &domain {
         Some(d) => needs_bypass(is_enabled, d, bypass_domains),
         None => false,
