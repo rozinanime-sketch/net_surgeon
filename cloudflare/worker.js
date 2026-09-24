@@ -90,9 +90,19 @@ export default {
     const writer = socket.writable.getWriter();
     const reader = socket.readable.getReader();
 
+    // Когда Telegram или сеть рвут соединение, эти промисы отклоняются.
+    // Без обработчика это «необработанное исключение» воркера, хотя для
+    // ретранслятора обрыв — обычное дело: закрытие ловится ниже.
+    const ignore = () => {};
+    socket.opened.catch(ignore);
+    socket.closed.catch(ignore);
+    writer.closed.catch(ignore);
+    reader.closed.catch(ignore);
+
     const closeAll = (code, reason) => {
       try { server.close(code, reason); } catch {}
-      try { socket.close(); } catch {}
+      // close() возвращает промис: try/catch его отказ не ловит.
+      try { socket.close().catch(ignore); } catch {}
     };
 
     // Сообщения пишутся строго по очереди: при параллельной записи куски
