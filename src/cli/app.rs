@@ -9,9 +9,8 @@ use super::traffic_history::TrafficHistory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuItem {
-    Status,
-    Bypass,
     Domains,
+    Blocklist,
     Diagnostics,
     Config,
     Start,
@@ -19,10 +18,9 @@ pub enum MenuItem {
 }
 
 impl MenuItem {
-    pub const ALL: [MenuItem; 7] = [
-        MenuItem::Status,
-        MenuItem::Bypass,
+    pub const ALL: [MenuItem; 6] = [
         MenuItem::Domains,
+        MenuItem::Blocklist,
         MenuItem::Diagnostics,
         MenuItem::Config,
         MenuItem::Start,

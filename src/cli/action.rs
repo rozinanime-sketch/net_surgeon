@@ -2,6 +2,8 @@
 //! Возвращается из screen::handle_key() и обрабатывается в cli/mod.rs (Quit,
 //! ToggleBackground — нужен доступ к терминалу) или в dispatch::run() (остальное).
 
+use super::screen::domains_editor::DomainList;
+
 pub enum Action {
     None,
     Quit,
@@ -11,6 +13,6 @@ pub enum Action {
     /// и записать выбранные стратегии в strategies.txt.
     RunDiagnosticsAll,
     SaveConfigField(&'static str, String),
-    SaveDomains(Vec<String>),
+    SaveDomains(DomainList, Vec<String>),
     ToggleBackground,
 }

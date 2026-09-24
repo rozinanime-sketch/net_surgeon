@@ -4,7 +4,7 @@
 
 use crossterm::event::KeyCode;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
@@ -19,48 +19,48 @@ use crate::observability::error::AppError;
 
 use super::StepResult;
 
-const FULL_FIELD_DEFS: &[(&str, &str)] = &[
-    ("field.tcp_port", "port"),
-    ("field.udp_port", "udp_port"),
-    ("field.socks5_port", "socks5_port"),
-    ("field.socks5_udp_port", "socks5_udp_port"),
-    ("field.transparent_port", "transparent_port"),
-    ("field.enabled", "enabled"),
-    ("field.split_pos_min", "bypass.split_pos_min"),
-    ("field.split_pos_max", "bypass.split_pos_max"),
-    ("field.split_delay", "bypass.split_delay_ms"),
-    ("field.window_clamp", "bypass.window_clamp"),
-    ("field.disorder_ttl", "bypass.disorder_ttl"),
-    ("field.junk_count", "socks5_junk.count"),
-    ("field.junk_size_min", "socks5_junk.size_min"),
-    ("field.junk_size_max", "socks5_junk.size_max"),
-    ("field.junk_delay_min", "socks5_junk.delay_min_ms"),
-    ("field.junk_delay_max", "socks5_junk.delay_max_ms"),
-    ("field.strategy_ttl", "strategy_ttl_hours"),
-    ("field.auto_diagnostics", "auto_diagnostics_hours"),
-    ("field.probe_gap_min", "probe_gap_min_ms"),
-    ("field.probe_gap_max", "probe_gap_max_ms"),
-    ("field.resolve_via_doh", "resolve_via_doh"),
-    ("field.doh_provider", "doh_provider"),
-    ("field.block_trackers", "block_trackers"),
-];
-
-const BYPASS_FIELD_DEFS: &[(&str, &str)] = &[
-    ("field.enabled", "enabled"),
-    ("field.split_pos_min", "bypass.split_pos_min"),
-    ("field.split_pos_max", "bypass.split_pos_max"),
-    ("field.split_delay", "bypass.split_delay_ms"),
-    ("field.window_clamp", "bypass.window_clamp"),
-    ("field.disorder_ttl", "bypass.disorder_ttl"),
-    ("field.junk_count", "socks5_junk.count"),
-    ("field.junk_size_min", "socks5_junk.size_min"),
-    ("field.junk_size_max", "socks5_junk.size_max"),
-    ("field.junk_delay_min", "socks5_junk.delay_min_ms"),
-    ("field.junk_delay_max", "socks5_junk.delay_max_ms"),
+/// Поля config.toml по группам: (ключ заголовка группы, [(ключ подписи, путь в TOML)]).
+/// Порядок здесь — порядок на экране. Раньше было два плоских списка:
+/// полный для «Конфига» и его подмножество для «Параметров обхода».
+const FIELD_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    ("config.group_ports", &[
+        ("field.tcp_port", "port"),
+        ("field.udp_port", "udp_port"),
+        ("field.socks5_port", "socks5_port"),
+        ("field.socks5_udp_port", "socks5_udp_port"),
+        ("field.transparent_port", "transparent_port"),
+    ]),
+    ("config.group_bypass", &[
+        ("field.enabled", "enabled"),
+        ("field.split_pos_min", "bypass.split_pos_min"),
+        ("field.split_pos_max", "bypass.split_pos_max"),
+        ("field.split_delay", "bypass.split_delay_ms"),
+        ("field.window_clamp", "bypass.window_clamp"),
+        ("field.disorder_ttl", "bypass.disorder_ttl"),
+    ]),
+    ("config.group_junk", &[
+        ("field.junk_count", "socks5_junk.count"),
+        ("field.junk_size_min", "socks5_junk.size_min"),
+        ("field.junk_size_max", "socks5_junk.size_max"),
+        ("field.junk_delay_min", "socks5_junk.delay_min_ms"),
+        ("field.junk_delay_max", "socks5_junk.delay_max_ms"),
+    ]),
+    ("config.group_diagnostics", &[
+        ("field.strategy_ttl", "strategy_ttl_hours"),
+        ("field.auto_diagnostics", "auto_diagnostics_hours"),
+        ("field.probe_gap_min", "probe_gap_min_ms"),
+        ("field.probe_gap_max", "probe_gap_max_ms"),
+    ]),
+    ("config.group_dns", &[
+        ("field.resolve_via_doh", "resolve_via_doh"),
+        ("field.doh_provider", "doh_provider"),
+        ("field.block_trackers", "block_trackers"),
+    ]),
 ];
 
 #[derive(Debug, Clone)]
 pub struct ConfigField {
+    pub group_key: &'static str,
     pub label_key: &'static str,
     pub toml_path: &'static str,
     pub value: String,
@@ -128,26 +128,20 @@ pub fn handle_key(state: &mut ConfigEditorState, key: KeyCode) -> StepResult {
     }
 }
 
-// --- I/O: без изменений по сравнению со старым config_editor.rs ---
+// --- I/O ---
 
 pub fn load_fields() -> Result<Vec<ConfigField>, AppError> {
-    load_fields_from(FULL_FIELD_DEFS)
-}
-
-pub fn load_bypass_fields() -> Result<Vec<ConfigField>, AppError> {
-    load_fields_from(BYPASS_FIELD_DEFS)
-}
-
-fn load_fields_from(defs: &[(&'static str, &'static str)]) -> Result<Vec<ConfigField>, AppError> {
     let text = crate::config::paths::read_to_string("config.toml")
         .map_err(|e| AppError::new("error.config_read").with("error", e))?;
     let doc: DocumentMut = text.parse()
         .map_err(|e| AppError::new("error.config_parse").with("error", e))?;
 
     let mut fields = Vec::new();
-    for (label_key, path) in defs {
-        let value = get_value_at_path(&doc, path).unwrap_or_default();
-        fields.push(ConfigField { label_key, toml_path: path, value });
+    for (group_key, defs) in FIELD_GROUPS {
+        for (label_key, path) in *defs {
+            let value = get_value_at_path(&doc, path).unwrap_or_default();
+            fields.push(ConfigField { group_key, label_key, toml_path: path, value });
+        }
     }
     Ok(fields)
 }
@@ -252,7 +246,7 @@ fn get_item_at_path<'a>(doc: &'a DocumentMut, parts: &[&str]) -> Option<&'a toml
     Some(item)
 }
 
-// --- Отрисовка: перенесено из старого ui.rs::draw_config_editor 1-в-1. ---
+// --- Отрисовка ---
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, editor: &ConfigEditorState, proxy_started: bool) {
     let popup = super::centered_rect(70, 80, area);
@@ -272,16 +266,27 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, editor: &ConfigEditorState
     let inner = outer.inner(popup);
     frame.render_widget(outer, popup);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(editor.fields.iter().map(|_| Constraint::Length(1)).collect::<Vec<_>>())
-        .split(inner);
+    let lang = app.language.code();
+    let mut lines: Vec<Line> = Vec::new();
+    let mut selected_line = 0;
 
     for (i, field) in editor.fields.iter().enumerate() {
-        if i >= rows.len() { break; }
+        if i == 0 || editor.fields[i - 1].group_key != field.group_key {
+            if i > 0 {
+                lines.push(Line::raw(""));
+            }
+            let heading = crate::observability::i18n::translate(lang, field.group_key, &[]);
+            lines.push(Line::styled(
+                heading,
+                Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+            ));
+        }
 
         let is_selected = i == editor.selected;
         let is_editing = is_selected && editor.editing_buffer.is_some();
+        if is_selected {
+            selected_line = lines.len();
+        }
 
         let label_style = if is_selected {
             Style::default().fg(Color::White).bg(Color::Rgb(42, 42, 90))
@@ -304,16 +309,29 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, editor: &ConfigEditorState
         };
 
         let prefix = if is_selected { "▶ " } else { "  " };
-        let label = crate::observability::i18n::translate(app.language.code(), field.label_key, &[]);
+        let label = crate::observability::i18n::translate(lang, field.label_key, &[]);
 
-        let line = Line::from(vec![
-            Span::styled(format!("{}{:<24}", prefix, label), label_style),
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}{:<34}", prefix, label), label_style),
             Span::raw(" "),
             Span::styled(value_text, value_style),
-        ]);
-
-        frame.render_widget(Paragraph::new(line), rows[i]);
+        ]));
     }
+
+    // С заголовками групп строк больше, чем влезает в невысокий терминал.
+    // Раньше лишние поля просто не рисовались; теперь список прокручивается
+    // так, чтобы выбранное поле всегда было видно.
+    let height = inner.height as usize;
+    let scroll = scroll_offset(selected_line, height, lines.len());
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
+}
+
+/// Выбранная строка держится у нижнего края, пока список не упрётся в конец.
+fn scroll_offset(selected_line: usize, height: usize, total: usize) -> usize {
+    if height == 0 || total <= height {
+        return 0;
+    }
+    (selected_line + 1).saturating_sub(height).min(total - height)
 }
 
 #[cfg(test)]
@@ -322,6 +340,24 @@ mod tests {
 
     fn doc(text: &str) -> DocumentMut {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn every_field_appears_once() {
+        let mut paths: Vec<&str> = FIELD_GROUPS.iter().flat_map(|(_, defs)| defs.iter().map(|(_, p)| *p)).collect();
+        let total = paths.len();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), total);
+    }
+
+    #[test]
+    fn scroll_keeps_selection_visible() {
+        assert_eq!(scroll_offset(5, 10, 30), 0);
+        assert_eq!(scroll_offset(9, 10, 30), 0);
+        assert_eq!(scroll_offset(10, 10, 30), 1);
+        assert_eq!(scroll_offset(29, 10, 30), 20);
+        assert_eq!(scroll_offset(29, 40, 30), 0);
     }
 
     #[test]

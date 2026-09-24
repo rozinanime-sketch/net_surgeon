@@ -15,6 +15,7 @@ use crate::cli::action::Action;
 use crate::cli::app::{App, Focus, MenuItem};
 use crate::observability::logging::{LogLevel, LogPayload};
 
+use super::domains_editor::DomainList;
 use super::{config_editor, diagnostics, domains_editor, Screen, StepResult};
 
 pub fn handle_key(app: &mut App, key: KeyCode) -> StepResult {
@@ -61,24 +62,8 @@ pub fn handle_key(app: &mut App, key: KeyCode) -> StepResult {
 
 fn handle_select(app: &mut App) -> StepResult {
     match app.current() {
-        MenuItem::Status => {
-            app.push_log_t(LogLevel::Info, "status.refreshing", vec![]);
-            StepResult::Stay(Action::None)
-        }
-        MenuItem::Bypass => match config_editor::load_bypass_fields() {
-            Ok(fields) => StepResult::Switch(
-                Screen::ConfigEditor(config_editor::ConfigEditorState::new(fields)),
-                Action::None,
-            ),
-            Err(e) => { app.push_err(e); StepResult::Stay(Action::None) }
-        },
-        MenuItem::Domains => match domains_editor::load_domains() {
-            Ok(domains) => StepResult::Switch(
-                Screen::DomainsEditor(domains_editor::DomainsEditorState::new(domains)),
-                Action::None,
-            ),
-            Err(e) => { app.push_err(e); StepResult::Stay(Action::None) }
-        },
+        MenuItem::Domains => open_domains(app, DomainList::Bypass),
+        MenuItem::Blocklist => open_domains(app, DomainList::Block),
         MenuItem::Diagnostics => {
             // Прогон мог начаться раньше, и экран закрывали: без этого он
             // открывался бы в режиме «можно запускать», хотя прогон идёт.
@@ -95,6 +80,16 @@ fn handle_select(app: &mut App) -> StepResult {
         },
         MenuItem::Start => StepResult::Stay(Action::StartProxy),
         MenuItem::Quit => StepResult::Stay(Action::Quit),
+    }
+}
+
+fn open_domains(app: &mut App, list: DomainList) -> StepResult {
+    match domains_editor::load_domains(list) {
+        Ok(domains) => StepResult::Switch(
+            Screen::DomainsEditor(domains_editor::DomainsEditorState::new(list, domains)),
+            Action::None,
+        ),
+        Err(e) => { app.push_err(e); StepResult::Stay(Action::None) }
     }
 }
 
@@ -141,9 +136,8 @@ fn draw_header(frame: &mut Frame, area: Rect) {
 
 fn menu_label(item: MenuItem) -> String {
     match item {
-        MenuItem::Status => t!("menu.status").to_string(),
-        MenuItem::Bypass => t!("menu.bypass").to_string(),
         MenuItem::Domains => t!("menu.domains").to_string(),
+        MenuItem::Blocklist => t!("menu.blocklist").to_string(),
         MenuItem::Diagnostics => t!("menu.diagnostics").to_string(),
         MenuItem::Config => t!("menu.config").to_string(),
         MenuItem::Start => t!("menu.start").to_string(),

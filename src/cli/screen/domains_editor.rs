@@ -1,4 +1,8 @@
-//! Экран редактирования bypass_domains.txt — состояние + I/O + обработка клавиш.
+//! Экран редактирования списков доменов (bypass_domains.txt и
+//! block_domains.txt) — состояние + I/O + обработка клавиш. Формат у файлов
+//! один, различаются только путь и подписи, поэтому экран общий.
+
+use std::collections::HashSet;
 
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -15,7 +19,40 @@ use crate::observability::error::AppError;
 
 use super::StepResult;
 
+/// Какой из списков открыт в редакторе.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainList {
+    Bypass,
+    Block,
+}
+
+impl DomainList {
+    fn path(self) -> &'static str {
+        match self {
+            DomainList::Bypass => "bypass_domains.txt",
+            DomainList::Block => "block_domains.txt",
+        }
+    }
+
+    fn title_key(self) -> &'static str {
+        match self {
+            DomainList::Bypass => "domains.panel_title",
+            DomainList::Block => "blocklist.panel_title",
+        }
+    }
+
+    pub fn saved_key(self, proxy_started: bool) -> &'static str {
+        match (self, proxy_started) {
+            (DomainList::Bypass, false) => "domains.saved",
+            (DomainList::Bypass, true) => "domains.saved_restart",
+            (DomainList::Block, false) => "blocklist.saved",
+            (DomainList::Block, true) => "blocklist.saved_restart",
+        }
+    }
+}
+
 pub struct DomainsEditorState {
+    pub list: DomainList,
     pub domains: Vec<String>,
     pub selected: usize,
     /// Some(buffer) когда вводим новый домен ИЛИ редактируем существующий.
@@ -25,8 +62,8 @@ pub struct DomainsEditorState {
 }
 
 impl DomainsEditorState {
-    pub fn new(domains: Vec<String>) -> Self {
-        Self { domains, selected: 0, editing_buffer: None, is_editing_existing: false }
+    pub fn new(list: DomainList, domains: Vec<String>) -> Self {
+        Self { list, domains, selected: 0, editing_buffer: None, is_editing_existing: false }
     }
 
     pub fn next(&mut self) {
@@ -69,7 +106,7 @@ pub fn handle_key(state: &mut DomainsEditorState, key: KeyCode) -> StepResult {
 
                 // NB: app.status.domains_count обновляется в screen::handle_key()
                 // на основе длины Vec внутри этого Action — состояние не знает про App.
-                StepResult::Stay(Action::SaveDomains(state.domains.clone()))
+                StepResult::Stay(Action::SaveDomains(state.list, state.domains.clone()))
             }
             KeyCode::Esc => {
                 state.editing_buffer = None;
@@ -110,7 +147,7 @@ pub fn handle_key(state: &mut DomainsEditorState, key: KeyCode) -> StepResult {
                 if state.selected >= state.domains.len() && state.selected > 0 {
                     state.selected -= 1;
                 }
-                StepResult::Stay(Action::SaveDomains(state.domains.clone()))
+                StepResult::Stay(Action::SaveDomains(state.list, state.domains.clone()))
             }
             KeyCode::Esc | KeyCode::Char('q') => StepResult::Close(Action::None),
             _ => StepResult::Stay(Action::None),
@@ -118,12 +155,12 @@ pub fn handle_key(state: &mut DomainsEditorState, key: KeyCode) -> StepResult {
     }
 }
 
-// --- I/O: без изменений по сравнению со старым domains_editor.rs ---
+// --- I/O ---
 
 /// Строки-комментарии пропускаются так же, как в `config::load_bypass_domains`.
 /// Раньше редактор показывал их как домены и учитывал в счётчике.
-pub fn load_domains() -> Result<Vec<String>, AppError> {
-    let text = crate::config::paths::read_to_string("bypass_domains.txt").unwrap_or_default();
+pub fn load_domains(list: DomainList) -> Result<Vec<String>, AppError> {
+    let text = crate::config::paths::read_to_string(list.path()).unwrap_or_default();
     Ok(text
         .lines()
         .map(|l| l.trim().to_string())
@@ -131,37 +168,51 @@ pub fn load_domains() -> Result<Vec<String>, AppError> {
         .collect())
 }
 
-/// Комментарии из файла сохраняются: они идут в начало, следом домены.
-pub fn save_domains(domains: &[String]) -> Result<(), AppError> {
-    let existing = crate::config::paths::read_to_string("bypass_domains.txt").unwrap_or_default();
+pub fn save_domains(list: DomainList, domains: &[String]) -> Result<(), AppError> {
+    let existing = crate::config::paths::read_to_string(list.path()).unwrap_or_default();
     let content = render_domains_file(&existing, domains);
-    crate::config::paths::write_atomic("bypass_domains.txt", &content)
+    crate::config::paths::write_atomic(list.path(), &content)
         .map_err(|e| AppError::new("error.domains_write").with("error", e))
 }
 
+/// Файл переписывается по месту: комментарии и пустые строки остаются где
+/// были, удалённые домены выпадают, новые дописываются в конец. Раньше все
+/// комментарии поднимались наверх, а домены шли следом по алфавиту — в
+/// block_domains.txt это отрывало заголовки групп («# Google Analytics»)
+/// от их доменов.
 fn render_domains_file(existing: &str, domains: &[String]) -> String {
+    let wanted: HashSet<&str> = domains.iter().map(String::as_str).collect();
+    let mut written: HashSet<&str> = HashSet::new();
     let mut out = String::new();
-    for comment in existing.lines().filter(|l| l.trim_start().starts_with('#')) {
-        out.push_str(comment);
-        out.push('\n');
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        let keep = trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || (wanted.contains(trimmed) && written.insert(trimmed));
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
     }
     for domain in domains {
-        out.push_str(domain);
-        out.push('\n');
+        if written.insert(domain) {
+            out.push_str(domain);
+            out.push('\n');
+        }
     }
     out
 }
 
-// --- Отрисовка: перенесено из старого ui.rs::draw_domains_editor 1-в-1. ---
+// --- Отрисовка ---
 
 pub fn draw(frame: &mut Frame, area: Rect, editor: &DomainsEditorState, proxy_started: bool) {
     let popup = super::centered_rect(60, 80, area);
     frame.render_widget(Clear, popup);
 
     let title = if proxy_started {
-        format!(" {}{} ", t!("domains.panel_title"), t!("domains.restart_needed"))
+        format!(" {}{} ", t!(editor.list.title_key()), t!("domains.restart_needed"))
     } else {
-        format!(" {} ({}) ", t!("domains.panel_title"), editor.domains.len())
+        format!(" {} ({}) ", t!(editor.list.title_key()), editor.domains.len())
     };
 
     let outer = Block::default()
@@ -218,9 +269,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn saving_keeps_comments_and_does_not_duplicate_them_as_domains() {
-        let existing = "# мой список\nyoutube.com\n# ещё\nx.com\n";
+    fn saving_keeps_comments_in_place_and_does_not_duplicate_them_as_domains() {
+        let existing = "# мой список\nyoutube.com\n\n# ещё\nx.com\n";
         let out = render_domains_file(existing, &["x.com".to_string(), "youtube.com".to_string()]);
-        assert_eq!(out, "# мой список\n# ещё\nx.com\nyoutube.com\n");
+        assert_eq!(out, existing);
+    }
+
+    #[test]
+    fn saving_drops_removed_and_appends_new_domains() {
+        let existing = "# Метрика\nmc.yandex.ru\nmc.yandex.by\n\n# GA\ngoogle-analytics.com\n";
+        let domains = ["google-analytics.com", "mc.yandex.ru", "new.tracker.io"].map(String::from);
+        let out = render_domains_file(existing, &domains);
+        assert_eq!(out, "# Метрика\nmc.yandex.ru\n\n# GA\ngoogle-analytics.com\nnew.tracker.io\n");
+    }
+
+    #[test]
+    fn saving_collapses_duplicate_lines() {
+        let out = render_domains_file("x.com\nx.com\n", &["x.com".to_string()]);
+        assert_eq!(out, "x.com\n");
     }
 }

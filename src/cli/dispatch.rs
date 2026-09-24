@@ -457,21 +457,18 @@ pub fn run(
             });
         }
 
-        Action::SaveDomains(domains_snapshot) => {
+        Action::SaveDomains(list, domains_snapshot) => {
             let log_tx = log_tx.clone();
             let proxy_started = app.proxy_started;
             rt.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    domains_editor::save_domains(&domains_snapshot)
+                    domains_editor::save_domains(list, &domains_snapshot)
                 }).await;
 
                 match result {
                     Ok(Ok(())) => {
-                        if proxy_started {
-                            log::log_t(&log_tx, LogLevel::Warning, "domains.saved_restart", vec![]);
-                        } else {
-                            log::log_t(&log_tx, LogLevel::Success, "domains.saved", vec![]);
-                        }
+                        let level = if proxy_started { LogLevel::Warning } else { LogLevel::Success };
+                        log::log_t(&log_tx, level, list.saved_key(proxy_started), vec![]);
                     }
                     Ok(Err(e)) => log::log_err(&log_tx, LogLevel::Error, e),
                     Err(e) => log::log_t(&log_tx, LogLevel::Error, "log.save_task_error", vec![("error", e.to_string())]),

@@ -78,7 +78,8 @@ pub fn handle_key(app: &mut App, key: KeyCode) -> Action {
     // domains_editor не имеет доступа к App (сознательно — состояние экрана
     // не должно знать о статусе прокси), поэтому счётчик доменов в статусе
     // обновляется здесь, на основе данных внутри самого Action.
-    if let Action::SaveDomains(domains) = &action {
+    // Счётчик в статусе — про список обхода; список блокировки его не трогает.
+    if let Action::SaveDomains(domains_editor::DomainList::Bypass, domains) = &action {
         app.status.domains_count = domains.len();
     }
 
