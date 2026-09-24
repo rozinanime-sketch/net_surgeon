@@ -27,3 +27,5 @@ discord.media
 i.ytimg.com
 media.discordapp.net
 cdn.discordapp.com
+wattpad.com
+webnovel.com
