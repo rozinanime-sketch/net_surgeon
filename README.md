@@ -41,22 +41,34 @@
 Программа собрана статически и работает на любом дистрибутиве.
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.2.0/net_surgeon-0.2.0-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.2.0-x86_64-linux.tar.gz
-cd net_surgeon-0.2.0
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.3.0/net_surgeon-0.3.0-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.3.0-x86_64-linux.tar.gz
+cd net_surgeon-0.3.0
 ./run.sh
 ```
 
 ### Из исходников
 
 ```sh
-git clone --branch v0.2.0 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.3.0 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```
 
 `run.sh` сам соберёт программу при первом запуске и пересоберёт, если код
-изменился. Без `--branch v0.2.0` скачается текущая версия из `main`, а не релиз.
+изменился. Без `--branch v0.3.0` скачается текущая версия из `main`, а не релиз.
+
+### Android
+
+Скачайте `net_surgeon-0.3.0-arm64.apk` со [страницы релиза](https://github.com/rozinanime-sketch/net_surgeon/releases/tag/v0.3.0)
+и откройте на телефоне. Android попросит разрешить установку из этого
+источника — это нормально для приложений не из Google Play. Нужен Android 8
+или новее и 64-битный процессор (arm64), то есть почти любой телефон последних
+лет.
+
+В приложении нажмите «Включить» и согласитесь на подключение VPN. Это не
+настоящий VPN: трафик не уходит с телефона, подробнее — в
+[android/README.md](android/README.md).
 
 ## Пример использования
 
