@@ -3,6 +3,7 @@ mod tcp;
 mod handshake;
 mod http;
 mod https;
+pub mod telegram;
 mod transparent;
 mod transparent_udp;
 // pub, потому что подмодули ходят друг к другу (socks5/udp.rs читает
@@ -58,6 +59,7 @@ pub async fn run_all(
     // прокси из интерфейса, и правки списка применяются тогда же, когда
     // правки config.toml и bypass_domains.txt.
     crate::block::reload(config.block_trackers, &log_tx);
+    telegram::reload(&log_tx);
 
     let tcp_task = {
         let config = Arc::clone(&config);

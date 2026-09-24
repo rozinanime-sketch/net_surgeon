@@ -185,6 +185,21 @@ async fn handle(
         return;
     };
 
+    // Адрес Telegram — через ретранслятор, если он настроен. Раньше первого
+    // чтения: по содержимому тут решать нечего, а клиент MTProto заговорит
+    // сам, как только соединение пойдёт дальше.
+    if super::telegram::is_telegram(target_addr.ip(), target_addr.port())
+        && let Some(relay) = super::telegram::relay()
+    {
+        if let Err(e) = super::telegram::relay_connection(&mut client, &relay, target_addr.ip(), target_addr.port(), &[], log_tx, metrics).await {
+            log_t(log_tx, LogLevel::Warning, "log.telegram_relay_error", vec![
+                ("addr", target_addr.to_string()),
+                ("error", e.to_string()),
+            ]);
+        }
+        return;
+    }
+
     // Первый пакет: для TLS это ClientHello, из которого достаём имя домена.
     // Собираем его целиком — SNI может лежать за границей первого сегмента.
     let mut payload: Vec<u8> = Vec::with_capacity(4096);

@@ -55,7 +55,13 @@ cargo install cargo-ndk
 adb shell run-as io.github.netsurgeon cat files/strategies.txt
 ```
 
+## Telegram
+
+Если в корне проекта есть `telegram_relay.txt` с адресом вашего воркера,
+`build.sh` положит его в приложение, и Telegram пойдёт через ретранслятор
+(см. [cloudflare/README.md](../cloudflare/README.md)).
+
 ## Проверено
 
 Honor 90, Android 15, мобильный интернет: YouTube (`tls_record`) и Discord
-(`oob`) открываются.
+(`oob`) открываются; Telegram — через ретранслятор, фото и видео грузятся.

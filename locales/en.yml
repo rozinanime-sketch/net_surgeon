@@ -223,3 +223,6 @@ log.transparent_ipv6_unavailable: "Transparent mode: IPv6 listener %{addr} faile
 startup.config_reloaded: "Config and domain list reloaded"
 startup.config_reload_failed: "Config not reloaded, keeping the previous one: %{error}"
 startup.resolver_restart_needed: "resolve_via_doh and doh_provider for outgoing connections apply only after restarting the program"
+log.telegram_relay_active: "Telegram via relay %{host}"
+log.telegram_relayed: "Telegram → relay: %{addr}"
+log.telegram_relay_error: "Telegram relay unreachable (%{addr}): %{error}"

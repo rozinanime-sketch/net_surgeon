@@ -31,6 +31,10 @@ say "Файлы данных"
 ASSETS=app/src/main/assets
 mkdir -p "$ASSETS"
 cp ../bypass_domains.txt ../block_domains.txt "$ASSETS"/
+# Адрес своего воркера для Telegram (см. cloudflare/README.md). Файла нет —
+# в сборку он не попадёт, и Telegram пойдёт напрямую.
+rm -f "$ASSETS/telegram_relay.txt"
+[[ -f ../telegram_relay.txt ]] && cp ../telegram_relay.txt "$ASSETS"/
 sed -E \
     -e 's/^([[:space:]]*transparent_port[[:space:]]*=).*/\1 0/' \
     -e 's/^([[:space:]]*udp_port[[:space:]]*=).*/\1 0/' \

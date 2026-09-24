@@ -268,6 +268,25 @@ async fn handle_connect(
         return;
     }
 
+    // Адрес Telegram — через ретранслятор, если он настроен (см. модуль
+    // telegram). Успех отвечается сразу: клиент MTProto заговорит только
+    // после него, а до воркера ещё идти TLS и рукопожатию WebSocket.
+    if let Ok(addr) = target.parse::<std::net::SocketAddr>()
+        && crate::proxy::telegram::is_telegram(addr.ip(), addr.port())
+        && let Some(relay) = crate::proxy::telegram::relay()
+    {
+        if stream.write_all(&[SOCKS5_VERSION, REP_SUCCESS, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0, 0]).await.is_err() {
+            return;
+        }
+        if let Err(e) = crate::proxy::telegram::relay_connection(&mut *stream, &relay, addr.ip(), addr.port(), &pipelined, log_tx, metrics).await {
+            log_t(log_tx, LogLevel::Warning, "log.telegram_relay_error", vec![
+                ("addr", addr.to_string()),
+                ("error", e.to_string()),
+            ]);
+        }
+        return;
+    }
+
     log_t(log_tx, LogLevel::Info, "log.socks5_connect_to", vec![("target", target.clone())]);
 
     let mut server = match crate::dns::resolver::connect(&target).await {

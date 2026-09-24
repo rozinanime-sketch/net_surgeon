@@ -12,7 +12,11 @@ import java.io.File
 object DataFiles {
     const val BYPASS = "bypass_domains.txt"
     const val BLOCK = "block_domains.txt"
+    const val TELEGRAM_RELAY = "telegram_relay.txt"
     private val DEFAULTS = listOf("config.toml", BYPASS, BLOCK)
+
+    /** Есть не в каждой сборке: только если при сборке был свой воркер. */
+    private val OPTIONAL = listOf(TELEGRAM_RELAY)
 
     fun dir(context: Context): File = context.filesDir
 
@@ -23,6 +27,16 @@ object DataFiles {
             context.assets.open(name).use { input ->
                 target.outputStream().use { input.copyTo(it) }
             }
+        }
+        for (name in OPTIONAL) {
+            val target = File(dir(context), name)
+            if (target.exists()) continue
+            val input = try {
+                context.assets.open(name)
+            } catch (e: java.io.FileNotFoundException) {
+                continue
+            }
+            input.use { src -> target.outputStream().use { src.copyTo(it) } }
         }
     }
 

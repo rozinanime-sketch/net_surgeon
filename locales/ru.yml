@@ -223,3 +223,6 @@ log.transparent_ipv6_unavailable: "Прозрачный режим: IPv6-слу�
 startup.config_reloaded: "Конфиг и список доменов перечитаны"
 startup.config_reload_failed: "Конфиг не перечитан, работаю со старым: %{error}"
 startup.resolver_restart_needed: "resolve_via_doh и doh_provider для исходящих подключений применятся только после перезапуска программы"
+log.telegram_relay_active: "Telegram через ретранслятор %{host}"
+log.telegram_relayed: "Telegram → ретранслятор: %{addr}"
+log.telegram_relay_error: "Ретранслятор Telegram недоступен (%{addr}): %{error}"

@@ -1,0 +1,5 @@
+# Ретранслятор Telegram для net_surgeon — см. worker.js и README.md.
+name = "net-surgeon-tg"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
