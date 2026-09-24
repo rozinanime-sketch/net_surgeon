@@ -47,11 +47,28 @@ async fn main() {
         }
     };
 
+    // `--firewall` передаёт run.sh: перехват ставит сама программа, и ядро
+    // снимет его при любом её завершении (см. src/firewall.rs).
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|a| a == "--firewall") {
+        let cfg = &startup.config;
+        match net_surgeon::firewall::install(cfg.transparent_port, cfg.udp_port) {
+            Ok(msg) => eprintln!("[✓] {}", msg),
+            Err(e) => {
+                eprintln!("[✗] Прозрачный режим: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     match parse_mode() {
         Mode::Headless => headless::run(false, startup).await,
         Mode::DiagnoseOnly => run_diagnose_only(startup).await,
         Mode::Tui => run_tui(startup),
     }
+
+    #[cfg(target_os = "linux")]
+    net_surgeon::firewall::release();
 }
 
 /// `--diagnose-only` в сборке с интерфейсом остаётся интерактивным: смотреть

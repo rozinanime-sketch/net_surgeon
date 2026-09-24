@@ -33,6 +33,8 @@
 //! * `block` — какие домены не пропускать вовсе: трекеры и счётчики.
 //! * `cli` — терминальный интерфейс. Единственный модуль за feature-флагом.
 //! * `headless` — тот же запуск без интерфейса.
+//! * `firewall` — правила прозрачного режима, которые ядро снимает само,
+//!   когда процесс завершается (только Linux).
 //!
 //! # Направление зависимостей
 //!
@@ -51,6 +53,10 @@ pub mod bypass;
 pub mod config;
 pub mod dns;
 pub mod engine;
+/// Правила прозрачного режима из самой программы (nftables, флаг owner).
+/// На Android перехват делает VpnService, там модуль не нужен.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+pub mod firewall;
 pub mod headless;
 pub mod observability;
 pub mod protocol;

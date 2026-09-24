@@ -24,7 +24,16 @@
 # как забытая настройка.
 #
 #
-# ПОЧЕМУ СНЯТИЕ ПРАВИЛА УСТРОЕНО ТАК СЛОЖНО
+# КАК ЭТО УСТРОЕНО ТЕПЕРЬ
+#
+# Если в системе есть nft, правила ставит сама программа — в таблицу
+# nftables с флагом owner, которую ядро удаляет вместе с процессом (см.
+# src/firewall.rs). Всё описанное ниже про снятие правил относится к
+# старому пути через iptables: он остался для систем без nftables и
+# включается принудительно через NET_SURGEON_LEGACY=1.
+#
+#
+# ПОЧЕМУ СНЯТИЕ ПРАВИЛА УСТРОЕНО ТАК СЛОЖНО (старый путь)
 #
 # Одного `trap cleanup EXIT` недостаточно — на практике правило оставалось
 # висеть, и сеть падала. Причин было четыре, и закрыты они по отдельности:
@@ -384,9 +393,20 @@ build() {
 # — худший момент для изучения синтаксиса.
 
 if [[ $MODE == off || $MODE == --off ]]; then
+    # Перехват нового образца (nftables, owner) живёт ровно столько, сколько
+    # процесс: остановить его — и ядро снимет таблицу само, без root.
+    if pgrep -x net_surgeon >/dev/null; then
+        say "Останавливаю net_surgeon — перехват снимется вместе с ним."
+        pkill -x net_surgeon || true
+        sleep 1
+        pgrep -x net_surgeon >/dev/null && pkill -9 -x net_surgeon
+    fi
     say "Нужны права root, чтобы снять перехват."
     sudo -v || die "Без sudo правило не снять."
     sweep_rules
+    if command -v nft >/dev/null && sudo nft list table inet net_surgeon >/dev/null 2>&1; then
+        die "Таблица nftables net_surgeon осталась — значит, её держит живой процесс. Найдите его: ps -ef | grep net_surgeon"
+    fi
     if rule_present || udp_rule_present || dns_rule_present; then
         die "Снять не удалось. Найдите правила с портом $PORT (sudo iptables -t nat -S OUTPUT; sudo iptables -t mangle -S) и удалите их по одному через -D. Не используйте -F: это снесёт и правила Docker/VPN."
     fi
@@ -396,6 +416,11 @@ fi
 
 if [[ $MODE == status || $MODE == --status ]]; then
     sudo -v || die "Нужны права root, чтобы прочитать таблицу nat."
+    if command -v nft >/dev/null && sudo nft list table inet net_surgeon >/dev/null 2>&1; then
+        warn "Перехват ВКЛЮЧЁН (nftables, снимется вместе с процессом net_surgeon):"
+        sudo nft list table inet net_surgeon | grep -E "redirect|tproxy" | sed 's/^[[:space:]]*/  /'
+        exit 0
+    fi
     if rule_present || udp_rule_present || dns_rule_present; then
         warn "Перехват на порт $PORT ВКЛЮЧЁН. Действующие правила:"
         sudo iptables -t nat -S OUTPUT 2>/dev/null | grep -E -- "$NAT_PAT" || true
@@ -431,6 +456,62 @@ fi
 check_vpn
 build
 
+# --- новый путь: правила ставит сама программа -----------------------------
+#
+# Таблица nftables с флагом owner принадлежит процессу и исчезает вместе с
+# ним, как бы он ни завершился (src/firewall.rs). Снимать при выходе нечего,
+# поэтому sudo нужен только один раз после сборки — выдать бинарю права:
+#
+#   группа nsproxy + setgid  — прокси сразу стартует в своей группе, и его
+#                              трафик не попадает обратно в перехват;
+#   cap_net_admin            — ставить правила и маршруты;
+#   cap_net_bind_service     — обратный сокет QUIC привязывается к порту 443.
+#
+# Пересборка заменяет файл, и всё это с него слетает — тогда спросим снова.
+# Без nft (или с NET_SURGEON_LEGACY=1) — старый путь через iptables ниже.
+ensure_config_port() {
+    # Порт в конфиге — правим сами, чтобы не заставлять лезть в редактор.
+    # Но config.toml принадлежит пользователю, поэтому: трогаем его только
+    # когда значение действительно другое, и вслух говорим, что поменяли.
+    if grep -qE '^[[:space:]]*transparent_port[[:space:]]*=' config.toml; then
+        CURRENT_PORT="$(sed -nE 's/^[[:space:]]*transparent_port[[:space:]]*=[[:space:]]*([^#[:space:]]*).*/\1/p' config.toml | head -n1)"
+        if [[ $CURRENT_PORT != "$PORT" ]]; then
+            sed -i -E "s/^([[:space:]]*transparent_port[[:space:]]*=).*/\1 $PORT/" config.toml
+            warn "В config.toml изменён transparent_port: ${CURRENT_PORT:-пусто} -> $PORT"
+        fi
+    else
+        printf '\ntransparent_port = %s\n' "$PORT" >> config.toml
+        warn "В config.toml добавлена строка transparent_port = $PORT"
+    fi
+}
+
+bin_privileged() {
+    [[ $(stat -c %G "$BIN" 2>/dev/null) == "$GROUP" ]] || return 1
+    [[ -g $BIN ]] || return 1
+    getcap "$BIN" 2>/dev/null | grep -q cap_net_admin || return 1
+}
+
+if command -v nft >/dev/null && command -v getcap >/dev/null && [[ -z ${NET_SURGEON_LEGACY:-} ]]; then
+    ensure_config_port
+
+    if ! bin_privileged; then
+        say "Выдаю программе права на перехват (один раз после сборки, нужен sudo)."
+        sudo -v || die "Без sudo прозрачный режим не настроить. Попробуйте: ./run.sh plain"
+        getent group "$GROUP" >/dev/null || sudo groupadd --system "$GROUP"
+        # Порядок важен: chgrp сбрасывает и бит setgid, и полномочия файла.
+        sudo chgrp "$GROUP" "$BIN"
+        sudo chmod 2755 "$BIN"
+        sudo setcap cap_net_admin,cap_net_bind_service+ep "$BIN"
+        bin_privileged || die "Права выдать не удалось. Каталог на разделе с nosuid? Тогда: NET_SURGEON_LEGACY=1 ./run.sh"
+    fi
+
+    say "Запуск. Перехват снимется сам при любом выходе, даже при закрытии окна."
+    "$BIN" --firewall || true
+    exit 0
+fi
+
+# --- старый путь: iptables через sudo --------------------------------------
+
 # Права понадобятся дважды: поставить правило и снять. Спрашиваем один раз
 # и держим sudo «тёплым», чтобы при выходе не появился запрос пароля
 # в самый неподходящий момент.
@@ -450,21 +531,7 @@ if ! getent group "$GROUP" >/dev/null; then
 fi
 build_match
 
-# Порт в конфиге — правим сами, чтобы не заставлять лезть в редактор.
-# Но config.toml принадлежит пользователю, поэтому: трогаем его только когда
-# значение действительно другое, и вслух говорим, что именно поменяли.
-# Раньше sed отрабатывал каждый запуск молча и заодно срезал комментарий
-# в конце строки, даже если порт и так был нужный.
-if grep -qE '^[[:space:]]*transparent_port[[:space:]]*=' config.toml; then
-    CURRENT_PORT="$(sed -nE 's/^[[:space:]]*transparent_port[[:space:]]*=[[:space:]]*([^#[:space:]]*).*/\1/p' config.toml | head -n1)"
-    if [[ $CURRENT_PORT != "$PORT" ]]; then
-        sed -i -E "s/^([[:space:]]*transparent_port[[:space:]]*=).*/\1 $PORT/" config.toml
-        warn "В config.toml изменён transparent_port: ${CURRENT_PORT:-пусто} -> $PORT"
-    fi
-else
-    printf '\ntransparent_port = %s\n' "$PORT" >> config.toml
-    warn "В config.toml добавлена строка transparent_port = $PORT"
-fi
+ensure_config_port
 
 # Правила с прошлого запуска (или от `setup-transparent.sh on`) могли
 # остаться. Сносим ВСЕ, а не одно: иначе добавленное сейчас станет вторым
