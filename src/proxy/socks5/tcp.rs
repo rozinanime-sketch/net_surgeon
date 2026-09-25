@@ -300,6 +300,15 @@ async fn handle_connect(
 
     let _ = stream.write_all(&[SOCKS5_VERSION, REP_SUCCESS, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0, 0]).await;
 
+    // Nagle выключается, как в HTTPS-туннеле и прозрачном режиме. Без этого
+    // вторая часть разрезанного ClientHello ждала ACK на первую: disorder
+    // вырождался в обычный сплит с задержкой ретрансмита (первая половина
+    // с низким TTL не доходит, ACK нет), остальные техники получали паузу
+    // в RTT. Через этот путь идёт весь трафик Android, а диагностика мерила
+    // техники с выключенным Nagle — в бою применялось не то, что измерено.
+    let _ = stream.set_nodelay(true);
+    let _ = server.set_nodelay(true);
+
     // Дескриптор до разделения: disorder и oob работают с сокетом напрямую.
     let server_fd = {
         use std::os::fd::AsRawFd;

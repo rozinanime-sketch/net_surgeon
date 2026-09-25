@@ -376,6 +376,21 @@ fn normalize_domain(domain: &str) -> String {
     domain.trim().trim_end_matches('.').to_lowercase()
 }
 
+/// Проверка «запись годится» для момента `now`: не протухла по времени
+/// И снята текущей версией методики — после смены профиля ClientHello или
+/// набора техник прошлые вердикты несопоставимы с новыми. Одна на
+/// `lookup_detailed` и `record_outcome`, чтобы исход засчитывался той же
+/// записи, что дала стратегию.
+fn usable_at(ttl_hours: u64, now: u64) -> impl Fn(&Entry) -> bool {
+    let ttl_secs = ttl_hours.saturating_mul(3600);
+    let resigned_ttl_secs = RESIGNED_TTL_HOURS.saturating_mul(3600).min(ttl_secs);
+    move |entry: &Entry| {
+        let ttl = if entry.resigned { resigned_ttl_secs } else { ttl_secs };
+        now.saturating_sub(entry.decided_at) < ttl
+            && entry.version == crate::engine::diagnostics::DIAGNOSTIC_VERSION
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
@@ -517,18 +532,7 @@ impl StrategyStore {
     pub fn lookup_detailed(&self, domain: &str, class: HelloClass, ttl_hours: u64) -> Option<(Strategy, MatchKind)> {
         let key = normalize_domain(domain);
         let guard = self.inner.read().unwrap();
-        let ttl_secs = ttl_hours.saturating_mul(3600);
-        let resigned_ttl_secs = RESIGNED_TTL_HOURS.saturating_mul(3600).min(ttl_secs);
-        let now = now_secs();
-
-        // Запись годится, если не протухла по времени И снята текущей
-        // версией методики: после смены профиля ClientHello или набора
-        // техник прошлые вердикты несопоставимы с новыми.
-        let usable = |entry: &Entry| {
-            let ttl = if entry.resigned { resigned_ttl_secs } else { ttl_secs };
-            now.saturating_sub(entry.decided_at) < ttl
-                && entry.version == crate::engine::diagnostics::DIAGNOSTIC_VERSION
-        };
+        let usable = usable_at(ttl_hours, now_secs());
 
         // Точная запись решает всё: если она протухла, наследовать стратегию
         // у родителя НЕЛЬЗЯ. Наследование заодно отменяет переизмерение
@@ -652,11 +656,12 @@ impl StrategyStore {
     ///
     /// Возвращает true, если запись была сброшена — вызывающий код тогда
     /// сообщает об этом в лог.
-    pub fn record_outcome(&self, domain: &str, class: HelloClass, succeeded: bool) -> bool {
+    pub fn record_outcome(&self, domain: &str, class: HelloClass, succeeded: bool, ttl_hours: u64) -> bool {
         use std::sync::atomic::Ordering;
 
         let exact = (normalize_domain(domain), class);
         let mut guard = self.inner.write().unwrap();
+        let usable = usable_at(ttl_hours, now_secs());
 
         // Ключ ищется той же лестницей, что и в `lookup_detailed`: точная
         // запись, иначе ближайший родитель.
@@ -676,10 +681,15 @@ impl StrategyStore {
             // Записи «без обхода» пропускаются ровно как в `lookup_detailed`:
             // стратегию поддомену дала не она, и засчитывать ей чужие провалы
             // значило бы сбросить рабочий `none`, оставив нерабочую технику.
+            //
+            // Протухшие — тоже: `lookup_detailed` через них перешагивает, и
+            // стратегию дал предок выше. Раньше исход доставался ближайшей
+            // протухшей записи, а нерабочая стратегия настоящего владельца
+            // не набирала неудач и не сбрасывалась.
             let owner = crate::bypass::parent_domains(&exact.0).find(|p| {
                 guard
                     .get(&(p.to_string(), class))
-                    .is_some_and(|e| e.strategy != Strategy::None)
+                    .is_some_and(|e| e.strategy != Strategy::None && usable(e))
             });
             match owner {
                 Some(parent) => (parent.to_string(), class),
@@ -1075,10 +1085,10 @@ mod tests {
         store.set("googlevideo.com", HelloClass::Large, Strategy::TlsRecord, 0.44);
 
         for _ in 0..MAX_CONSECUTIVE_FAILURES - 1 {
-            assert!(!store.record_outcome("rr3---sn-pivhx.googlevideo.com", HelloClass::Large, false));
+            assert!(!store.record_outcome("rr3---sn-pivhx.googlevideo.com", HelloClass::Large, false, 24));
         }
         // Третья неудача подряд сбрасывает запись родителя
-        assert!(store.record_outcome("rr5---sn-other.googlevideo.com", HelloClass::Large, false));
+        assert!(store.record_outcome("rr5---sn-other.googlevideo.com", HelloClass::Large, false, 24));
         assert_eq!(store.lookup_detailed("googlevideo.com", HelloClass::Large, 24), None);
 
         assert_eq!(store.verification_stats().total, MAX_CONSECUTIVE_FAILURES as u64);
@@ -1095,7 +1105,7 @@ mod tests {
         store.set("a.example.com", HelloClass::Large, Strategy::None, 1.0);
 
         for _ in 0..MAX_CONSECUTIVE_FAILURES {
-            store.record_outcome("b.a.example.com", HelloClass::Large, false);
+            store.record_outcome("b.a.example.com", HelloClass::Large, false, 24);
         }
         assert_eq!(
             store.lookup_detailed("a.example.com", HelloClass::Large, 24),
@@ -1110,18 +1120,18 @@ mod tests {
         let store = StrategyStore::new();
         store.set("googlevideo.com", HelloClass::Large, Strategy::TlsRecord, 0.44);
 
-        assert!(!store.record_outcome("a.googlevideo.com", HelloClass::Large, false));
-        assert!(!store.record_outcome("b.googlevideo.com", HelloClass::Large, true));
+        assert!(!store.record_outcome("a.googlevideo.com", HelloClass::Large, false, 24));
+        assert!(!store.record_outcome("b.googlevideo.com", HelloClass::Large, true, 24));
         // Серия прервана, поэтому следующие две неудачи ещё не сбрасывают запись
-        assert!(!store.record_outcome("c.googlevideo.com", HelloClass::Large, false));
-        assert!(!store.record_outcome("d.googlevideo.com", HelloClass::Large, false));
+        assert!(!store.record_outcome("c.googlevideo.com", HelloClass::Large, false, 24));
+        assert!(!store.record_outcome("d.googlevideo.com", HelloClass::Large, false, 24));
         assert!(store.lookup_detailed("googlevideo.com", HelloClass::Large, 24).is_some());
     }
 
     #[test]
     fn outcome_for_an_unknown_domain_is_ignored() {
         let store = StrategyStore::new();
-        assert!(!store.record_outcome("example.com", HelloClass::Large, false));
+        assert!(!store.record_outcome("example.com", HelloClass::Large, false, 24));
         assert_eq!(store.verification_stats().total, 0);
     }
 
@@ -1133,9 +1143,9 @@ mod tests {
         let store = StrategyStore::new();
         store.set("example.com", HelloClass::Large, Strategy::TlsRecord, 0.44);
         for _ in 0..4 {
-            store.record_outcome("example.com", HelloClass::Large, true);
+            store.record_outcome("example.com", HelloClass::Large, true, 24);
         }
-        store.record_outcome("example.com", HelloClass::Large, false);
+        store.record_outcome("example.com", HelloClass::Large, false, 24);
 
         // Та же техника — статистика продолжает накапливаться
         store.set("example.com", HelloClass::Large, Strategy::TlsRecord, 0.60);
@@ -1175,7 +1185,7 @@ mod tests {
 
         // Провалы маленького пакета сбрасывают только его запись
         for _ in 0..MAX_CONSECUTIVE_FAILURES {
-            store.record_outcome("updates.discord.com", HelloClass::Small, false);
+            store.record_outcome("updates.discord.com", HelloClass::Small, false, 24);
         }
         assert_eq!(store.lookup_detailed("updates.discord.com", HelloClass::Small, 24), None);
         assert_eq!(store.lookup_detailed("updates.discord.com", HelloClass::Large, 24).map(|(s, _)| s), Some(Strategy::TlsRecord));
@@ -1241,6 +1251,24 @@ mod tests {
             store.lookup_detailed("a.b.example.com", HelloClass::Large, 1),
             Some((Strategy::TlsRecord, MatchKind::Inherited)),
         );
+    }
+
+    /// Исход засчитывается той записи, что дала стратегию, а не ближайшей
+    /// протухшей: иначе нерабочий свежий предок не сбрасывался бы никогда.
+    #[test]
+    fn live_outcome_skips_a_stale_parent_like_lookup_does() {
+        let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
+        let store = store_from(&format!(
+            "{}{}",
+            store_line("b.example.com", Strategy::SniSplit, 10 * 3600, v),
+            store_line("example.com", Strategy::TlsRecord, 0, v),
+        ));
+
+        for _ in 0..MAX_CONSECUTIVE_FAILURES - 1 {
+            assert!(!store.record_outcome("a.b.example.com", HelloClass::Large, false, 1));
+        }
+        assert!(store.record_outcome("a.b.example.com", HelloClass::Large, false, 1));
+        assert_eq!(store.lookup_detailed("example.com", HelloClass::Large, 1), None);
     }
 
     /// Записи чужой версии методики не доживают до памяти, иначе они навсегда
@@ -1374,9 +1402,9 @@ mod tests {
         let store = StrategyStore::new();
         store.set("flaky.example.com", HelloClass::Large, Strategy::None, 1.0);
 
-        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, false));
-        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, false));
-        assert!(store.record_outcome("flaky.example.com", HelloClass::Large, false));
+        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, false, 24));
+        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, false, 24));
+        assert!(store.record_outcome("flaky.example.com", HelloClass::Large, false, 24));
         assert_eq!(store.lookup_detailed("flaky.example.com", HelloClass::Large, 24), None);
         assert_eq!(store.verification_stats().invalidations, 1);
     }
@@ -1389,7 +1417,7 @@ mod tests {
         store.set_resigned("hopeless.example.com", HelloClass::Large);
 
         for _ in 0..10 {
-            assert!(!store.record_outcome("hopeless.example.com", HelloClass::Large, false));
+            assert!(!store.record_outcome("hopeless.example.com", HelloClass::Large, false, 24));
         }
         assert!(store.is_resigned("hopeless.example.com", HelloClass::Large, 24));
         assert_eq!(store.verification_stats().total, 0);

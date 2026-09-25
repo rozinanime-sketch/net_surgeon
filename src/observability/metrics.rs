@@ -5,6 +5,10 @@ use crate::observability::stats::Percentiles;
 
 pub struct Metrics {
     pub active_connections: AtomicUsize,
+    /// Со стороны прокси: `rx` — принятое от клиента (исходящий трафик
+    /// пользователя), `tx` — отданное клиенту (входящий). Ретранслятор
+    /// Telegram считал наоборот, а подписи в интерфейсе стояли как для
+    /// входящего rx, и при просмотре видео крупные числа были у «↑».
     pub bytes_rx: AtomicU64,
     pub bytes_tx: AtomicU64,
     /// Активные QUIC-сессии, проходящие через SOCKS5 UDP. Метрики

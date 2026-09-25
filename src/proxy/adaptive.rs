@@ -134,7 +134,7 @@ pub fn record_outcome(ctx: &Context<'_>, domain: &str, selected: Selected, respo
     // вердикт «прямое соединение работает», и он может оказаться ошибочным.
     // Отказ («ничего не помогло») хранилище само не засчитывает.
     let Some(class) = selected.source else { return };
-    if !ctx.strategies.record_outcome(domain, class, responded) {
+    if !ctx.strategies.record_outcome(domain, class, responded, ctx.ttl_hours) {
         return;
     }
 

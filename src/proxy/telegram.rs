@@ -150,7 +150,7 @@ where
 
     if !early.is_empty() {
         ws::send(&ws_write, ws::OP_BINARY, early).await?;
-        metrics.add_tx(early.len() as u64);
+        metrics.add_rx(early.len() as u64);
     }
 
     let up = {
@@ -166,7 +166,7 @@ where
                 if ws::send(&ws_write, ws::OP_BINARY, &buf[..n]).await.is_err() {
                     break;
                 }
-                metrics.add_tx(n as u64);
+                metrics.add_rx(n as u64);
             }
             let _ = ws::send(&ws_write, ws::OP_CLOSE, &1000u16.to_be_bytes()).await;
         }
@@ -186,7 +186,7 @@ where
                         if client_write.write_all(&payload).await.is_err() {
                             break;
                         }
-                        metrics.add_rx(payload.len() as u64);
+                        metrics.add_tx(payload.len() as u64);
                     }
                     ws::OP_PING => {
                         if ws::send(&ws_write, ws::OP_PONG, &payload).await.is_err() {

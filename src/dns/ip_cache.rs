@@ -20,6 +20,10 @@ impl IpDomainCache {
     }
 
     pub fn insert(&self, ip: IpAddr, domain: String) {
+        // Имя приводится к виду списков обхода: они в нижнем регистре и без
+        // точки в конце, а сравнение с ними точное. DoH-релей клал имя из
+        // запроса как есть, и `YouTube.com` по IP обхода не получал.
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         let mut guard = self.inner.write().unwrap();
         if guard.len() > 20_000 {
             let now = Instant::now();
