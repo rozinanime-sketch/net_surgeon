@@ -34,10 +34,9 @@ enabled = true
 # оптимальным для Cloudflare, а не для вас: на проверке x.com и meduza.io
 # переставали открываться именно поэтому.
 #
-# Google Public DNS, наоборот, опирается на ECS для геолокации. Если резолв
-# через DoH нужен, разумнее взять его:
-#   doh_provider = "https://dns.google/dns-query"
-doh_provider = "https://xbox-dns.ru/dns-query"
+# Google Public DNS, наоборот, опирается на ECS для геолокации, поэтому
+# здесь он.
+doh_provider = "https://dns.google/dns-query"
 
 # Адрес самого DoH-провайдера. Пустая строка (или отсутствие строки) —
 # обычное поведение: имя провайдера резолвит система.
@@ -48,9 +47,17 @@ doh_provider = "https://xbox-dns.ru/dns-query"
 # релею надо узнать адрес провайдера — у самого себя. Здесь этот адрес задан
 # заранее, и круг разрывается.
 #
+# Узнать адрес: getent ahostsv4 dns.google
+doh_bootstrap_ip = "8.8.8.8"
+
+# Умный DNS — только для доменов из smart_dns_domains.txt: нейросетей,
+# которые сами закрыты для России по IP. Он отвечает на них адресами своих
+# серверов за границей. Остальные сайты идут через doh_provider выше, так
+# что умный DNS не узнаёт, что ещё вы открываете. Пусто — выключено.
+smart_dns_provider = "https://xbox-dns.ru/dns-query"
+# Адрес умного DNS, по той же причине, что doh_bootstrap_ip.
 # Узнать адрес: getent ahostsv4 xbox-dns.ru
-# Например:  doh_bootstrap_ip = "111.88.96.56"
-doh_bootstrap_ip = "111.88.96.56"
+smart_dns_bootstrap_ip = "111.88.96.56"
 
 # Резолвить адреса для исходящих подключений через DoH.
 #

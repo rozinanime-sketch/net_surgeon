@@ -172,6 +172,16 @@ pub struct Config {
     #[serde(default)]
     pub doh_bootstrap_ip: Option<std::net::IpAddr>,
 
+    /// «Умный» DoH (например, xbox-dns.ru) для доменов из
+    /// smart_dns_domains.txt — сервисов, закрытых для России по IP.
+    /// Остальные имена идут через `doh_provider`. Пусто — выключено.
+    #[serde(default)]
+    pub smart_dns_provider: String,
+
+    /// То же, что `doh_bootstrap_ip`, но для `smart_dns_provider`.
+    #[serde(default)]
+    pub smart_dns_bootstrap_ip: Option<std::net::IpAddr>,
+
     /// Блокировать домены из block_domains.txt — счётчики вроде
     /// Яндекс.Метрики. По умолчанию выключено: прокси, который молча режет
     /// часть трафика, неожиданен, и включать это должен сам пользователь.
@@ -264,6 +274,13 @@ mod tests {
                 "задан doh_bootstrap_ip, но из doh_provider ({}) не извлекается хост — \
                  закреплённый адрес не будет использован",
                 config.doh_provider,
+            );
+        }
+        if config.smart_dns_bootstrap_ip.is_some() {
+            assert!(
+                crate::dns::provider_endpoint(&config.smart_dns_provider).is_some(),
+                "задан smart_dns_bootstrap_ip, но из smart_dns_provider ({}) не извлекается хост",
+                config.smart_dns_provider,
             );
         }
     }

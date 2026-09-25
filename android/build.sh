@@ -33,7 +33,7 @@ find app/src/main/jniLibs -name '*.so' ! -name 'libnet_surgeon_android.so' -dele
 say "Файлы данных"
 ASSETS=app/src/main/assets
 mkdir -p "$ASSETS"
-cp ../bypass_domains.txt ../block_domains.txt "$ASSETS"/
+cp ../bypass_domains.txt ../block_domains.txt ../smart_dns_domains.txt "$ASSETS"/
 # Адрес своего воркера для Telegram (см. cloudflare/README.md). Файла нет —
 # в сборку он не попадёт, и Telegram пойдёт напрямую. В релиз адрес не кладём
 # никогда: APK публичный, и чужой воркер тратил бы лимит вашего аккаунта.

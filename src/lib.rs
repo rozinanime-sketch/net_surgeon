@@ -119,6 +119,8 @@ pub fn bootstrap() -> Result<Startup, String> {
         config.resolve_via_doh,
         config.doh_provider.clone(),
         config.doh_bootstrap_ip,
+        config.smart_dns_provider.clone(),
+        config.smart_dns_bootstrap_ip,
         Arc::clone(&ip_cache),
     );
 

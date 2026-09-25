@@ -246,6 +246,15 @@ pub async fn run_socks5_udp_processor(
                     // на время резолва не гарантируется; клиенты, которым
                     // он важен (QUIC), шлют адрес, а не имя.
                     Err(_) => {
+                        // Сервисы умного DNS (нейросети) — только по TCP.
+                        // Системный резолвер здесь дал бы настоящий адрес, и
+                        // QUIC пришёл бы к сервису с российского IP: отказ по
+                        // региону, хотя TCP идёт через умный DNS. Без ответа
+                        // браузер сразу уходит на TCP.
+                        let host = dst_addr_str.rsplit_once(':').map_or(dst_addr_str.as_str(), |(h, _)| h);
+                        if crate::dns::smart::matches(host) {
+                            continue;
+                        }
                         tokio::spawn(async move {
                             let dst_addr = match tokio::net::lookup_host(&dst_addr_str).await {
                                 Ok(mut addrs) => match addrs.next() {

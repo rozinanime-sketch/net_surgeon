@@ -534,7 +534,10 @@ fn reload(app: &mut App, config: &mut Arc<Config>, domains: &mut Arc<HashSet<Str
         Ok(fresh) => {
             // Резолвер — синглтон, инициализированный при старте (OnceLock),
             // переинициализировать его на лету нельзя. Честно предупреждаем.
-            if fresh.resolve_via_doh != config.resolve_via_doh || fresh.doh_provider != config.doh_provider {
+            if fresh.resolve_via_doh != config.resolve_via_doh
+                || fresh.doh_provider != config.doh_provider
+                || fresh.smart_dns_provider != config.smart_dns_provider
+            {
                 app.push_log_t(LogLevel::Warning, "startup.resolver_restart_needed", vec![]);
             }
             *config = Arc::new(fresh);

@@ -90,7 +90,7 @@ pub fn reload(enabled: bool, log_tx: &LogSender) {
 }
 
 /// Тот же формат, что у bypass_domains.txt: домен на строку, `#` — комментарий.
-fn parse(text: &str) -> HashSet<String> {
+pub(crate) fn parse(text: &str) -> HashSet<String> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))

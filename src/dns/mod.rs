@@ -1,6 +1,7 @@
 pub mod doh;
 pub mod ip_cache;
 pub mod resolver;
+pub mod smart;
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -67,7 +68,31 @@ pub fn doh_client(
         builder = builder.resolve(host, SocketAddr::new(ip, port));
     }
 
+    // По умолчанию reqwest проверяет сертификаты системным верификатором,
+    // а на Android ему нужна инициализация через JNI. Без неё проверка
+    // паникует внутри задачи соединения, и оно молча зависает. Поэтому там
+    // корни — встроенный список Mozilla, как в telegram.rs.
+    #[cfg(target_os = "android")]
+    {
+        builder = builder.tls_backend_preconfigured(android_tls());
+    }
+
     builder.build()
+}
+
+#[cfg(target_os = "android")]
+fn android_tls() -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS 1.2/1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config
 }
 
 #[cfg(test)]

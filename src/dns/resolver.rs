@@ -110,6 +110,11 @@ struct Resolver {
 
 static RESOLVER: OnceLock<Option<Resolver>> = OnceLock::new();
 
+/// Резолвер умного DNS для имён из smart_dns_domains.txt (см. `dns::smart`).
+/// Работает и при выключенном `resolve_via_doh`: иначе на телефоне, где
+/// DNS-релея нет, нейросети получали бы настоящие адреса и отказ по стране.
+static SMART: OnceLock<Option<Resolver>> = OnceLock::new();
+
 /// Канал логов подключается отдельно от init: он создаётся уже внутри
 /// event loop интерфейса, когда резолвер давно поднят.
 static LOG: OnceLock<LogSender> = OnceLock::new();
@@ -150,29 +155,22 @@ fn note_recovered(host: &str) {
 }
 
 /// Инициализация при старте. `None` — резолв через DoH выключен, всё идёт
-/// через системный резолвер.
+/// через системный резолвер. Пустой `smart_provider` — умного DNS нет.
 pub fn init(
     enabled: bool,
     provider: String,
     bootstrap: Option<std::net::IpAddr>,
+    smart_provider: String,
+    smart_bootstrap: Option<std::net::IpAddr>,
     ip_cache: Arc<IpDomainCache>,
 ) {
-    let resolver = if enabled {
-        super::doh_client(&provider, bootstrap, Duration::from_secs(5))
-            .ok()
-            .map(|client| Resolver {
-                client,
-                provider,
-                forward: RwLock::new(HashMap::new()),
-                in_flight: tokio::sync::Mutex::new(HashMap::new()),
-                down_until: std::sync::Mutex::new(None),
-                ip_cache,
-            })
-    } else {
-        None
-    };
+    let main = enabled.then(|| Resolver::new(provider, bootstrap, Arc::clone(&ip_cache))).flatten();
+    let smart = (!smart_provider.is_empty())
+        .then(|| Resolver::new(smart_provider, smart_bootstrap, ip_cache))
+        .flatten();
 
-    let _ = RESOLVER.set(resolver);
+    let _ = RESOLVER.set(main);
+    let _ = SMART.set(smart);
 }
 
 /// Разрешает `host:port` в один адрес, готовый для подключения.
@@ -290,10 +288,6 @@ enum Resolution {
 
 /// Разрешает "host:port" в список адресов через DoH.
 async fn resolve_target(target: &str) -> Resolution {
-    let Some(Some(resolver)) = RESOLVER.get().map(|r| r.as_ref()) else {
-        return Resolution::NotApplicable;
-    };
-
     let Some((host, port)) = split_host_port(target) else {
         return Resolution::NotApplicable;
     };
@@ -302,6 +296,11 @@ async fn resolve_target(target: &str) -> Resolution {
     if host.parse::<IpAddr>().is_ok() {
         return Resolution::NotApplicable;
     }
+
+    let smart = SMART.get().and_then(Option::as_ref).filter(|_| super::smart::matches(&host));
+    let Some(resolver) = smart.or_else(|| RESOLVER.get().and_then(Option::as_ref)) else {
+        return Resolution::NotApplicable;
+    };
 
     match resolver.lookup(&host).await {
         Ok(ips) if !ips.is_empty() => {
@@ -330,6 +329,18 @@ fn split_host_port(target: &str) -> Option<(String, u16)> {
 }
 
 impl Resolver {
+    fn new(provider: String, bootstrap: Option<IpAddr>, ip_cache: Arc<IpDomainCache>) -> Option<Self> {
+        let client = super::doh_client(&provider, bootstrap, Duration::from_secs(5)).ok()?;
+        Some(Resolver {
+            client,
+            provider,
+            forward: RwLock::new(HashMap::new()),
+            in_flight: tokio::sync::Mutex::new(HashMap::new()),
+            down_until: std::sync::Mutex::new(None),
+            ip_cache,
+        })
+    }
+
     /// `Ok(ips)` — адреса получены. `Ok(empty)` — DoH ответил, но A-записей
     /// нет (так бывает у apex-доменов вроде ytimg.com, где сервис живёт
     /// только на поддоменах). `Err(())` — запрос не удался.

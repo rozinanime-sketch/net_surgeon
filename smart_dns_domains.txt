@@ -1,0 +1,33 @@
+# Домены, которые разрешаются через умный DNS (smart_dns_provider в config.toml).
+#
+# Сюда — только сервисы, которые сами закрыты для России по IP: умный DNS
+# отвечает на них адресами своих серверов за границей. Остальные сайты
+# идут через обычный doh_provider, и умный DNS о них не узнаёт.
+#
+# Домен на строку, поддомены учитываются. Проверить, что умный DNS
+# действительно подменяет адрес: сравните ответы xbox-dns.ru и dns.google.
+
+# ChatGPT, OpenAI
+chatgpt.com
+openai.com
+oaiusercontent.com
+
+# Claude, Anthropic
+claude.ai
+claude.com
+anthropic.com
+
+# Gemini и другие нейросети Google. Только их поддомены: остальному Google
+# умный DNS не нужен.
+gemini.google.com
+aistudio.google.com
+notebooklm.google.com
+labs.google
+generativelanguage.googleapis.com
+alkalimakersuite-pa.clients6.google.com
+
+# Grok
+grok.com
+
+# Copilot
+copilot.microsoft.com

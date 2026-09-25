@@ -13,7 +13,17 @@ object DataFiles {
     const val BYPASS = "bypass_domains.txt"
     const val BLOCK = "block_domains.txt"
     const val TELEGRAM_RELAY = "telegram_relay.txt"
-    private val DEFAULTS = listOf("config.toml", BYPASS, BLOCK)
+    const val SMART_DNS = "smart_dns_domains.txt"
+    private const val CONFIG = "config.toml"
+    private val DEFAULTS = listOf(CONFIG, BYPASS, BLOCK, SMART_DNS)
+
+    /**
+     * Настройки, появившиеся после первых версий. В уже установленном
+     * приложении config.toml старый и не перезаписывается, поэтому без
+     * них новая возможность молча не включилась бы. Дописываем из assets
+     * только отсутствующие ключи, правки пользователя не трогаем.
+     */
+    private val ADDED_KEYS = listOf("smart_dns_provider", "smart_dns_bootstrap_ip")
 
     /** Есть не в каждой сборке: только если при сборке был свой воркер. */
     private val OPTIONAL = listOf(TELEGRAM_RELAY)
@@ -28,6 +38,7 @@ object DataFiles {
                 target.outputStream().use { input.copyTo(it) }
             }
         }
+        addMissingKeys(context)
         for (name in OPTIONAL) {
             val target = File(dir(context), name)
             if (target.exists()) continue
@@ -38,6 +49,23 @@ object DataFiles {
             }
             input.use { src -> target.outputStream().use { src.copyTo(it) } }
         }
+    }
+
+    private fun addMissingKeys(context: Context) {
+        val target = File(dir(context), CONFIG)
+        val current = target.readText()
+        val present = current.lineSequence().map { it.substringBefore('=').trim() }.toSet()
+        val shipped = context.assets.open(CONFIG).bufferedReader().use { it.readText() }
+        val missing = shipped.lineSequence()
+            .filter { line -> line.substringBefore('=').trim().let { it in ADDED_KEYS && it !in present } }
+            .toList()
+        if (missing.isEmpty()) return
+        // Ключи верхнего уровня: в TOML их нельзя дописать после первой
+        // [секции], иначе они попадут в неё. Вставляем перед ней.
+        val lines = current.lines().toMutableList()
+        val section = lines.indexOfFirst { it.trimStart().startsWith("[") }.takeIf { it >= 0 } ?: lines.size
+        lines.addAll(section, missing + "")
+        write(context, CONFIG, lines.joinToString("\n"))
     }
 
     fun read(context: Context, name: String): String =

@@ -59,6 +59,7 @@ pub async fn run_all(
     // прокси из интерфейса, и правки списка применяются тогда же, когда
     // правки config.toml и bypass_domains.txt.
     crate::block::reload(config.block_trackers, &log_tx);
+    crate::dns::smart::reload(&config.smart_dns_provider, &log_tx);
     telegram::reload(&log_tx);
 
     let tcp_task = {
@@ -88,6 +89,8 @@ pub async fn run_all(
                     udp_address,
                     config.doh_provider.clone(),
                     config.doh_bootstrap_ip,
+                    config.smart_dns_provider.clone(),
+                    config.smart_dns_bootstrap_ip,
                     log_tx,
                     metrics,
                     token,
