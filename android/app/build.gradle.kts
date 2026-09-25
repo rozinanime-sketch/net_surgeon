@@ -58,6 +58,16 @@ android {
         }
     }
 
+    // Ядро на Rust — 6 МБ из 6. Без сжатия Android грузит его прямо из APK,
+    // но и качать приходится все 6 МБ, а раздаём мы с GitHub, где никто
+    // не сожмёт за нас. Сжатое оно ~2,5 МБ; платим распаковкой при установке
+    // (доля секунды) и ~3 МБ на телефоне — на скорость запуска это не влияет.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
