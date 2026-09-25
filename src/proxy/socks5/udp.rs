@@ -274,8 +274,8 @@ pub async fn run_socks5_udp_processor(
                             continue;
                         }
                         tokio::spawn(async move {
-                            let dst_addr = match tokio::net::lookup_host(&dst_addr_str).await {
-                                Ok(mut addrs) => match addrs.next() {
+                            let dst_addr = match crate::dns::resolver::lookup_system(&dst_addr_str).await {
+                                Ok(addrs) => match addrs.into_iter().next() {
                                     Some(a) => a,
                                     None => return,
                                 },

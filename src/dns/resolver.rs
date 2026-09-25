@@ -305,16 +305,24 @@ async fn connect_each(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
 /// `TcpStream::connect("host:port")` делает то же, но без таймаутов: каждый
 /// недоступный адрес стоит полного цикла повторов SYN.
 async fn connect_system(target: &str) -> std::io::Result<TcpStream> {
+    let addrs = lookup_system(target).await?;
+    connect_each(&addrs).await
+}
+
+/// Системный резолвер, а если он не нашёл адрес — запасной DoH.
+///
+/// Общая для TCP и UDP: раньше UDP в SOCKS5 резолвил имена сам, и QUIC к
+/// сайту, заблокированному на уровне DNS, молча не работал.
+pub async fn lookup_system(target: &str) -> std::io::Result<Vec<SocketAddr>> {
     let system = tokio::net::lookup_host(target).await.map(|a| a.collect::<Vec<SocketAddr>>());
-    let addrs = match system {
-        Ok(addrs) if !addrs.is_empty() => addrs,
+    match system {
+        Ok(addrs) if !addrs.is_empty() => Ok(addrs),
         // «Адресов нет» или пустой ответ — переспрашиваем DoH
         other => match resolve_unresolvable(target).await {
-            Some(addrs) => addrs,
-            None => other?,
+            Some(addrs) => Ok(addrs),
+            None => other,
         },
-    };
-    connect_each(&addrs).await
+    }
 }
 
 /// Адреса через запасной DoH для имени, которое не нашёл системный
