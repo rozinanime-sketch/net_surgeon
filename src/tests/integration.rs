@@ -115,7 +115,7 @@ fn parse_records(data: &[u8]) -> Vec<&[u8]> {
 }
 
 #[tokio::test]
-async fn tls_record_strategy_produces_two_records_hiding_the_hostname() {
+async fn tls_record_strategy_produces_records_hiding_the_hostname() {
     let hello = client_hello("blocked.example");
     let (port, collector) = spawn_collector().await;
 
@@ -128,11 +128,10 @@ async fn tls_record_strategy_produces_two_records_hiding_the_hostname() {
 
     let received = collector.await.expect("collector");
 
-    // Ровно один дополнительный 5-байтовый заголовок записи
-    assert_eq!(received.len(), hello.len() + 5);
-
+    // Имя режется на несколько записей; каждая добавляет только заголовок
     let records = parse_records(&received);
-    assert_eq!(records.len(), 2, "ClientHello должен уйти двумя TLS-записями");
+    assert!(records.len() > 2, "имя домена должно разойтись по нескольким записям");
+    assert_eq!(received.len(), hello.len() + 5 * (records.len() - 1));
 
     // Ради этого техника и существует: имени домена нет целиком ни в одной записи
     let needle = b"blocked.example";
@@ -181,9 +180,11 @@ async fn tls_records_are_sent_as_separate_writes() {
         .expect("запись")
         .expect("SNI найден");
 
-    assert_eq!(log.0.len(), 2, "каждая TLS-запись — отдельной отправкой");
+    assert_eq!(log.0.len(), 2, "первая TLS-запись — отдельной отправкой, остальные следом");
+    assert_eq!(parse_records(&log.0[0]).len(), 1, "в первой отправке ровно одна запись");
     for chunk in &log.0 {
-        assert_eq!(parse_records(chunk).len(), 1, "граница отправки совпадает с границей записи");
+        let covered: usize = parse_records(chunk).iter().map(|r| r.len() + 5).sum();
+        assert_eq!(covered, chunk.len(), "граница отправки совпадает с границей записи");
     }
 }
 
@@ -241,14 +242,13 @@ async fn parallel_connections_do_not_interfere() {
             drop(upstream);
 
             let received = collector.await.expect("collector");
-            (hello.len(), received)
+            (hello, received)
         }));
     }
 
     for task in tasks {
-        let (sent_len, received) = task.await.expect("задача");
-        assert_eq!(received.len(), sent_len + 5);
-        assert_eq!(parse_records(&received).len(), 2);
+        let (hello, received) = task.await.expect("задача");
+        assert_eq!(parse_records(&received).concat(), hello[5..]);
     }
 }
 

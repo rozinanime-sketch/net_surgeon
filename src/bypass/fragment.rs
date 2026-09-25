@@ -281,10 +281,11 @@ where
     Ok(Some(SplitInfo { first: split_pos, second: data.len() - split_pos }))
 }
 
-/// Перестраивает ClientHello в две TLS-записи и отправляет КАЖДУЮ отдельным
-/// TCP-сегментом.
+/// Перестраивает ClientHello в несколько TLS-записей (см.
+/// [`super::tls::split_into_records`]) и отправляет первую отдельным
+/// TCP-сегментом, остальные — следом.
 ///
-/// Раньше обе записи уходили одним куском в расчёте на то, что DPI ищет SNI
+/// Раньше все записи уходили одним куском в расчёте на то, что DPI ищет SNI
 /// только внутри одной записи. Для ClientHello браузера (~1800 байт) это
 /// работало случайно: он не влезает в один сегмент, и записи и так
 /// разъезжались по пакетам. Маленький ClientHello (rustls у программы
@@ -301,7 +302,7 @@ pub async fn tls_record_split<W>(
 where
     W: tokio::io::AsyncWriteExt + Unpin,
 {
-    let Some(reframed) = super::tls::split_into_two_records(data) else {
+    let Some(reframed) = super::tls::split_into_records(data) else {
         return Ok(None);
     };
     // Граница — конец первой записи: заголовок (5 байт) плюс её длина.

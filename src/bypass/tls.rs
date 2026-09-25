@@ -289,18 +289,32 @@ pub(crate) fn push_ext(out: &mut Vec<u8>, ext_type: u16, data: &[u8]) {
     out.extend_from_slice(&(data.len() as u16).to_be_bytes());
     out.extend_from_slice(data);
 }
-/// Перестраивает ClientHello в ДВЕ TLS-записи с границей внутри имени домена.
+/// Сколько символов имени домена лежит в одной TLS-записи.
+///
+/// DPI ищет запрещённое слово в каждой записи. Раньше записей было две с
+/// границей посередине имени, и работало это, только если середина
+/// попадала внутрь слова: «www.you|tube.com» проходил, а
+/// «youtubei.go|ogleapis.com» нет — «youtube» целиком оставалось в первой
+/// записи, и соединение молча висело. Граница у начала имени ломала уже
+/// www.youtube.com: «youtube.com» целиком лежало во второй. Где слово,
+/// заранее не известно, поэтому имя режется на куски короче любого
+/// разумного ключевого слова: оно не поместится ни в одну запись.
+const NAME_CHUNK: usize = 3;
+
+/// Перестраивает ClientHello в несколько TLS-записей, разрезая имя домена
+/// на куски по [`NAME_CHUNK`] символов.
 ///
 /// Ключевое отличие от TCP-сплита: тот режет поток байт, и DPI, который
 /// пересобирает TCP, склеивает всё обратно и спокойно читает SNI. Здесь же
-/// меняется сама структура TLS: получается две полноценные записи, каждая
-/// со своим 5-байтовым заголовком. По RFC 8446 handshake-сообщение может
-/// занимать несколько записей, сервер соберёт нормально — а DPI, который ищет
-/// SNI внутри одной записи, не найдёт его даже при идеальной сборке TCP.
+/// меняется сама структура TLS: каждая запись — полноценная, со своим
+/// 5-байтовым заголовком. По RFC 8446 handshake-сообщение может занимать
+/// несколько записей, сервер соберёт нормально — а DPI, который ищет
+/// имя внутри одной записи, не найдёт его даже при идеальной сборке TCP.
 ///
-/// Возвращает готовый буфер для отправки одним куском: техника работает на
-/// уровне TLS, дополнительная фрагментация TCP ей не нужна.
-pub fn split_into_two_records(data: &[u8]) -> Option<Vec<u8>> {
+/// Первая запись — всё до конца первого куска имени; последняя — последний
+/// кусок и остаток ClientHello. Возвращает готовый буфер: вызывающий код
+/// отправляет первую запись отдельным сегментом, остальное — следом.
+pub fn split_into_records(data: &[u8]) -> Option<Vec<u8>> {
     let loc = find_sni(data)?;
 
     // Заголовок записи — первые 5 байт; дальше идёт полезная нагрузка.
@@ -319,29 +333,29 @@ pub fn split_into_two_records(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let trailing = &data[record_end..];
-
     let version = [data[1], data[2]];
-    let payload = &data[HEADER..record_end];
 
-    // Точку разрыва переводим из координат буфера в координаты нагрузки.
-    let split_at = loc.split_point().checked_sub(HEADER)?;
-    if split_at == 0 || split_at >= payload.len() {
+    // Границы записей в координатах буфера: внутри имени через каждые
+    // NAME_CHUNK символов. Имя целиком внутри первой записи.
+    let name_end = loc.offset.checked_add(loc.len)?;
+    if loc.offset <= HEADER || name_end > record_end {
+        return None;
+    }
+    let mut bounds = vec![HEADER];
+    bounds.extend((loc.offset + NAME_CHUNK..name_end).step_by(NAME_CHUNK));
+    bounds.push(record_end);
+    if bounds.len() < 3 {
         return None;
     }
 
-    let (first, second) = payload.split_at(split_at);
-
-    let mut out = Vec::with_capacity(data.len() + HEADER);
-    out.push(0x16);
-    out.extend_from_slice(&version);
-    out.extend_from_slice(&(first.len() as u16).to_be_bytes());
-    out.extend_from_slice(first);
-
-    out.push(0x16);
-    out.extend_from_slice(&version);
-    out.extend_from_slice(&(second.len() as u16).to_be_bytes());
-    out.extend_from_slice(second);
-
+    let mut out = Vec::with_capacity(data.len() + HEADER * (bounds.len() - 2));
+    for pair in bounds.windows(2) {
+        let part = &data[pair[0]..pair[1]];
+        out.push(0x16);
+        out.extend_from_slice(&version);
+        out.extend_from_slice(&(part.len() as u16).to_be_bytes());
+        out.extend_from_slice(part);
+    }
     out.extend_from_slice(trailing);
 
     Some(out)
@@ -444,44 +458,61 @@ mod tests {
         }
     }
 
-    #[test]
-    fn two_records_hide_the_hostname_from_single_record_parsing() {
-        let hello = build_client_hello("youtube.com");
-        let reframed = split_into_two_records(&hello).expect("должно перестроиться");
-
-        // Обе записи — валидные TLS-записи с корректной длиной
-        let len1 = u16::from_be_bytes([reframed[3], reframed[4]]) as usize;
-        assert_eq!(reframed[0], 0x16);
-        let second_start = 5 + len1;
-        assert_eq!(reframed[second_start], 0x16);
-        let len2 = u16::from_be_bytes([reframed[second_start + 3], reframed[second_start + 4]]) as usize;
-
-        // Суммарная нагрузка совпадает с исходной — ничего не потеряно
-        assert_eq!(len1 + len2, hello.len() - 5);
-        assert_eq!(reframed.len(), hello.len() + 5);
-
-        // Имя домена не лежит целиком ни в одной из записей
-        let first_record = &reframed[5..5 + len1];
-        let second_record = &reframed[second_start + 5..second_start + 5 + len2];
-        assert!(!first_record.windows(11).any(|w| w == b"youtube.com"));
-        assert!(!second_record.windows(11).any(|w| w == b"youtube.com"));
+    /// Нагрузки записей рукопожатия подряд и то, что лежит после них.
+    fn handshake_records(mut buf: &[u8]) -> (Vec<&[u8]>, &[u8]) {
+        let mut records = Vec::new();
+        while buf.first() == Some(&0x16) {
+            let len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+            records.push(&buf[5..5 + len]);
+            buf = &buf[5 + len..];
+        }
+        (records, buf)
     }
 
     #[test]
-    fn bytes_after_the_hello_are_not_pulled_into_the_second_record() {
+    fn records_hide_the_hostname_from_single_record_parsing() {
+        let hello = build_client_hello("youtube.com");
+        let reframed = split_into_records(&hello).expect("должно перестроиться");
+        let (records, rest) = handshake_records(&reframed);
+
+        // Нагрузка записей подряд — исходный ClientHello, ничего не потеряно
+        assert!(rest.is_empty());
+        assert_eq!(records.concat(), &hello[5..]);
+        assert_eq!(reframed.len(), hello.len() + 5 * (records.len() - 1));
+
+        // Имя домена не лежит целиком ни в одной из записей
+        for record in &records {
+            assert!(!record.windows(11).any(|w| w == b"youtube.com"));
+        }
+    }
+
+    #[test]
+    fn no_record_holds_a_blocked_word_wherever_it_sits_in_the_name() {
+        // Две половины резали слово, только если середина в него попадала:
+        // www.you|tube.com проходил, youtubei.go|ogleapis.com — нет.
+        for host in ["www.youtube.com", "youtubei.googleapis.com", "youtube.googleapis.com"] {
+            let hello = build_client_hello(host);
+            let reframed = split_into_records(&hello).expect("должно перестроиться");
+            let (records, _) = handshake_records(&reframed);
+            for record in &records {
+                assert!(!record.windows(4).any(|w| w == b"yout" || w == b"tube"), "{host}");
+            }
+        }
+    }
+
+    #[test]
+    fn bytes_after_the_hello_are_not_pulled_into_the_records() {
         let hello = build_client_hello("youtube.com");
         // Следом за ClientHello — ChangeCipherSpec, как шлёт TLS 1.3 в режиме совместимости
         let ccs = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
         let mut data = hello.clone();
         data.extend_from_slice(&ccs);
 
-        let reframed = split_into_two_records(&data).expect("должно перестроиться");
-        let len1 = u16::from_be_bytes([reframed[3], reframed[4]]) as usize;
-        let second_start = 5 + len1;
-        let len2 = u16::from_be_bytes([reframed[second_start + 3], reframed[second_start + 4]]) as usize;
+        let reframed = split_into_records(&data).expect("должно перестроиться");
+        let (records, rest) = handshake_records(&reframed);
 
-        assert_eq!(len1 + len2, hello.len() - 5, "записи рукопожатия покрывают только ClientHello");
-        assert_eq!(&reframed[second_start + 5 + len2..], &ccs, "хвост уходит как был");
+        assert_eq!(records.concat(), &hello[5..], "записи рукопожатия покрывают только ClientHello");
+        assert_eq!(rest, &ccs, "хвост уходит как был");
     }
 
     #[test]
@@ -491,13 +522,13 @@ mod tests {
         // Заголовок обещает больше, чем пришло
         let claimed = (hello.len() - 5 + 100) as u16;
         data[3..5].copy_from_slice(&claimed.to_be_bytes());
-        assert_eq!(split_into_two_records(&data), None);
+        assert_eq!(split_into_records(&data), None);
     }
 
     #[test]
     fn reframing_needs_sni() {
-        assert_eq!(split_into_two_records(b"GET / HTTP/1.1\r\n"), None);
-        assert_eq!(split_into_two_records(&[]), None);
+        assert_eq!(split_into_records(b"GET / HTTP/1.1\r\n"), None);
+        assert_eq!(split_into_records(&[]), None);
     }
 
     #[test]
@@ -508,7 +539,7 @@ mod tests {
         let small = super::build_client_hello_sized("updates.discord.com", 0);
         assert!(small.len() < 400, "короткий вариант: {} байт", small.len());
         assert!(find_sni(&small).is_some());
-        assert!(split_into_two_records(&small).is_some());
+        assert!(split_into_records(&small).is_some());
     }
 
     /// Каждое поле длины в пробе сходится с тем, что за ним лежит.

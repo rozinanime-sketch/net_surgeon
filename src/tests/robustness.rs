@@ -111,10 +111,10 @@ fn feed_every_parser(data: &[u8]) {
     let _ = tls::record_len(data);
     let _ = tls::looks_like_handshake(data);
 
-    if let Some(out) = tls::split_into_two_records(data) {
-        // Перестройка добавляет ровно один заголовок записи — пять байт.
-        assert_eq!(
-            out.len(), data.len() + 5,
+    if let Some(out) = tls::split_into_records(data) {
+        // Перестройка добавляет только заголовки записей — по пять байт.
+        assert!(
+            out.len() > data.len() && (out.len() - data.len()).is_multiple_of(5),
             "перестроенный ClientHello потерял или выдумал байты",
         );
         assert_eq!(out[0], 0x16, "первая запись перестала быть handshake");
