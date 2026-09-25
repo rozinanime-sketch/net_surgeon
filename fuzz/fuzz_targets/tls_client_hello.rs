@@ -1,4 +1,4 @@
-//! Разбор TLS ClientHello: поиск SNI и перестройка в две записи.
+//! Разбор TLS ClientHello: поиск SNI и перестройка в несколько записей.
 //!
 //! Самая ценная цель из всех: сюда приходит первый пакет КАЖДОГО соединения,
 //! и приходит он до того, как хоть что-то проверено.
@@ -20,10 +20,11 @@ fuzz_target!(|data: &[u8]| {
     let _ = tls::record_len(data);
     let _ = tls::looks_like_handshake(data);
 
-    if let Some(out) = tls::split_into_two_records(data) {
-        // Перестройка добавляет ровно один заголовок записи — пять байт.
-        // Ни одного байта нагрузки при этом потеряться не должно.
-        assert_eq!(out.len(), data.len() + 5);
+    if let Some(out) = tls::split_into_records(data) {
+        // Перестройка добавляет только заголовки записей — по пять байт на
+        // каждую новую. Ни одного байта нагрузки при этом потеряться не должно.
+        assert!(out.len() > data.len());
+        assert!((out.len() - data.len()).is_multiple_of(5));
         assert_eq!(out[0], 0x16);
     }
 });
