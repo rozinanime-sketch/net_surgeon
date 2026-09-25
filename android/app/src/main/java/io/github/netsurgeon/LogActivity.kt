@@ -49,7 +49,7 @@ class LogActivity : Activity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "Лог"
+            text = getString(R.string.log)
             textSize = 20f
             setTextColor(Color.rgb(120, 170, 255))
             typeface = Typeface.DEFAULT_BOLD
@@ -67,11 +67,11 @@ class LogActivity : Activity() {
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row.addView(Button(this).apply {
-            text = "Копировать"
+            text = getString(R.string.copy)
             setOnClickListener { copy() }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         row.addView(Button(this).apply {
-            text = "Поделиться"
+            text = getString(R.string.share)
             setOnClickListener { share() }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         root.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
@@ -96,7 +96,7 @@ class LogActivity : Activity() {
             // Следим за концом лога, только если пользователь и так внизу:
             // иначе нельзя было бы прокрутить вверх и почитать.
             val atBottom = !logScroll.canScrollVertically(1)
-            log.text = text.ifEmpty { "Пусто: обход ещё не включали." }
+            log.text = text.ifEmpty { getString(R.string.log_empty) }
             if (atBottom) logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
         }
     }
@@ -104,14 +104,14 @@ class LogActivity : Activity() {
     private fun copy() {
         val clipboard = getSystemService(ClipboardManager::class.java)
         clipboard.setPrimaryClip(ClipData.newPlainText("net_surgeon log", NativeBridge.logs()))
-        Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, R.string.copied, Toast.LENGTH_SHORT).show()
     }
 
     private fun share() {
         val send = Intent(Intent.ACTION_SEND)
             .setType("text/plain")
-            .putExtra(Intent.EXTRA_SUBJECT, "Лог net_surgeon")
+            .putExtra(Intent.EXTRA_SUBJECT, getString(R.string.log_subject))
             .putExtra(Intent.EXTRA_TEXT, NativeBridge.logs())
-        startActivity(Intent.createChooser(send, "Отправить лог"))
+        startActivity(Intent.createChooser(send, getString(R.string.send_log)))
     }
 }

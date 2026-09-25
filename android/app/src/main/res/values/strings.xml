@@ -1,4 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">net surgeon</string>
+    <string name="app_name" translatable="false">net surgeon</string>
+    <string name="status_on">Bypass on</string>
+    <string name="status_off">Off</string>
+    <string name="turn_on">Turn on</string>
+    <string name="turn_off">Turn off</string>
+    <string name="domains">Domains</string>
+    <string name="trackers">Trackers</string>
+    <string name="telegram">Telegram</string>
+    <string name="title_bypass">Bypass domains</string>
+    <string name="title_block">Tracker blocking</string>
+    <string name="title_telegram">Telegram relay</string>
+    <string name="hint_telegram">Address of your own Cloudflare worker, e.g. net-surgeon-tg.&lt;subdomain&gt;.workers.dev. How to set one up: cloudflare/README.md in the repository. Empty — Telegram goes directly. Takes effect after the bypass is restarted.</string>
+    <string name="hint_domains">One domain per line; subdomains are included. Takes effect after the bypass is restarted.</string>
+    <string name="autostart">Turn on when the phone starts</string>
+    <string name="always_on_hint">System “Always-on VPN” is more reliable: Settings → VPN → net surgeon. Tap to open.</string>
+    <string name="update_available">Version %1$s is out. Tap to open the download page.</string>
+    <string name="log">Log</string>
+    <string name="copy">Copy</string>
+    <string name="share">Share</string>
+    <string name="log_empty">Empty: the bypass has not been turned on yet.</string>
+    <string name="copied">Copied</string>
+    <string name="log_subject">net_surgeon log</string>
+    <string name="send_log">Send log</string>
+    <string name="save">Save</string>
+    <string name="saved">Saved</string>
+    <string name="error_message">Error: %1$s</string>
+    <string name="save_failed">could not save %1$s</string>
+    <string name="notif_channel">Bypass status</string>
+    <string name="notif_title">Bypass on</string>
+    <string name="notif_text">Tap to open net surgeon</string>
+    <string name="tile_on">On</string>
+    <string name="tile_off">Off</string>
 </resources>

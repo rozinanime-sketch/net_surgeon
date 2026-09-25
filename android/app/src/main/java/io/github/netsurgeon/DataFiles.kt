@@ -103,7 +103,7 @@ object DataFiles {
         tmp.writeText(text)
         if (!tmp.renameTo(target)) {
             tmp.delete()
-            error("не удалось сохранить $name")
+            error(context.getString(R.string.save_failed, name))
         }
     }
 }

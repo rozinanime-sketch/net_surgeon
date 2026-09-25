@@ -26,7 +26,7 @@ class EditorActivity : Activity() {
         val file = intent.getStringExtra(EXTRA_FILE) ?: return finish()
         val title = intent.getStringExtra(EXTRA_TITLE) ?: file
         val hint = intent.getStringExtra(EXTRA_HINT)
-            ?: "Домен на строку, поддомены учитываются. Применится после перезапуска обхода."
+            ?: getString(R.string.hint_domains)
 
         val pad = (16 * resources.displayMetrics.density).toInt()
         val root = LinearLayout(this).apply {
@@ -66,14 +66,14 @@ class EditorActivity : Activity() {
         root.addView(editor, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
 
         root.addView(Button(this).apply {
-            text = "Сохранить"
+            text = getString(R.string.save)
             setOnClickListener {
                 try {
                     DataFiles.write(this@EditorActivity, file, normalize(editor.text.toString()))
-                    Toast.makeText(this@EditorActivity, "Сохранено", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@EditorActivity, R.string.saved, Toast.LENGTH_SHORT).show()
                     finish()
                 } catch (e: Exception) {
-                    Toast.makeText(this@EditorActivity, "Ошибка: ${e.message}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@EditorActivity, getString(R.string.error_message, e.message ?: ""), Toast.LENGTH_LONG).show()
                 }
             }
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))

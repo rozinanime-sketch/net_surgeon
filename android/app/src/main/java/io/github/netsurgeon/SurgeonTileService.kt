@@ -38,7 +38,7 @@ class SurgeonTileService : TileService() {
         val running = NativeBridge.isRunning()
         tile.state = if (running) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            tile.subtitle = if (running) "Включён" else "Выключен"
+            tile.subtitle = getString(if (running) R.string.tile_on else R.string.tile_off)
         }
         tile.updateTile()
     }

@@ -76,36 +76,32 @@ class MainActivity : Activity() {
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row.addView(Button(this).apply {
-            text = "Домены"
-            setOnClickListener { openEditor(DataFiles.BYPASS, "Домены для обхода") }
+            text = getString(R.string.domains)
+            setOnClickListener { openEditor(DataFiles.BYPASS, getString(R.string.title_bypass)) }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         row.addView(Button(this).apply {
-            text = "Трекеры"
-            setOnClickListener { openEditor(DataFiles.BLOCK, "Блокировка трекеров") }
+            text = getString(R.string.trackers)
+            setOnClickListener { openEditor(DataFiles.BLOCK, getString(R.string.title_block)) }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         row.addView(Button(this).apply {
-            text = "Telegram"
+            text = getString(R.string.telegram)
             setOnClickListener {
                 openEditor(
-                    DataFiles.TELEGRAM_RELAY, "Ретранслятор Telegram",
-                    "Адрес своего воркера Cloudflare, например " +
-                        "net-surgeon-tg.<поддомен>.workers.dev. Как его завести — " +
-                        "cloudflare/README.md в репозитории. Пусто — Telegram идёт " +
-                        "напрямую. Применится после перезапуска обхода."
+                    DataFiles.TELEGRAM_RELAY, getString(R.string.title_telegram),
+                    getString(R.string.hint_telegram)
                 )
             }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         root.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
         root.addView(CheckBox(this).apply {
-            text = "Включать при запуске телефона"
+            text = getString(R.string.autostart)
             setTextColor(Color.LTGRAY)
             isChecked = Prefs.autostart(this@MainActivity)
             setOnCheckedChangeListener { _, on -> Prefs.setAutostart(this@MainActivity, on) }
         })
         root.addView(TextView(this).apply {
-            text = "Надёжнее системная «Постоянная VPN»: Настройки → VPN → " +
-                "net surgeon. Нажмите, чтобы открыть."
+            text = getString(R.string.always_on_hint)
             textSize = 12f
             setTextColor(Color.GRAY)
             setOnClickListener {
@@ -124,7 +120,7 @@ class MainActivity : Activity() {
         // Пустое место забирает остаток экрана: кнопка лога — в самом низу.
         root.addView(View(this), LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         root.addView(Button(this).apply {
-            text = "Лог"
+            text = getString(R.string.log)
             setOnClickListener { startActivity(Intent(this@MainActivity, LogActivity::class.java)) }
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
@@ -158,7 +154,7 @@ class MainActivity : Activity() {
             update.visibility = View.GONE
             return
         }
-        update.text = "Вышла версия $version. Нажмите, чтобы открыть страницу загрузки."
+        update.text = getString(R.string.update_available, version)
         update.setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
         update.visibility = View.VISIBLE
     }
@@ -170,9 +166,9 @@ class MainActivity : Activity() {
 
     private fun render() {
         val running = NativeBridge.isRunning()
-        status.text = if (running) "Обход включён" else "Выключено"
+        status.text = getString(if (running) R.string.status_on else R.string.status_off)
         status.setTextColor(if (running) Color.rgb(120, 220, 120) else Color.GRAY)
-        toggle.text = if (running) "Выключить" else "Включить"
+        toggle.text = getString(if (running) R.string.turn_off else R.string.turn_on)
     }
 
     private fun onToggle() {

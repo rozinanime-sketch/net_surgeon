@@ -10,7 +10,6 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.service.quicksettings.TileService
-import java.util.Locale
 
 /**
  * VPN без сервера: весь трафик телефона приходит сюда через TUN и уходит
@@ -58,7 +57,9 @@ class SurgeonVpnService : VpnService() {
                 return
             }
 
-        val lang = if (Locale.getDefault().language == "ru") "ru" else "en"
+        // Язык ресурсов, а не Locale.getDefault(): так учитывается и язык,
+        // выбранный для одного приложения в настройках Android 13+.
+        val lang = if (resources.configuration.locales[0].language == "ru") "ru" else "en"
         // detachFd: дескриптор теперь принадлежит ядру, и Java его не закроет
         // из-под него при сборке мусора.
         val error = NativeBridge.start(tun.detachFd(), DataFiles.dir(this).absolutePath, lang)
@@ -92,7 +93,7 @@ class SurgeonVpnService : VpnService() {
         // Важность низкая: уведомление без звука и не всплывает, оно лишь
         // показывает, что обход включён, и даёт его выключить.
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL, "Обход включён", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL, getString(R.string.notif_channel), NotificationManager.IMPORTANCE_LOW)
         )
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
@@ -102,11 +103,11 @@ class SurgeonVpnService : VpnService() {
         )
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_surgeon)
-            .setContentTitle("Обход включён")
-            .setContentText("Нажмите, чтобы открыть net surgeon")
+            .setContentTitle(getString(R.string.notif_title))
+            .setContentText(getString(R.string.notif_text))
             .setContentIntent(open)
             .setOngoing(true)
-            .addAction(Notification.Action.Builder(null, "Выключить", stop).build())
+            .addAction(Notification.Action.Builder(null, getString(R.string.turn_off), stop).build())
             .build()
     }
 

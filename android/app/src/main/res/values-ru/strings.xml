@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="status_on">Обход включён</string>
+    <string name="status_off">Выключено</string>
+    <string name="turn_on">Включить</string>
+    <string name="turn_off">Выключить</string>
+    <string name="domains">Домены</string>
+    <string name="trackers">Трекеры</string>
+    <string name="telegram">Telegram</string>
+    <string name="title_bypass">Домены для обхода</string>
+    <string name="title_block">Блокировка трекеров</string>
+    <string name="title_telegram">Ретранслятор Telegram</string>
+    <string name="hint_telegram">Адрес своего воркера Cloudflare, например net-surgeon-tg.&lt;поддомен&gt;.workers.dev. Как его завести — cloudflare/README.md в репозитории. Пусто — Telegram идёт напрямую. Применится после перезапуска обхода.</string>
+    <string name="hint_domains">Домен на строку, поддомены учитываются. Применится после перезапуска обхода.</string>
+    <string name="autostart">Включать при запуске телефона</string>
+    <string name="always_on_hint">Надёжнее системная «Постоянная VPN»: Настройки → VPN → net surgeon. Нажмите, чтобы открыть.</string>
+    <string name="update_available">Вышла версия %1$s. Нажмите, чтобы открыть страницу загрузки.</string>
+    <string name="log">Лог</string>
+    <string name="copy">Копировать</string>
+    <string name="share">Поделиться</string>
+    <string name="log_empty">Пусто: обход ещё не включали.</string>
+    <string name="copied">Скопировано</string>
+    <string name="log_subject">Лог net_surgeon</string>
+    <string name="send_log">Отправить лог</string>
+    <string name="save">Сохранить</string>
+    <string name="saved">Сохранено</string>
+    <string name="error_message">Ошибка: %1$s</string>
+    <string name="save_failed">не удалось сохранить %1$s</string>
+    <string name="notif_channel">Состояние обхода</string>
+    <string name="notif_title">Обход включён</string>
+    <string name="notif_text">Нажмите, чтобы открыть net surgeon</string>
+    <string name="tile_on">Включён</string>
+    <string name="tile_off">Выключен</string>
+</resources>
