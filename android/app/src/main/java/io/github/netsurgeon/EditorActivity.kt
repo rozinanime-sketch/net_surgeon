@@ -53,7 +53,12 @@ class EditorActivity : Activity() {
             textSize = 14f
             setTextColor(Color.WHITE)
             gravity = Gravity.TOP or Gravity.START
+            // Как адрес, а не как текст: иначе клавиатура (SwiftKey)
+            // ставит пробел и заглавную букву после каждой точки, и
+            // «a.workers.dev» превращается в «A. Workers. Dev» даже без
+            // подсказок.
             inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_VARIATION_URI or
                 InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                 InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             setHorizontallyScrolling(false)
@@ -76,11 +81,14 @@ class EditorActivity : Activity() {
         setContentView(root)
     }
 
-    /** Домены в нижний регистр и без пробелов по краям; комментарии как есть. */
+    /**
+     * Домены в нижний регистр и без пробелов вовсе — в имени их не бывает,
+     * а клавиатура могла вставить их после точек; комментарии как есть.
+     */
     private fun normalize(text: String): String =
         text.lines().joinToString("\n") { line ->
-            val t = line.trim()
-            if (t.startsWith("#")) line.trimEnd() else t.lowercase()
+            if (line.trimStart().startsWith("#")) line.trimEnd()
+            else line.filterNot { it.isWhitespace() }.lowercase()
         }.trimEnd() + "\n"
 
     companion object {
