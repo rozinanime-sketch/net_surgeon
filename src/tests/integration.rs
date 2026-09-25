@@ -295,6 +295,8 @@ async fn socks5_udp_junk_only_for_listed_domains() {
 
     let listed_server = UdpSocket::bind("127.0.0.2:0").await.unwrap();
     let plain_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // Звонок: адрес не из списка, но первый пакет — STUN
+    let call_server = UdpSocket::bind("127.0.0.3:0").await.unwrap();
 
     let ip_cache = Arc::new(IpDomainCache::new());
     ip_cache.insert("127.0.0.2".parse().unwrap(), "video.listed.test".into());
@@ -306,7 +308,7 @@ async fn socks5_udp_junk_only_for_listed_domains() {
     };
     let token = CancellationToken::new();
     let (log_tx, _log_rx) = logging::channel();
-    let junk = Socks5JunkParams { count: 2, size_min: 900, size_max: 900, delay_min_ms: 1, delay_max_ms: 1 };
+    let junk = Socks5JunkParams { count: 2, size_min: 900, size_max: 900, delay_min_ms: 1, delay_max_ms: 1, calls: true };
     let policy = UdpPolicy {
         is_enabled: true,
         bypass_domains: Arc::new(HashSet::from(["listed.test".to_string()])),
@@ -346,8 +348,14 @@ async fn socks5_udp_junk_only_for_listed_domains() {
     client.send_to(&datagram(plain_server.local_addr().unwrap(), b"plain"), relay_addr).await.unwrap();
     client.send_to(&datagram(listed_server.local_addr().unwrap(), b"listed"), relay_addr).await.unwrap();
 
+    // STUN Binding Request: тип, длина 0, «магическое число», 12 байт ID
+    let mut stun = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42];
+    stun.extend_from_slice(&[7u8; 12]);
+    client.send_to(&datagram(call_server.local_addr().unwrap(), &stun), relay_addr).await.unwrap();
+
     assert_eq!(sizes(&plain_server, 1).await, vec![5], "поток вне списка получил мусор");
     assert_eq!(sizes(&listed_server, 3).await, vec![900, 900, 6], "поток из списка остался без мусора");
+    assert_eq!(sizes(&call_server, 3).await, vec![900, 900, 20], "звонок (STUN) остался без мусора");
 
     token.cancel();
 }

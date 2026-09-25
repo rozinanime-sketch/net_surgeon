@@ -51,11 +51,17 @@ pub struct Socks5JunkParams {
     pub size_max: usize,
     pub delay_min_ms: u64,
     pub delay_max_ms: u64,
+    /// Мусор и перед потоками звонков: STUN и UDP к сетям Telegram. См.
+    /// `session::is_call_flow`. Экспериментально, поэтому с выключателем.
+    #[serde(default = "default_true")]
+    pub calls: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for Socks5JunkParams {
     fn default() -> Self {
-        Self { count: 6, size_min: 100, size_max: 800, delay_min_ms: 15, delay_max_ms: 40 }
+        Self { count: 6, size_min: 100, size_max: 800, delay_min_ms: 15, delay_max_ms: 40, calls: true }
     }
 }
 

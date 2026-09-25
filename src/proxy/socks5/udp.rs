@@ -358,6 +358,12 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
     let bypass = domain
         .as_deref()
         .is_some_and(|d| needs_bypass(ctx.policy.is_enabled, d, &ctx.policy.bypass_domains));
+    // Звонок (STUN или UDP к сетям Telegram) — мусор и без списка обхода:
+    // DPI режет звонки по STUN, а у ретрансляторов голоса нет имени.
+    let call = !bypass
+        && ctx.policy.is_enabled
+        && ctx.junk.calls
+        && session::is_call_flow(&payload, dst_addr.ip());
 
     // Семейство исходящего сокета должно совпадать с адресом назначения,
     // иначе send упадёт.
@@ -397,6 +403,9 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
         cancel.clone(),
     ));
 
+    if call {
+        log_t(&ctx.log_tx, LogLevel::Info, "log.call_junk", vec![("addr", dst_addr.to_string())]);
+    }
     if bypass {
         // С именем: по одному адресу не понять, почему поток получил мусор.
         let target = match &domain {
@@ -413,7 +422,7 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
     // следом за ним.
     let sender = session::spawn_writer(
         upstream,
-        bypass.then(|| (ctx.junk.clone(), is_quic)),
+        (bypass || call).then(|| (ctx.junk.clone(), is_quic)),
         Arc::clone(&ctx.metrics),
         cancel.clone(),
         WriterLog {

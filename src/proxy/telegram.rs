@@ -75,10 +75,13 @@ static RELAY: RwLock<Option<Arc<str>>> = RwLock::new(None);
 
 /// Адрес Telegram, к которому воркер нас пустит.
 pub fn is_telegram(ip: IpAddr, port: u16) -> bool {
+    PORTS.contains(&port) && is_telegram_network(ip)
+}
+
+/// Адрес в сетях Telegram, на любом порту. Серверы голоса в звонках
+/// слушают не 443, поэтому для UDP порт не проверяется.
+pub fn is_telegram_network(ip: IpAddr) -> bool {
     let IpAddr::V4(v4) = ip else { return false };
-    if !PORTS.contains(&port) {
-        return false;
-    }
     let n = u32::from(v4);
     TELEGRAM_V4.iter().any(|(base, bits)| {
         let mask = u32::MAX << (32 - bits);

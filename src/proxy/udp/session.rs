@@ -55,6 +55,32 @@ pub fn is_quic_initial(payload: &[u8]) -> bool {
     )
 }
 
+/// Пакет STUN (RFC 5389): служебный протокол, которым стороны звонка
+/// договариваются о соединении через NAT.
+///
+/// По нему DPI оператора и узнаёт звонки: голос дальше зашифрован без
+/// узнаваемой сигнатуры, а STUN стандартный. Признак надёжный: два старших
+/// бита типа нулевые, в байтах 4..8 «магическое число» 0x2112A442, длина
+/// в заголовке совпадает с остатком пакета и кратна четырём.
+pub fn is_stun(payload: &[u8]) -> bool {
+    const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+    if payload.len() < 20 || payload[0] & 0xC0 != 0 || payload[4..8] != MAGIC_COOKIE {
+        return false;
+    }
+    let length = u16::from_be_bytes([payload[2], payload[3]]) as usize;
+    length == payload.len() - 20 && length.is_multiple_of(4)
+}
+
+/// Похоже ли на поток звонка: STUN или UDP к сетям Telegram.
+///
+/// Звонки Telegram ходят и на его собственные серверы (ретрансляторы
+/// голоса), и напрямую между собеседниками. Первые узнаются по адресу,
+/// вторые — по STUN в первом пакете. Мусор перед ними — тот же приём,
+/// что `--dpi-desync=fake` с фильтром STUN у zapret.
+pub fn is_call_flow(payload: &[u8], dst: std::net::IpAddr) -> bool {
+    is_stun(payload) || crate::proxy::telegram::is_telegram_network(dst)
+}
+
 /// Запускает задачу отправки и возвращает очередь для датаграмм.
 ///
 /// `junk` — параметры мусора и признак QUIC; `None` — сессия без обхода.
@@ -133,6 +159,47 @@ async fn send_junk(upstream: &UdpSocket, junk: &Socks5JunkParams, quic: bool, me
 mod tests {
     use super::*;
 
+    /// STUN Binding Request: тип 0x0001, длина 0, cookie, 12 байт ID.
+    fn binding_request() -> Vec<u8> {
+        let mut p = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42];
+        p.extend_from_slice(&[7u8; 12]);
+        p
+    }
+
+    #[test]
+    fn stun_is_recognised_and_lookalikes_are_not() {
+        let mut req = binding_request();
+        assert!(is_stun(&req));
+
+        // С атрибутом: длина в заголовке растёт вместе с пакетом
+        req[3] = 8;
+        req.extend_from_slice(&[0x80, 0x22, 0x00, 0x04, b't', b'e', b's', b't']);
+        assert!(is_stun(&req));
+
+        let mut wrong_cookie = binding_request();
+        wrong_cookie[4] = 0x00;
+        assert!(!is_stun(&wrong_cookie));
+
+        let mut wrong_length = binding_request();
+        wrong_length[3] = 4;
+        assert!(!is_stun(&wrong_length));
+
+        // QUIC long header: старший бит взведён
+        let mut quic = binding_request();
+        quic[0] = 0xC0;
+        assert!(!is_stun(&quic));
+        assert!(!is_stun(&[0u8; 19]));
+    }
+
+    #[test]
+    fn call_flows_are_stun_or_telegram_networks() {
+        let elsewhere: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let telegram: std::net::IpAddr = "91.108.56.130".parse().unwrap();
+        assert!(is_call_flow(&binding_request(), elsewhere));
+        assert!(is_call_flow(b"any payload", telegram));
+        assert!(!is_call_flow(b"any payload", elsewhere));
+    }
+
     #[tokio::test]
     async fn junk_goes_first_and_payloads_keep_their_order() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -140,7 +207,7 @@ mod tests {
         upstream.connect(server.local_addr().unwrap()).await.unwrap();
 
         let (log_tx, _rx) = crate::observability::logging::channel();
-        let junk = Socks5JunkParams { count: 3, size_min: 1000, size_max: 1000, delay_min_ms: 20, delay_max_ms: 20 };
+        let junk = Socks5JunkParams { count: 3, size_min: 1000, size_max: 1000, delay_min_ms: 20, delay_max_ms: 20, calls: true };
         let tx = spawn_writer(
             Arc::new(upstream),
             Some((junk, false)),
