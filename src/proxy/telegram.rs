@@ -120,6 +120,15 @@ fn masked(host: &str) -> String {
     }
 }
 
+/// Имя хоста для лога: адрес воркера — под маской, остальное как есть.
+/// Для модулей, которые не знают, чей это адрес (резолвер).
+pub(crate) fn masked_if_relay(host: &str) -> String {
+    match relay() {
+        Some(relay) if relay.eq_ignore_ascii_case(host) => masked(host),
+        _ => host.to_string(),
+    }
+}
+
 /// Первая строка, не пустая и не комментарий. Схема и путь, если их
 /// вписали по привычке, отрезаются: нужен только хост.
 fn parse(text: &str) -> Option<String> {

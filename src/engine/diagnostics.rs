@@ -330,7 +330,12 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
     // относился к тому же адресу. Но время DoH-запроса не должно попадать
     // ни в connect_rtt, ни в таймаут подключения — иначе живой домен
     // получает «TCP не открылся» просто потому, что резолв был медленным.
-    let resolved = crate::dns::resolver::resolve_first(target).await;
+    // Если системный резолвер имя не знает (блокировка на уровне DNS),
+    // адрес берётся у запасного DoH — так же, как это сделает прокси.
+    let resolved = match crate::dns::resolver::resolve_first(target).await {
+        Some(addr) => Some(addr),
+        None => crate::dns::resolver::resolve_if_system_fails(target).await,
+    };
 
     let connect_started = Instant::now();
     let connect_result = match resolved {

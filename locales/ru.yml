@@ -173,6 +173,7 @@ log.oob_score: "%{domain}: OOB-байт — успехов %{successes}/%{attemp
 field.disorder_ttl: "TTL для disorder"
 log.doh_resolved: "DoH: %{domain} -> %{ips}"
 log.doh_fallback: "DoH не смог разрешить %{domain} — переход на системный DNS (адрес может отличаться)"
+log.dns_fallback_used: "%{domain}: системный DNS не нашёл адрес — взят через DoH (возможно, блокировка на уровне DNS)"
 log.doh_recovered: "DoH снова разрешает %{domain}"
 field.resolve_via_doh: "Резолв через DoH"
 log.diag_retry_started: "Повторная проверка %{count} доменов (больше проб, без досрочного прекращения)…"

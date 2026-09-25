@@ -173,6 +173,7 @@ log.oob_score: "%{domain}: OOB byte — %{successes}/%{attempts} successes, conf
 field.disorder_ttl: "Disorder TTL"
 log.doh_resolved: "DoH: %{domain} -> %{ips}"
 log.doh_fallback: "DoH failed to resolve %{domain} — falling back to system DNS (address may differ)"
+log.dns_fallback_used: "%{domain}: system DNS found no address — resolved via DoH instead (possibly DNS-level blocking)"
 log.doh_recovered: "DoH resolves %{domain} again"
 field.resolve_via_doh: "Resolve via DoH"
 log.diag_retry_started: "Retrying %{count} domains (more trials, no early abandon)…"

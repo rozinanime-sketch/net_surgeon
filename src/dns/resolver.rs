@@ -106,6 +106,9 @@ struct Resolver {
     /// До какого момента провайдер считается недоступным (см. `PROVIDER_BACKOFF`).
     down_until: std::sync::Mutex<Option<Instant>>,
     ip_cache: Arc<IpDomainCache>,
+    /// Писать ли в лог каждый полученный ответ. У запасного резолвера
+    /// своя строка лога (с маской для адреса воркера Telegram).
+    log_resolved: bool,
 }
 
 static RESOLVER: OnceLock<Option<Resolver>> = OnceLock::new();
@@ -114,6 +117,18 @@ static RESOLVER: OnceLock<Option<Resolver>> = OnceLock::new();
 /// Работает и при выключенном `resolve_via_doh`: иначе на телефоне, где
 /// DNS-релея нет, нейросети получали бы настоящие адреса и отказ по стране.
 static SMART: OnceLock<Option<Resolver>> = OnceLock::new();
+
+/// Запасной DoH на случай, когда системный резолвер не нашёл адрес.
+///
+/// Оператор блокирует часть сайтов и на уровне DNS: отвечает «адресов нет»,
+/// причём не всегда — на телефоне Instagram то резолвился, то нет. Обход
+/// DPI тут бессилен, до соединения дело не доходит. Резолвить через DoH
+/// всё подряд по умолчанию не стоит (см. `resolve_via_doh`), а переспросить
+/// только то, что система не нашла, — безопасно: хуже не станет.
+///
+/// Есть, только когда основной DoH выключен: иначе он уже спрошен, и
+/// повторять его отказ незачем.
+static FALLBACK: OnceLock<Option<Resolver>> = OnceLock::new();
 
 /// Канал логов подключается отдельно от init: он создаётся уже внутри
 /// event loop интерфейса, когда резолвер давно поднят.
@@ -164,12 +179,17 @@ pub fn init(
     smart_bootstrap: Option<std::net::IpAddr>,
     ip_cache: Arc<IpDomainCache>,
 ) {
-    let main = enabled.then(|| Resolver::new(provider, bootstrap, Arc::clone(&ip_cache))).flatten();
+    let main = enabled.then(|| Resolver::new(provider.clone(), bootstrap, Arc::clone(&ip_cache))).flatten();
+    let fallback = (!enabled && !provider.is_empty())
+        .then(|| Resolver::new(provider, bootstrap, Arc::clone(&ip_cache)))
+        .flatten()
+        .map(|r| Resolver { log_resolved: false, ..r });
     let smart = (!smart_provider.is_empty())
         .then(|| Resolver::new(smart_provider, smart_bootstrap, ip_cache))
         .flatten();
 
     let _ = RESOLVER.set(main);
+    let _ = FALLBACK.set(fallback);
     let _ = SMART.set(smart);
 }
 
@@ -285,8 +305,54 @@ async fn connect_each(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
 /// `TcpStream::connect("host:port")` делает то же, но без таймаутов: каждый
 /// недоступный адрес стоит полного цикла повторов SYN.
 async fn connect_system(target: &str) -> std::io::Result<TcpStream> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(target).await?.collect();
+    let system = tokio::net::lookup_host(target).await.map(|a| a.collect::<Vec<SocketAddr>>());
+    let addrs = match system {
+        Ok(addrs) if !addrs.is_empty() => addrs,
+        // «Адресов нет» или пустой ответ — переспрашиваем DoH
+        other => match resolve_unresolvable(target).await {
+            Some(addrs) => addrs,
+            None => other?,
+        },
+    };
     connect_each(&addrs).await
+}
+
+/// Адреса через запасной DoH для имени, которое не нашёл системный
+/// резолвер. `None` — запасного нет, хост уже адрес или DoH тоже не знает.
+async fn resolve_unresolvable(target: &str) -> Option<Vec<SocketAddr>> {
+    let fallback = FALLBACK.get()?.as_ref()?;
+    let (host, port) = split_host_port(target)?;
+    if host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    let ips = fallback.lookup(&host).await.ok().filter(|ips| !ips.is_empty())?;
+    // Один раз на домен: браузер открывает к нему десятки соединений.
+    static NOTED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let first_time = NOTED
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(host.clone()))
+        .unwrap_or(false);
+    if first_time && let Some(tx) = LOG.get() {
+        log_t(tx, LogLevel::Warning, "log.dns_fallback_used", vec![
+            ("domain", crate::proxy::telegram::masked_if_relay(&host)),
+        ]);
+    }
+    Some(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
+}
+
+/// Для диагностики: адрес через запасной DoH, только если системный
+/// резолвер имя не нашёл. `None` — система справилась (проба подключается
+/// по имени, как раньше) или не справился и DoH.
+///
+/// Иначе проба домена, заблокированного на уровне DNS, давала «TCP не
+/// открылся» — и вердикт «блокировка по IP», хотя прокси до него дойдёт.
+pub async fn resolve_if_system_fails(target: &str) -> Option<SocketAddr> {
+    let found = tokio::net::lookup_host(target).await.is_ok_and(|mut addrs| addrs.next().is_some());
+    if found {
+        return None;
+    }
+    resolve_unresolvable(target).await?.into_iter().next()
 }
 
 /// Откуда взялся адрес. Различать важно: «DoH выключен» и «DoH сломался» —
@@ -349,6 +415,7 @@ impl Resolver {
             in_flight: tokio::sync::Mutex::new(HashMap::new()),
             down_until: std::sync::Mutex::new(None),
             ip_cache,
+            log_resolved: true,
         })
     }
 
@@ -442,7 +509,7 @@ impl Resolver {
         // Промах кэша, то есть примерно раз в TTL на домен: видно, каким
         // резолвером получен адрес, которым потом пользуются прокси
         // и диагностика.
-        if let Some(tx) = LOG.get() {
+        if self.log_resolved && let Some(tx) = LOG.get() {
             let listed = ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(", ");
             log_t(tx, LogLevel::Info, "log.doh_resolved", vec![
                 ("domain", host.to_string()),
@@ -565,6 +632,7 @@ mod tests {
             in_flight: tokio::sync::Mutex::new(HashMap::new()),
             down_until: std::sync::Mutex::new(None),
             ip_cache: Arc::new(IpDomainCache::new()),
+            log_resolved: true,
         });
 
         let started = Instant::now();
