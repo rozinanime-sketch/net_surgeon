@@ -47,7 +47,7 @@ fn reward_table(
             reward(s, weights),
             s.successes,
             s.attempts,
-            s.median_ms.map(|ms| format!("{:.0}мс", ms)).unwrap_or_else(|| "—".into())
+            s.median_ms.map(|ms| format!("{:.0}{}", ms, rust_i18n::t!("unit.ms"))).unwrap_or_else(|| "—".into())
         )
     })
     .collect::<Vec<_>>()

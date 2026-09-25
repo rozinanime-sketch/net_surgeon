@@ -454,7 +454,7 @@ async fn connect_with_fallback(
     // пробовать второй раз незачем — он только что не ответил.
     let skipped_target = name.is_some() && is_dead(target.ip());
     let first_error = if skipped_target {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{target}: недавно не отвечал"))
+        std::io::Error::new(std::io::ErrorKind::TimedOut, rust_i18n::t!("err.recently_dead", addr = target).into_owned())
     } else {
         // С таймаутом: без него недоступный сервер держал соединение около
         // двух минут, пока ядро повторяет SYN.

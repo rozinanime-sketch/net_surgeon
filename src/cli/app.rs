@@ -115,7 +115,8 @@ impl App {
             log_scroll: 0,
             log_autoscroll: true,
             focus: Focus::Menu,
-            language: Language::Ru,
+            // Язык системы, а не всегда русский: переключатель `L` остаётся.
+            language: if crate::default_language() == "ru" { Language::Ru } else { Language::En },
             proxy_token: None,
             diagnostics_running: false,
             diagnostics_only: false,

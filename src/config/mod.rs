@@ -205,9 +205,9 @@ pub fn load_config() -> Result<Config, String> {
     // ничего не подсказывает: каталог данных вычисляется, а не берётся из CWD.
     let path = paths::resolve("config.toml");
     let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Не удалось прочитать {}: {}", path.display(), e))?;
+        .map_err(|e| rust_i18n::t!("startup.config_read", path = path.display(), error = e).into_owned())?;
     toml::from_str(&contents)
-        .map_err(|e| format!("Не удалось распарсить config.toml: {}", e))
+        .map_err(|e| rust_i18n::t!("startup.config_parse", error = e).into_owned())
 }
 
 /// Список доменов для обхода.

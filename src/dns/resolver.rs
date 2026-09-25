@@ -227,7 +227,7 @@ pub async fn connect(target: &str) -> std::io::Result<TcpStream> {
                 Ok(result) => result,
                 Err(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!("{target}: подключение не установилось за {} с", FALLBACK_CONNECT_TIMEOUT.as_secs()),
+                    rust_i18n::t!("err.connect_timeout", addr = target, secs = FALLBACK_CONNECT_TIMEOUT.as_secs()).into_owned(),
                 )),
             }
         }
@@ -251,7 +251,7 @@ pub async fn connect_addr(addr: SocketAddr) -> std::io::Result<TcpStream> {
         Ok(result) => result,
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            format!("{addr}: подключение не установилось за {} с", PER_ADDRESS_CONNECT_TIMEOUT.as_secs()),
+            rust_i18n::t!("err.connect_timeout", addr = addr, secs = PER_ADDRESS_CONNECT_TIMEOUT.as_secs()).into_owned(),
         )),
     }
 }
@@ -270,8 +270,8 @@ async fn connect_each(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
     // она прятала настоящую: IPv4 не ответил за 4 с, следом IPv6 в сети без
     // IPv6 мгновенно дал «Network is unreachable» — и в логе было только это.
     match errors.len() {
-        0 => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "нет адресов для подключения")),
-        1 => Err(errors.pop().expect("один элемент").1),
+        0 => Err(std::io::Error::new(std::io::ErrorKind::NotFound, rust_i18n::t!("err.no_addresses").into_owned())),
+        1 => Err(errors.pop().expect("ровно одна ошибка").1),
         _ => {
             let kind = errors[0].1.kind();
             let detail = errors.iter().map(|(a, e)| format!("{}: {e}", a.ip())).collect::<Vec<_>>().join("; ");

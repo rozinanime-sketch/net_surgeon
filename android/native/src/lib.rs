@@ -81,6 +81,13 @@ fn push_line(line: String) {
     }
 }
 
+/// Строка из словаря ядра на языке, выбранном при запуске.
+fn tr(key: &str, args: &[(&str, String)]) -> String {
+    let lang = LANG.lock().map(|l| l.clone()).unwrap_or_default();
+    let args: Vec<(String, String)> = args.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    i18n::translate(&lang, key, &args)
+}
+
 fn marker(level: LogLevel) -> &'static str {
     match level {
         LogLevel::Info => "·",
@@ -125,9 +132,12 @@ fn log_tx() -> &'static LogSender {
 /// Поднимает ядро и tun2proxy поверх дескриптора TUN. `None` — запущено,
 /// иначе текст ошибки для экрана.
 fn start(tun_fd: i32, data_dir: String, lang: String) -> Option<String> {
+    if let Ok(mut l) = LANG.lock() {
+        *l = lang.clone();
+    }
     let mut running = RUNNING.lock().ok()?;
     if running.is_some() {
-        return Some("уже запущено".into());
+        return Some(tr("startup.already_running", &[]));
     }
 
     // Каталог данных ядро вычисляет один раз, при первом обращении, и эта
@@ -139,9 +149,6 @@ fn start(tun_fd: i32, data_dir: String, lang: String) -> Option<String> {
         unsafe { std::env::set_var("NET_SURGEON_DIR", &data_dir) };
     }
     net_surgeon::set_locale(&lang);
-    if let Ok(mut l) = LANG.lock() {
-        *l = lang;
-    }
 
     let startup = match net_surgeon::bootstrap() {
         Ok(s) => s,
@@ -156,11 +163,11 @@ fn start(tun_fd: i32, data_dir: String, lang: String) -> Option<String> {
     let socks = format!("socks5://127.0.0.1:{}", startup.config.socks5_port);
     let proxy = match tun2proxy::ArgProxy::try_from(socks.as_str()) {
         Ok(p) => p,
-        Err(e) => return Some(format!("адрес SOCKS5: {e}")),
+        Err(e) => return Some(tr("startup.bad_socks_addr", &[("error", e.to_string())])),
     };
     let pool = match VIRTUAL_DNS_POOL.parse() {
         Ok(p) => p,
-        Err(e) => return Some(format!("пул virtual DNS: {e:?}")),
+        Err(e) => return Some(tr("startup.bad_dns_pool", &[("error", format!("{e:?}"))])),
     };
     let mut args = tun2proxy::Args::default();
     args.proxy(proxy)
@@ -195,8 +202,8 @@ fn start(tun_fd: i32, data_dir: String, lang: String) -> Option<String> {
             // соединения tun2proxy получили бы отказ.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             match tun2proxy::general_run_async(args, mtu, false, token).await {
-                Ok(_) => push_line("tun2proxy остановлен".into()),
-                Err(e) => push_line(format!("✗ tun2proxy: {e}")),
+                Ok(_) => push_line(tr("startup.tun_stopped", &[])),
+                Err(e) => push_line(format!("✗ {}", tr("startup.tun_error", &[("error", e.to_string())]))),
             }
         });
     }

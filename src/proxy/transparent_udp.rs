@@ -241,7 +241,7 @@ fn recv_with_orig_dst(
     let Some(orig_dst) = orig_dst else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "в датаграмме нет IP_ORIGDSTADDR — проверьте правило TPROXY",
+            rust_i18n::t!("err.no_origdst").into_owned(),
         ));
     };
 

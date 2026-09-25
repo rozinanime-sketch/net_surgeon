@@ -7,6 +7,12 @@
 
 use net_surgeon::{bootstrap, headless};
 
+/// Перевод сообщения запуска на язык по умолчанию.
+fn tr(key: &str, args: &[(&str, String)]) -> String {
+    let args: Vec<(String, String)> = args.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    net_surgeon::observability::i18n::translate(net_surgeon::default_language(), key, &args)
+}
+
 /// Как запускаться.
 enum Mode {
     /// Терминальный интерфейс.
@@ -37,7 +43,7 @@ fn parse_mode() -> Mode {
 
 #[tokio::main]
 async fn main() {
-    net_surgeon::set_locale("ru");
+    net_surgeon::set_locale(net_surgeon::default_language());
 
     let startup = match bootstrap() {
         Ok(s) => s,
@@ -55,7 +61,7 @@ async fn main() {
         match net_surgeon::firewall::install(cfg.transparent_port, cfg.udp_port) {
             Ok(msg) => eprintln!("[✓] {}", msg),
             Err(e) => {
-                eprintln!("[✗] Прозрачный режим: {}", e);
+                eprintln!("[✗] {}", tr("startup.transparent_failed", &[("error", e)]));
                 std::process::exit(1);
             }
         }
@@ -107,8 +113,8 @@ fn run_tui_with(startup: net_surgeon::Startup, diagnostics_only: bool) {
         ip_cache,
         strategies,
     ) {
-        eprintln!("[✗] Ошибка TUI: {}", e);
-        eprintln!("[i] Без терминала запускайте с --headless.");
+        eprintln!("[✗] {}", tr("startup.tui_error", &[("error", e.to_string())]));
+        eprintln!("[i] {}", tr("startup.tui_hint", &[]));
         std::process::exit(1);
     }
 }

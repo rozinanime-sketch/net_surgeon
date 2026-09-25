@@ -30,7 +30,7 @@ use crate::Startup;
 /// Берётся из `NET_SURGEON_LANG`, по умолчанию русский — как и в TUI.
 /// Переключать на лету некому, поэтому значение читается один раз.
 fn language() -> String {
-    std::env::var("NET_SURGEON_LANG").unwrap_or_else(|_| "ru".to_string())
+    crate::default_language().to_string()
 }
 
 fn level_marker(level: LogLevel) -> &'static str {
@@ -121,7 +121,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
                         if strategies.is_dirty()
                             && let Err(e) = strategies.save()
                         {
-                            eprintln!("[✗] strategies.txt: {e}");
+                            eprintln!("[✗] {}", crate::observability::i18n::translate(crate::default_language(), "startup.strategies_save_failed", &[("error".into(), e.to_string())]));
                         }
                     }
                 }
@@ -137,13 +137,13 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
     loop {
         tokio::select! {
             _ = wait_terminate(&mut terminate) => {
-                println!("[i] Получен SIGTERM, завершаюсь…");
+                println!("[i] {}", crate::observability::i18n::translate(&lang, "startup.sigterm", &[]));
                 token.cancel();
                 break;
             }
             _ = tokio::signal::ctrl_c() => {
                 println!();
-                println!("[i] Завершаюсь…");
+                println!("[i] {}", crate::observability::i18n::translate(&lang, "startup.exiting", &[]));
                 token.cancel();
                 break;
             }
@@ -169,7 +169,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
     if startup.strategies.is_dirty()
         && let Err(e) = startup.strategies.save()
     {
-        eprintln!("[✗] strategies.txt: {e}");
+        eprintln!("[✗] {}", crate::observability::i18n::translate(&lang, "startup.strategies_save_failed", &[("error".into(), e.to_string())]));
     }
 }
 

@@ -116,7 +116,7 @@ static HELD: Mutex<Option<Held>> = Mutex::new(None);
 /// Ставит перехват. Возвращает, что включено, для сообщения пользователю.
 pub fn install(port: u16, dns_port: u16) -> Result<String, String> {
     if port == 0 {
-        return Err("transparent_port = 0 в config.toml — перехватывать некуда".into());
+        return Err(rust_i18n::t!("fw.no_port").into_owned());
     }
 
     // Группа прокси должна отличаться от обычной группы пользователя:
@@ -130,7 +130,7 @@ pub fn install(port: u16, dns_port: u16) -> Result<String, String> {
     }
 
     if HELD.lock().map(|h| h.is_some()).unwrap_or(false) {
-        return Err("перехват уже включён".into());
+        return Err(rust_i18n::t!("fw.already_on").into_owned());
     }
 
     // Проверка раньше, чем что-то менять: без права ни nft, ни ip ничего
@@ -138,16 +138,13 @@ pub fn install(port: u16, dns_port: u16) -> Result<String, String> {
     // дело в пересобранном бинаре, с которого слетели полномочия.
     let check = run_with_cap("nft", &["list", "tables"]).map_err(|e| nft_missing(&e))?;
     if !check.status.success() {
-        return Err(format!(
-            "нет права CAP_NET_ADMIN ({}). Запустите ./run.sh — он выдаст права после сборки",
-            stderr_line(&check)
-        ));
+        return Err(rust_i18n::t!("fw.no_cap", error = stderr_line(&check)).into_owned());
     }
 
     // До любых изменений: иначе второй экземпляр, прежде чем получить
     // отказ от nft, снял бы маршрутную пару первого и сломал ему QUIC.
     if table_present() {
-        return Err("перехват уже держит другой запущенный net_surgeon".into());
+        return Err(rust_i18n::t!("fw.taken").into_owned());
     }
 
     let routing = add_routing();
@@ -161,18 +158,18 @@ pub fn install(port: u16, dns_port: u16) -> Result<String, String> {
         if routing {
             del_routing();
         }
-        return Err(format!("nft отверг правила: {}", stderr_line(&dry)));
+        return Err(rust_i18n::t!("fw.rejected", error = stderr_line(&dry)).into_owned());
     }
 
     let mut child = spawn_with_cap("nft", &["-i"])
         .map_err(|e| nft_missing(&e))?;
-    let mut stdin = child.stdin.take().ok_or("нет stdin у nft")?;
+    let mut stdin = child.stdin.take().ok_or_else(|| rust_i18n::t!("fw.no_stdin").into_owned())?;
     if let Err(e) = stdin.write_all(rules.as_bytes()).and_then(|_| stdin.flush()) {
         let _ = child.kill();
         if routing {
             del_routing();
         }
-        return Err(format!("не удалось передать правила nft: {e}"));
+        return Err(rust_i18n::t!("fw.send_failed", error = e).into_owned());
     }
 
     // Команды применяются асинхронно, пока nft читает stdin: ждём таблицу.
@@ -189,7 +186,7 @@ pub fn install(port: u16, dns_port: u16) -> Result<String, String> {
         if routing {
             del_routing();
         }
-        return Err("таблица nftables не появилась — возможно, уже запущен другой net_surgeon".into());
+        return Err(rust_i18n::t!("fw.table_missing").into_owned());
     }
 
     if let Ok(mut h) = HELD.lock() {
@@ -203,10 +200,7 @@ pub fn install(port: u16, dns_port: u16) -> Result<String, String> {
     if dns_port > 0 {
         what.push("DNS");
     }
-    Ok(format!(
-        "перехват включён ({}), снимется сам при любом выходе, даже при kill -9",
-        what.join(", ")
-    ))
+    Ok(rust_i18n::t!("fw.installed", rules = what.join(", ")).into_owned())
 }
 
 /// Штатное снятие. Таблицу ядро убрало бы и само, а маршрутную пару —
@@ -263,15 +257,15 @@ fn del_routing() {
 
 fn nft_missing(e: &io::Error) -> String {
     if e.kind() == io::ErrorKind::NotFound {
-        "не найдена программа nft (пакет nftables)".into()
+        rust_i18n::t!("fw.no_nft").into_owned()
     } else {
-        format!("не удалось запустить nft: {e}")
+        rust_i18n::t!("fw.nft_start_failed", error = e).into_owned()
     }
 }
 
 fn stderr_line(o: &Output) -> String {
     let s = String::from_utf8_lossy(&o.stderr);
-    s.lines().find(|l| !l.trim().is_empty()).unwrap_or("без сообщения").trim().to_string()
+    s.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()).unwrap_or_else(|| rust_i18n::t!("fw.no_message").into_owned())
 }
 
 fn command_with_cap(program: &str, args: &[&str]) -> Command {

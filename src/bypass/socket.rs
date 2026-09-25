@@ -196,7 +196,7 @@ pub async fn send_oob(fd: RawFd, byte: u8) -> std::io::Result<()> {
 
     Err(std::io::Error::new(
         std::io::ErrorKind::WouldBlock,
-        "не удалось отправить OOB-байт: буфер занят",
+        rust_i18n::t!("err.oob_busy").into_owned(),
     ))
 }
 
@@ -219,7 +219,7 @@ pub fn set_ttl(_fd: RawFd, _ttl: u32) -> bool {
 pub async fn send_oob(_fd: RawFd, _byte: u8) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "MSG_OOB не реализован для этой платформы",
+        rust_i18n::t!("err.oob_unsupported").into_owned(),
     ))
 }
 

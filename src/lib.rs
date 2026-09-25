@@ -133,3 +133,47 @@ pub fn bootstrap() -> Result<Startup, String> {
 pub fn set_locale(code: &str) {
     rust_i18n::set_locale(code);
 }
+
+/// Язык по умолчанию: `NET_SURGEON_LANG`, иначе язык системы.
+///
+/// Раньше программа на компьютере всегда стартовала по-русски, и
+/// англоязычный пользователь видел в логе русский текст, пока не находил
+/// переключатель. Теперь русский — только если он и есть язык системы.
+pub fn default_language() -> &'static str {
+    let explicit = std::env::var("NET_SURGEON_LANG").ok();
+    // Порядок как у gettext: LC_ALL перекрывает LC_MESSAGES, тот — LANG.
+    let system = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|v| !v.is_empty());
+    language_from(explicit.as_deref(), system.as_deref())
+}
+
+fn language_from(explicit: Option<&str>, system: Option<&str>) -> &'static str {
+    match explicit {
+        Some("ru") => return "ru",
+        Some("en") => return "en",
+        _ => {}
+    }
+    match system {
+        Some(v) if v.to_ascii_lowercase().starts_with("ru") => "ru",
+        _ => "en",
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::language_from;
+
+    #[test]
+    fn explicit_setting_wins_and_system_language_is_the_default() {
+        assert_eq!(language_from(Some("en"), Some("ru_RU.UTF-8")), "en");
+        assert_eq!(language_from(Some("ru"), Some("en_US.UTF-8")), "ru");
+        assert_eq!(language_from(None, Some("ru_RU.UTF-8")), "ru");
+        assert_eq!(language_from(None, Some("de_DE.UTF-8")), "en");
+        assert_eq!(language_from(Some("fr"), Some("ru_RU.UTF-8")), "ru");
+        // Без языка системы (LANG=C, пусто) — английский
+        assert_eq!(language_from(None, Some("C")), "en");
+        assert_eq!(language_from(None, None), "en");
+    }
+}

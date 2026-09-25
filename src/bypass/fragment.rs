@@ -143,10 +143,11 @@ fn restore_ttl(fd: RawFd, ttl: u32) -> std::io::Result<()> {
     if socket::set_ttl(fd, ttl) {
         Ok(())
     } else {
-        Err(std::io::Error::other(format!(
-            "не удалось вернуть TTL {ttl} после низкого: {}",
-            std::io::Error::last_os_error()
-        )))
+        Err(std::io::Error::other(rust_i18n::t!(
+            "err.ttl_restore",
+            ttl = ttl,
+            error = std::io::Error::last_os_error()
+        ).into_owned()))
     }
 }
 
@@ -240,9 +241,7 @@ where
         // Приманка уже в сети, а откатить нумерацию не вышло. Продолжать
         // нельзя: сервер получит данные со сдвигом и будет ждать дыру.
         // Честная ошибка лучше повисшего соединения.
-        return Err(std::io::Error::other(
-            "fake: приманка отправлена, но откатить номер последовательности не удалось",
-        ));
+        return Err(std::io::Error::other(rust_i18n::t!("err.fake_seq").into_owned()));
     }
 
     server_writer.write_all(data).await?;

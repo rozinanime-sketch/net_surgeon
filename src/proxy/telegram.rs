@@ -140,7 +140,7 @@ where
     let path = format!("/apiws?dst={ip}&port={port}");
     let ws = tokio::time::timeout(CONNECT_TIMEOUT, ws::connect(relay_host, &path))
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "ретранслятор не ответил"))??;
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, rust_i18n::t!("err.relay_timeout").into_owned()))??;
 
     log_t(log_tx, LogLevel::Info, "log.telegram_relayed", vec![("addr", format!("{ip}:{port}"))]);
 
@@ -276,7 +276,7 @@ mod ws {
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
             if head.len() > 8192 {
-                return Err(std::io::Error::other("слишком длинный ответ ретранслятора"));
+                return Err(std::io::Error::other(rust_i18n::t!("err.relay_long_reply").into_owned()));
             }
             stream.read_exact(&mut byte).await?;
             head.push(byte[0]);
@@ -284,7 +284,7 @@ mod ws {
         let status = String::from_utf8_lossy(&head);
         let first = status.lines().next().unwrap_or_default();
         if first.split_whitespace().nth(1) != Some("101") {
-            return Err(std::io::Error::other(format!("ретранслятор ответил: {first}")));
+            return Err(std::io::Error::other(rust_i18n::t!("err.relay_replied", status = first).into_owned()));
         }
         Ok(stream)
     }
@@ -337,7 +337,7 @@ mod ws {
             n => n as u64,
         };
         if len > max {
-            return Err(std::io::Error::other("кадр ретранслятора слишком большой"));
+            return Err(std::io::Error::other(rust_i18n::t!("err.relay_frame_too_big").into_owned()));
         }
         let mut mask = [0u8; 4];
         if masked {

@@ -58,12 +58,8 @@ fn enter_background_mode(
 
     restore_terminal(terminal)?;
 
-    let msg = if app.language.code() == "ru" {
-        "\n  Прокси работает в фоне. Нажмите Enter чтобы вернуться в интерфейс.\n"
-    } else {
-        "\n  Proxy running in background. Press Enter to return to the interface.\n"
-    };
-    println!("{}", msg);
+    let msg = crate::observability::i18n::translate(app.language.code(), "startup.background", &[]);
+    println!("\n  {}\n", msg);
     io::stdout().flush()?;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -297,7 +293,7 @@ fn run_app(
     if strategies.is_dirty()
         && let Err(e) = strategies.save()
     {
-        eprintln!("[✗] Не удалось сохранить strategies.txt: {}", e);
+        eprintln!("[✗] {}", rust_i18n::t!("startup.strategies_save_failed", error = e));
     }
 
     Ok(())
