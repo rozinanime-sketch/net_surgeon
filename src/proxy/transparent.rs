@@ -284,12 +284,13 @@ async fn handle(
     let strategy = selected.strategy;
 
     let started = std::time::Instant::now();
-    // С таймаутом: без него недоступный сервер держал соединение около двух
-    // минут, пока ядро повторяет SYN.
-    let server = match crate::dns::resolver::connect_addr(target_addr).await {
-        Ok(s) => {
+    // Имя сайта известно только из SNI или кэша; без него запасных адресов
+    // не найти.
+    let name = (domain.parse::<std::net::IpAddr>().is_err()).then_some(domain.as_str());
+    let (server, target_addr) = match connect_with_fallback(target_addr, name, log_tx).await {
+        Ok(pair) => {
             metrics.record_connect_ms(started.elapsed().as_secs_f64() * 1000.0);
-            s
+            pair
         }
         Err(e) => {
             log_t(log_tx, LogLevel::Error, "log.https_connect_error", vec![
@@ -390,4 +391,94 @@ async fn handle(
 
     // Обратная связь по стратегии — та же, что в остальных режимах.
     crate::proxy::adaptive::record_outcome(&adaptive_ctx, &domain, selected, responded.load(Ordering::Relaxed));
+}
+
+/// Сколько помнить адрес, который не ответил на подключение.
+const DEAD_ADDR_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Адреса, которые недавно не ответили: `адрес → когда забыть`.
+static DEAD_ADDRS: std::sync::Mutex<Option<std::collections::HashMap<std::net::IpAddr, std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
+fn is_dead(ip: std::net::IpAddr) -> bool {
+    let Ok(mut guard) = DEAD_ADDRS.lock() else { return false };
+    let map = guard.get_or_insert_with(Default::default);
+    let now = std::time::Instant::now();
+    map.retain(|_, until| *until > now);
+    map.contains_key(&ip)
+}
+
+fn mark_dead(ip: std::net::IpAddr) {
+    if let Ok(mut guard) = DEAD_ADDRS.lock() {
+        guard.get_or_insert_with(Default::default).insert(ip, std::time::Instant::now() + DEAD_ADDR_TTL);
+    }
+}
+
+/// Подключается к адресу, который выбрал браузер, а если тот не отвечает —
+/// к другому адресу того же сайта.
+///
+/// В прозрачном режиме адрес выбирает не прокси, а браузер: берёт один из
+/// DNS-ответа. У Discord часть адресов Cloudflare заблокирована по IP
+/// (162.159.136.232 не отвечает на SYN), а DNS отдаёт адреса по кругу —
+/// сайт то открывался, то нет. Обход DPI тут бессилен: пакеты до сервера
+/// не доходят вовсе. Зато у сайта есть другие адреса, и они живы.
+///
+/// Мёртвый адрес запоминается на [`DEAD_ADDR_TTL`], чтобы следующие
+/// соединения не ждали на нём таймаут каждое.
+async fn connect_with_fallback(
+    target: std::net::SocketAddr,
+    name: Option<&str>,
+    log_tx: &LogSender,
+) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
+    let first_error = if name.is_some() && is_dead(target.ip()) {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{target}: недавно не отвечал"))
+    } else {
+        // С таймаутом: без него недоступный сервер держал соединение около
+        // двух минут, пока ядро повторяет SYN.
+        match crate::dns::resolver::connect_addr(target).await {
+            Ok(s) => return Ok((s, target)),
+            Err(e) => {
+                mark_dead(target.ip());
+                e
+            }
+        }
+    };
+    let Some(name) = name else { return Err(first_error) };
+
+    let Ok(addrs) = tokio::net::lookup_host((name, target.port())).await else {
+        return Err(first_error);
+    };
+    // Только того же семейства: к IPv6 из IPv4-соединения (и наоборот)
+    // может не быть маршрута.
+    for addr in addrs.filter(|a| a.is_ipv4() == target.is_ipv4() && a.ip() != target.ip()) {
+        if is_dead(addr.ip()) {
+            continue;
+        }
+        match crate::dns::resolver::connect_addr(addr).await {
+            Ok(s) => {
+                log_t(log_tx, LogLevel::Info, "log.transparent_fallback_addr", vec![
+                    ("domain", name.to_string()),
+                    ("dead", target.ip().to_string()),
+                    ("addr", addr.ip().to_string()),
+                ]);
+                return Ok((s, addr));
+            }
+            Err(_) => mark_dead(addr.ip()),
+        }
+    }
+    Err(first_error)
+}
+
+#[cfg(test)]
+mod dead_addr_tests {
+    use super::*;
+
+    #[test]
+    fn remembers_dead_address_only() {
+        let dead: std::net::IpAddr = "192.0.2.77".parse().unwrap();
+        let alive: std::net::IpAddr = "192.0.2.78".parse().unwrap();
+        mark_dead(dead);
+        assert!(is_dead(dead));
+        assert!(!is_dead(alive));
+    }
 }

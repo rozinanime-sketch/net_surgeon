@@ -191,6 +191,7 @@ log.socks5_udp_reply_error: "SOCKS5 UDP: не удалось вернуть от
 log.transparent_listening: "Прозрачный режим слушает: %{addr} (нужно правило iptables)"
 log.transparent_no_dst: "Прозрачный режим: не удалось узнать исходный адрес — проверьте правило iptables"
 log.transparent_tunnel: "Перехвачено: %{domain} -> %{addr} (bypass: %{bypass})"
+log.transparent_fallback_addr: "%{domain}: адрес %{dead} не отвечает, подключаюсь к %{addr}"
 log.transparent_applied: "Перехват %{domain}: применено %{detail}"
 field.transparent_port: "Порт прозрачного режима (0 = выкл)"
 field.block_trackers: "Блокировать трекеры"

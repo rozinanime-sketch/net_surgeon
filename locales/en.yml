@@ -191,6 +191,7 @@ log.socks5_udp_reply_error: "SOCKS5 UDP: failed to return reply to client %{addr
 log.transparent_listening: "Transparent mode listening: %{addr} (iptables rule required)"
 log.transparent_no_dst: "Transparent mode: could not determine original destination — check the iptables rule"
 log.transparent_tunnel: "Intercepted: %{domain} -> %{addr} (bypass: %{bypass})"
+log.transparent_fallback_addr: "%{domain}: %{dead} does not answer, connecting to %{addr}"
 log.transparent_applied: "Intercept %{domain}: applied %{detail}"
 field.transparent_port: "Transparent port (0 = off)"
 field.block_trackers: "Block trackers"
