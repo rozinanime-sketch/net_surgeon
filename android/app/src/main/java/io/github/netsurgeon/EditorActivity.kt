@@ -78,6 +78,7 @@ class EditorActivity : Activity() {
             }
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
+        root.padForSystemBars()
         setContentView(root)
     }
 

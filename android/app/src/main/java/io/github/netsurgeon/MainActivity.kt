@@ -19,11 +19,11 @@ import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 
 /**
- * Главный экран: кнопка включения, состояние и лог ядра.
+ * Главный экран: кнопка включения и состояние. Лог — отдельным экраном
+ * ([LogActivity]): пока всё работает, он не нужен.
  *
  * Разметка собрана в коде, без XML и без AndroidX: экран один и простой,
  * а библиотеки интерфейса удвоили бы размер приложения и время сборки.
@@ -32,8 +32,6 @@ class MainActivity : Activity() {
 
     private lateinit var toggle: Button
     private lateinit var status: TextView
-    private lateinit var log: TextView
-    private lateinit var logScroll: ScrollView
     private lateinit var update: TextView
     private val handler = Handler(Looper.getMainLooper())
 
@@ -123,21 +121,14 @@ class MainActivity : Activity() {
         }
         root.addView(update, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
-        root.addView(TextView(this).apply {
+        // Пустое место забирает остаток экрана: кнопка лога — в самом низу.
+        root.addView(View(this), LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        root.addView(Button(this).apply {
             text = "Лог"
-            setTextColor(Color.GRAY)
-            setPadding(0, pad, 0, dp(4))
-        })
+            setOnClickListener { startActivity(Intent(this@MainActivity, LogActivity::class.java)) }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
-        log = TextView(this).apply {
-            textSize = 11f
-            typeface = Typeface.MONOSPACE
-            setTextColor(Color.LTGRAY)
-            setTextIsSelectable(true)
-        }
-        logScroll = ScrollView(this).apply { addView(log) }
-        root.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-
+        root.padForSystemBars()
         setContentView(root)
         // После поворота экрана intent тот же: второй раз не включаем.
         if (savedInstanceState == null) startIfAsked(intent)
@@ -182,15 +173,6 @@ class MainActivity : Activity() {
         status.text = if (running) "Обход включён" else "Выключено"
         status.setTextColor(if (running) Color.rgb(120, 220, 120) else Color.GRAY)
         toggle.text = if (running) "Выключить" else "Включить"
-
-        val text = NativeBridge.logs()
-        if (text != log.text.toString()) {
-            // Следим за концом лога, только если пользователь и так внизу:
-            // иначе нельзя было бы прокрутить вверх и почитать.
-            val atBottom = !logScroll.canScrollVertically(1)
-            log.text = text
-            if (atBottom) logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
-        }
     }
 
     private fun onToggle() {

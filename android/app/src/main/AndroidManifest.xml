@@ -29,6 +29,10 @@
             android:name=".EditorActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".LogActivity"
+            android:exported="false" />
+
         <!-- BIND_VPN_SERVICE: подключиться к сервису может только система. -->
         <service
             android:name=".SurgeonVpnService"
