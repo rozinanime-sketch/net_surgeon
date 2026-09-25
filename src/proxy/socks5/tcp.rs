@@ -16,6 +16,8 @@ use crate::protocol::socks5::parse_socks5_target;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const NO_AUTH: u8 = 0x00;
+/// «Ни один из предложенных методов не подходит» (RFC 1928 §3).
+const NO_ACCEPTABLE_METHOD: u8 = 0xFF;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_IPV6: u8 = 0x04;
@@ -109,6 +111,16 @@ async fn handle_socks5(
         return;
     }
 
+    // Работаем только без пароля. Раньше «без пароля» отвечалось всегда,
+    // даже клиенту, который его не предлагал (настроен на логин и пароль):
+    // он получал непредложенный метод и падал с невнятной ошибкой. По RFC
+    // ответ в этом случае — «подходящего метода нет», и клиент скажет прямо.
+    if !offers_no_auth(&buf[..n]) {
+        log_t(&log_tx, LogLevel::Warning, "log.socks5_auth_unsupported", vec![]);
+        let _ = stream.write_all(&[SOCKS5_VERSION, NO_ACCEPTABLE_METHOD]).await;
+        return;
+    }
+
     // Хвост, пришедший в одном сегменте с приветствием, — это уже запрос.
     // По RFC 1928 клиент обязан дождаться выбора метода, но некоторые шлют
     // оба сообщения одним пакетом. Раньше этот хвост затирался следующим
@@ -161,6 +173,13 @@ async fn read_greeting(stream: &mut TcpStream, buf: &mut [u8]) -> Option<(usize,
             return Some((have, 0));
         }
     }
+}
+
+/// Предлагает ли клиент работу без пароля: METHODS — байты после VER и
+/// NMETHODS. Приветствие длиной `2 + NMETHODS` гарантирует `read_greeting`.
+fn offers_no_auth(greeting: &[u8]) -> bool {
+    let count = greeting.get(1).copied().unwrap_or(0) as usize;
+    greeting.get(2..2 + count).is_some_and(|methods| methods.contains(&NO_AUTH))
 }
 
 /// Запрос RFC 1928: VER CMD RSV ATYP DST.ADDR DST.PORT.
@@ -539,6 +558,17 @@ mod tests {
         let v6 = udp_associate_reply("::1".parse().unwrap(), 1082);
         assert_eq!(v6[3], 0x04);
         assert_eq!(v6.len(), 4 + 16 + 2);
+    }
+
+    #[test]
+    fn greeting_without_no_auth_is_refused() {
+        assert!(offers_no_auth(&[0x05, 0x01, 0x00]));
+        assert!(offers_no_auth(&[0x05, 0x02, 0x02, 0x00]));
+        // Только логин и пароль
+        assert!(!offers_no_auth(&[0x05, 0x01, 0x02]));
+        // Ни одного метода и обрезанное приветствие
+        assert!(!offers_no_auth(&[0x05, 0x00]));
+        assert!(!offers_no_auth(&[0x05, 0x02, 0x02]));
     }
 
     fn name_for(requested: &str, first_packet: &[u8], cache: &IpDomainCache) -> Option<String> {
