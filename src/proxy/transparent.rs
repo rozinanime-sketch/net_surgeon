@@ -406,6 +406,28 @@ fn is_dead(ip: std::net::IpAddr) -> bool {
     map.contains_key(&ip)
 }
 
+/// Помечает адрес мёртвым, если ошибка говорит о блокировке по IP.
+///
+/// Только таймаут: адрес, заблокированный по IP, молча не отвечает на SYN.
+/// Мгновенные ошибки — «сеть недоступна», «нет маршрута», отказ в
+/// соединении — говорят о своей сети или о сервере, а не о блокировке.
+/// Раньше мёртвым становился адрес с любой ошибкой, и секундный обрыв
+/// Wi-Fi выключал на десять минут все сайты, к которым в эту секунду
+/// шли соединения: адрес «недавно не отвечал», и к нему даже не пробовали.
+fn mark_dead_if_blocked(ip: std::net::IpAddr, error: &std::io::Error) {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        mark_dead(ip);
+    }
+}
+
+fn forget_dead(ip: std::net::IpAddr) {
+    if let Ok(mut guard) = DEAD_ADDRS.lock()
+        && let Some(map) = guard.as_mut()
+    {
+        map.remove(&ip);
+    }
+}
+
 fn mark_dead(ip: std::net::IpAddr) {
     if let Ok(mut guard) = DEAD_ADDRS.lock() {
         guard.get_or_insert_with(Default::default).insert(ip, std::time::Instant::now() + DEAD_ADDR_TTL);
@@ -428,7 +450,10 @@ async fn connect_with_fallback(
     name: Option<&str>,
     log_tx: &LogSender,
 ) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
-    let first_error = if name.is_some() && is_dead(target.ip()) {
+    // Решается до первой попытки: адрес, ставший мёртвым на ней же,
+    // пробовать второй раз незачем — он только что не ответил.
+    let skipped_target = name.is_some() && is_dead(target.ip());
+    let first_error = if skipped_target {
         std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{target}: недавно не отвечал"))
     } else {
         // С таймаутом: без него недоступный сервер держал соединение около
@@ -436,15 +461,29 @@ async fn connect_with_fallback(
         match crate::dns::resolver::connect_addr(target).await {
             Ok(s) => return Ok((s, target)),
             Err(e) => {
-                mark_dead(target.ip());
+                mark_dead_if_blocked(target.ip(), &e);
                 e
             }
         }
     };
-    let Some(name) = name else { return Err(first_error) };
+    // Исходный адрес пропущен как мёртвый, а замены не нашлось — последняя
+    // попытка всё же к нему: отметка могла устареть, а без попытки
+    // соединение гарантированно не откроется.
+    let last_resort = || async {
+        if skipped_target {
+            let stream = crate::dns::resolver::connect_addr(target).await?;
+            // Ожил — дальше снова первым пробуется он.
+            forget_dead(target.ip());
+            Ok((stream, target))
+        } else {
+            Err(first_error)
+        }
+    };
+
+    let Some(name) = name else { return last_resort().await };
 
     let Ok(addrs) = tokio::net::lookup_host((name, target.port())).await else {
-        return Err(first_error);
+        return last_resort().await;
     };
     // Только того же семейства: к IPv6 из IPv4-соединения (и наоборот)
     // может не быть маршрута.
@@ -461,10 +500,10 @@ async fn connect_with_fallback(
                 ]);
                 return Ok((s, addr));
             }
-            Err(_) => mark_dead(addr.ip()),
+            Err(e) => mark_dead_if_blocked(addr.ip(), &e),
         }
     }
-    Err(first_error)
+    last_resort().await
 }
 
 #[cfg(test)]
@@ -478,5 +517,38 @@ mod dead_addr_tests {
         mark_dead(dead);
         assert!(is_dead(dead));
         assert!(!is_dead(alive));
+    }
+
+    /// Мгновенные ошибки — своя сеть или сервер, а не блокировка по IP.
+    #[test]
+    fn only_a_silent_address_is_marked_dead() {
+        use std::io::{Error, ErrorKind};
+        let refused: std::net::IpAddr = "192.0.2.80".parse().unwrap();
+        let unreachable: std::net::IpAddr = "192.0.2.81".parse().unwrap();
+        let silent: std::net::IpAddr = "192.0.2.82".parse().unwrap();
+
+        mark_dead_if_blocked(refused, &Error::from(ErrorKind::ConnectionRefused));
+        mark_dead_if_blocked(unreachable, &Error::from(ErrorKind::NetworkUnreachable));
+        mark_dead_if_blocked(silent, &Error::from(ErrorKind::TimedOut));
+
+        assert!(!is_dead(refused));
+        assert!(!is_dead(unreachable));
+        assert!(is_dead(silent));
+    }
+
+    /// Адрес помечен мёртвым, замены нет — к нему всё равно пробуют
+    /// подключиться, и если он ожил, отметка снимается.
+    #[tokio::test]
+    async fn dead_target_without_replacement_is_still_tried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        mark_dead(target.ip());
+
+        let (log_tx, _rx) = crate::observability::logging::channel();
+        // Имя без других IPv4-адресов: замены не найдётся
+        let result = connect_with_fallback(target, Some("localhost"), &log_tx).await;
+
+        assert_eq!(result.map(|(_, addr)| addr).ok(), Some(target));
+        assert!(!is_dead(target.ip()), "ожившего адреса отметка должна сниматься");
     }
 }
