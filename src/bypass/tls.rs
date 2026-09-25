@@ -145,6 +145,17 @@ pub fn find_sni(data: &[u8]) -> Option<SniLocation> {
     None
 }
 
+/// Имя домена из SNI — в том виде, в каком его ждут списки: нижний
+/// регистр, без точки в конце. `None`, если SNI нет или имя не UTF-8.
+///
+/// Нужна там, где имя больше взять неоткуда: в прозрачном режиме и в
+/// SOCKS5, когда клиент прислал голый IP.
+pub fn sni_host(data: &[u8]) -> Option<String> {
+    let loc = find_sni(data)?;
+    let host = std::str::from_utf8(&data[loc.offset..loc.offset + loc.len]).ok()?;
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
 
 /// Собирает ClientHello, похожий на браузерный.
 ///

@@ -228,9 +228,7 @@ async fn handle(
     // DoH-релей. Раньше этот запасной путь был только описан в комментарии:
     // ip_cache сюда вообще не передавался, и без SNI обход молча отключался,
     // хотя в HTTPS-туннеле такой же случай обрабатывался.
-    let sni = crate::bypass::tls::find_sni(&payload)
-        .and_then(|loc| std::str::from_utf8(&payload[loc.offset..loc.offset + loc.len]).ok())
-        .map(|host| host.to_lowercase());
+    let sni = crate::bypass::tls::sni_host(&payload);
 
     // SNI увиден — запоминаем «адрес → домен». Кроме DoH-релея, в который
     // системный DNS обычно не ходит, кэш больше никто не наполнял, и обход

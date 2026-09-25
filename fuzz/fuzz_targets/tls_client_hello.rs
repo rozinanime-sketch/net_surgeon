@@ -17,6 +17,14 @@ fuzz_target!(|data: &[u8]| {
         assert!(loc.split_point() < loc.offset + loc.len);
     }
 
+    // Имя из SNI уходит в кэш и в выбор стратегии: оно обязано быть уже
+    // приведено к виду списков, иначе сравнение с ними молча промахнётся.
+    if let Some(host) = tls::sni_host(data) {
+        assert!(!host.is_empty());
+        assert_eq!(host, host.to_ascii_lowercase());
+        assert!(!host.ends_with('.'));
+    }
+
     let _ = tls::record_len(data);
     let _ = tls::looks_like_handshake(data);
 

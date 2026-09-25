@@ -94,6 +94,7 @@ log.diag_bypass_failed: "%{domain}: обход не сработал, нужны
 log.socks5_bind_error: "Не удалось занять SOCKS5 порт %{addr}: %{error}"
 log.bind_error: "Не удалось занять порт %{addr}: %{error}"
 log.bypass_via_ip_cache: "Обход применён по кэшу IP->домен: %{ip} = %{domain}"
+log.socks5_name_from_sni: "SOCKS5: %{ip} опознан как %{domain} по SNI — включаю обход"
 field.tcp_port: "TCP порт"
 field.udp_port: "UDP порт"
 field.socks5_port: "SOCKS5 порт"

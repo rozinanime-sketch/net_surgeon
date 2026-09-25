@@ -315,29 +315,11 @@ async fn handle_connect(
         server.as_raw_fd()
     };
 
-    let mut domain = extract_domain(&target);
-
-    // Клиент прислал голый IP (ATYP 0x01/0x04): так делают приложения,
-    // которые резолвят имена сами. Имя восстанавливается по кэшу ответов DoH
-    // так же, как в HTTPS-туннеле и прозрачном режиме, — иначе такие
-    // клиенты не получали обхода вовсе. Только для голого IP: известное имя
-    // кэшем не подменяется (на общих адресах CDN за одним IP много сайтов).
-    if is_enabled
-        && let Ok(ip) = domain.parse::<std::net::IpAddr>()
-        && let Some(cached) = ip_cache.lookup(&ip)
-        && matches_list(&cached, bypass_domains)
-    {
-        log_t(log_tx, LogLevel::Info, "log.bypass_via_ip_cache", vec![
-            ("ip", ip.to_string()),
-            ("domain", cached.clone()),
-        ]);
-        domain = cached;
-    }
+    let requested_domain = extract_domain(&target);
 
     let adaptive_ctx = crate::proxy::adaptive::Context {
         strategies, bypass_params, ttl_hours: strategy_ttl_hours, log_tx,
     };
-    let wants_bypass = needs_bypass(is_enabled, &domain, bypass_domains);
 
     let (mut cr, mut cw) = stream.split();
     let (mut sr, mut sw) = server.split();
@@ -370,7 +352,7 @@ async fn handle_connect(
             match cr.read(&mut initial_buf).await {
                 Ok(0) | Err(_) => {
                     let _ = sw.shutdown().await;
-                    return crate::proxy::adaptive::Selected::DIRECT;
+                    return (crate::proxy::adaptive::Selected::DIRECT, requested_domain);
                 }
                 Ok(n) => initial.extend_from_slice(&initial_buf[..n]),
             }
@@ -387,6 +369,19 @@ async fn handle_connect(
         }
 
         metrics_c2s.add_rx(initial.len() as u64);
+
+        // Имя решается здесь, а не до пересылки: для голого IP его лучше
+        // всего знает сам ClientHello.
+        let domain = match connection_name(&requested_domain, &initial, ip_cache, bypass_domains, is_enabled, log_tx) {
+            Some(domain) => domain,
+            None => {
+                // Трекер по SNI. Серверу не ушло ни байта: закрываем его
+                // сторону, он закроет свою, и клиент получит конец потока.
+                let _ = sw.shutdown().await;
+                return (crate::proxy::adaptive::Selected::DIRECT, requested_domain);
+            }
+        };
+        let wants_bypass = needs_bypass(is_enabled, &domain, bypass_domains);
 
         let is_tls = initial.len() >= 5 && initial[0] == 0x16 && initial[1] == 0x03;
         let mut selected = crate::proxy::adaptive::Selected::DIRECT;
@@ -418,11 +413,11 @@ async fn handle_connect(
                 }
                 Err(_) => {
                     let _ = sw.shutdown().await;
-                    return selected;
+                    return (selected, domain);
                 }
             }
         } else if sw.write_all(&initial).await.is_err() {
-            return selected;
+            return (selected, domain);
         }
 
         let mut buf = [0u8; 8192];
@@ -440,7 +435,7 @@ async fn handle_connect(
         // Полузакрытие, а не обрыв: клиент договорил, но сервер ещё может
         // досылать ответ.
         let _ = sw.shutdown().await;
-        selected
+        (selected, domain)
     };
     let to_client = async {
         let mut buf = [0u8; 8192];
@@ -464,10 +459,71 @@ async fn handle_connect(
     // для HTTP-подобных протоколов), тем самым обрывал ещё идущий ответ сервера
     // на середине. HTTPS-туннель здесь всегда использовал join — SOCKS5-путь
     // расходился с ним без всякой причины.
-    let (selected, _) = tokio::join!(to_server, to_client);
+    let ((selected, domain), _) = tokio::join!(to_server, to_client);
 
     // Обратная связь по применённой стратегии — та же, что в HTTPS-туннеле.
     crate::proxy::adaptive::record_outcome(&adaptive_ctx, &domain, selected, responded.load(Ordering::Relaxed));
+}
+
+/// Имя, по которому соединение получает решение об обходе и стратегию.
+/// `None` — по SNI это трекер, соединение надо закрыть.
+///
+/// Имя из запроса SOCKS5 — истина, его ничто не подменяет. Голый IP
+/// (ATYP 0x01/0x04) присылают приложения, которые резолвят имена сами, —
+/// на Android так бывает при включённом «Частном DNS»: в обход virtual DNS
+/// приложения получают настоящие адреса. Для него порядок тот же, что в
+/// прозрачном режиме: SNI из ClientHello, иначе кэш ответов DNS, иначе
+/// сам адрес. Раньше SNI не смотрелся, а своего DNS-релея на телефоне нет —
+/// кэш пуст, и обход молча выключался для всех сайтов.
+fn connection_name(
+    requested: &str,
+    first_packet: &[u8],
+    ip_cache: &IpDomainCache,
+    bypass_domains: &HashSet<String>,
+    is_enabled: bool,
+    log_tx: &LogSender,
+) -> Option<String> {
+    let Ok(ip) = requested.parse::<std::net::IpAddr>() else {
+        return Some(requested.to_string());
+    };
+
+    if let Some(host) = crate::bypass::tls::sni_host(first_packet) {
+        // Запоминаем «адрес → домен» и для соединений без SNI (ECH, не TLS)
+        // к тому же адресу — так же делает прозрачный режим.
+        ip_cache.insert(ip, host.clone());
+
+        // По SNI блокируется, по кэшу — нет: за адресом трекера живут
+        // и другие сайты (см. модуль block).
+        if crate::block::is_blocked(&host) {
+            log_t(log_tx, LogLevel::Info, "log.blocked", vec![
+                ("domain", host),
+                ("via", "SNI".to_string()),
+            ]);
+            return None;
+        }
+        if is_enabled && matches_list(&host, bypass_domains) {
+            log_t(log_tx, LogLevel::Info, "log.socks5_name_from_sni", vec![
+                ("ip", ip.to_string()),
+                ("domain", host.clone()),
+            ]);
+        }
+        return Some(host);
+    }
+
+    // Кэш — только если он включает обход: на общих адресах CDN за одним
+    // IP много сайтов, и чужое имя без нужды лучше не брать.
+    if is_enabled
+        && let Some(cached) = ip_cache.lookup(&ip)
+        && matches_list(&cached, bypass_domains)
+    {
+        log_t(log_tx, LogLevel::Info, "log.bypass_via_ip_cache", vec![
+            ("ip", ip.to_string()),
+            ("domain", cached.clone()),
+        ]);
+        return Some(cached);
+    }
+
+    Some(requested.to_string())
 }
 
 #[cfg(test)]
@@ -483,5 +539,43 @@ mod tests {
         let v6 = udp_associate_reply("::1".parse().unwrap(), 1082);
         assert_eq!(v6[3], 0x04);
         assert_eq!(v6.len(), 4 + 16 + 2);
+    }
+
+    fn name_for(requested: &str, first_packet: &[u8], cache: &IpDomainCache) -> Option<String> {
+        let list: HashSet<String> = ["example.com".to_string()].into();
+        let (log_tx, _rx) = crate::observability::logging::channel();
+        connection_name(requested, first_packet, cache, &list, true, &log_tx)
+    }
+
+    #[test]
+    fn requested_name_is_never_replaced() {
+        let cache = IpDomainCache::new();
+        let hello = crate::bypass::tls::build_client_hello("other.example.com");
+        assert_eq!(name_for("site.org", &hello, &cache).as_deref(), Some("site.org"));
+    }
+
+    #[test]
+    fn bare_ip_takes_the_name_from_sni_and_remembers_it() {
+        let cache = IpDomainCache::new();
+        let hello = crate::bypass::tls::build_client_hello("WWW.Example.com");
+        assert_eq!(name_for("203.0.113.7", &hello, &cache).as_deref(), Some("www.example.com"));
+        // Соединение без SNI к тому же адресу опознаётся по запомненному
+        assert_eq!(name_for("203.0.113.7", b"\x00", &cache).as_deref(), Some("www.example.com"));
+    }
+
+    #[test]
+    fn sni_wins_over_the_cache() {
+        let cache = IpDomainCache::new();
+        cache.insert("203.0.113.8".parse().unwrap(), "cdn.example.com".into());
+        let hello = crate::bypass::tls::build_client_hello("unrelated.org");
+        assert_eq!(name_for("203.0.113.8", &hello, &cache).as_deref(), Some("unrelated.org"));
+    }
+
+    #[test]
+    fn bare_ip_without_sni_keeps_the_address_unless_the_cache_enables_bypass() {
+        let cache = IpDomainCache::new();
+        cache.insert("203.0.113.9".parse().unwrap(), "unrelated.org".into());
+        assert_eq!(name_for("203.0.113.9", b"SSH-2.0", &cache).as_deref(), Some("203.0.113.9"));
+        assert_eq!(name_for("2001:db8::1", b"", &cache).as_deref(), Some("2001:db8::1"));
     }
 }
