@@ -259,14 +259,25 @@ pub async fn connect_addr(addr: SocketAddr) -> std::io::Result<TcpStream> {
 /// Перебирает адреса по очереди, каждому — свой таймаут. Возвращает первую
 /// удачу либо последнюю ошибку.
 async fn connect_each(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
-    let mut last_error = std::io::Error::new(std::io::ErrorKind::NotFound, "нет адресов для подключения");
+    let mut errors: Vec<(SocketAddr, std::io::Error)> = Vec::new();
     for addr in addrs {
         match connect_addr(*addr).await {
             Ok(stream) => return Ok(stream),
-            Err(e) => last_error = e,
+            Err(e) => errors.push((*addr, e)),
         }
     }
-    Err(last_error)
+    // Причина — по каждому адресу. Раньше отдавалась только последняя, и
+    // она прятала настоящую: IPv4 не ответил за 4 с, следом IPv6 в сети без
+    // IPv6 мгновенно дал «Network is unreachable» — и в логе было только это.
+    match errors.len() {
+        0 => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "нет адресов для подключения")),
+        1 => Err(errors.pop().expect("один элемент").1),
+        _ => {
+            let kind = errors[0].1.kind();
+            let detail = errors.iter().map(|(a, e)| format!("{}: {e}", a.ip())).collect::<Vec<_>>().join("; ");
+            Err(std::io::Error::new(kind, detail))
+        }
+    }
 }
 
 /// Резолв системным резолвером и перебор адресов с таймаутом на каждый.
