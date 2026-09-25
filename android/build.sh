@@ -18,6 +18,10 @@ export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -n1)}"
 export JAVA_HOME="${JAVA_HOME_ANDROID:-$HOME/Android/jdk21}"
 GRADLE="${GRADLE:-$HOME/Android/gradle-8.14.3/bin/gradle}"
+# Rust вшивает в библиотеку пути к исходникам (для сообщений о панике),
+# и в опубликованном APK оказывались сотни строк /home/<имя>/... Меняем
+# домашний каталог на «~».
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~"
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 

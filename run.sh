@@ -382,7 +382,8 @@ build() {
 
     if [[ $stale -eq 1 ]]; then
         say "Собираю…"
-        cargo build --release
+        # Без имени пользователя в путях к исходникам внутри бинаря.
+        RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~" cargo build --release
     fi
 }
 
