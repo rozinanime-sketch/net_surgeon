@@ -190,8 +190,13 @@ pub async fn run_all(
         let log_tx = log_tx.clone();
         let metrics = Arc::clone(&metrics);
         let token = token.clone();
+        let policy = socks5::udp::UdpPolicy {
+            is_enabled: config.enabled,
+            bypass_domains: Arc::clone(&domains),
+            ip_cache: Arc::clone(&ip_cache),
+        };
         tokio::spawn(async move {
-            socks5::udp::run_socks5_udp_processor(&socks5_udp_address, config.socks5_junk.clone(), log_tx, metrics, token).await;
+            socks5::udp::run_socks5_udp_processor(&socks5_udp_address, config.socks5_junk.clone(), policy, log_tx, metrics, token).await;
         })
     };
 

@@ -1,11 +1,13 @@
 use tokio::net::UdpSocket;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+use crate::bypass::{extract_domain, needs_bypass};
+use crate::dns::ip_cache::IpDomainCache;
 use crate::observability::logging::{LogSender, log_t, LogLevel};
 use crate::config::Socks5JunkParams;
 use crate::observability::metrics::Metrics;
@@ -137,9 +139,24 @@ pub(crate) fn is_transient_udp_error(e: &std::io::Error) -> bool {
     )
 }
 
+/// Кому из UDP-потоков нужен мусор перед первой датаграммой.
+///
+/// Раньше мусор получал КАЖДЫЙ поток, без оглядки на список обхода и даже
+/// при выключенном обходе. На Android через SOCKS5 идёт весь UDP телефона:
+/// звонки, игры, QUIC ко всем сайтам — и у каждого нового потока первая
+/// датаграмма ждала шесть мусорных пакетов, 75–200 мс. Решение теперь то же,
+/// что в прозрачном режиме: по имени назначения или по кэшу «адрес → домен».
+#[derive(Clone)]
+pub struct UdpPolicy {
+    pub is_enabled: bool,
+    pub bypass_domains: Arc<HashSet<String>>,
+    pub ip_cache: Arc<IpDomainCache>,
+}
+
 pub async fn run_socks5_udp_processor(
     socks5_udp_port: &str,
     junk: Socks5JunkParams,
+    policy: UdpPolicy,
     log_tx: LogSender,
     metrics: Arc<Metrics>,
     token: CancellationToken,
@@ -228,6 +245,7 @@ pub async fn run_socks5_udp_processor(
                     server_socket: Arc::clone(&server_socket),
                     sessions: Arc::clone(&active_sessions),
                     junk: junk.clone(),
+                    policy: policy.clone(),
                     log_tx: log_tx.clone(),
                     metrics: Arc::clone(&metrics),
                     token: token.clone(),
@@ -239,7 +257,7 @@ pub async fn run_socks5_udp_processor(
                     // обгоняли друг друга: вторая датаграмма сессии уходила
                     // на сервер раньше первой. Здесь нет ни одного долгого
                     // ожидания — отправка идёт через очередь сессии.
-                    Ok(dst_addr) => route(ctx, client_src_addr, dst_addr, payload).await,
+                    Ok(dst_addr) => route(ctx, client_src_addr, dst_addr, None, payload).await,
                     // ATYP 0x03 отдаёт имя, а резолв может занять сотни
                     // миллисекунд — его нельзя ждать в цикле приёма, иначе
                     // встанут все клиенты. Порядок датаграмм к одному имени
@@ -269,7 +287,7 @@ pub async fn run_socks5_udp_processor(
                                     return;
                                 }
                             };
-                            route(ctx, client_src_addr, dst_addr, payload).await;
+                            route(ctx, client_src_addr, dst_addr, Some(extract_domain(&dst_addr_str)), payload).await;
                         });
                     }
                 }
@@ -283,13 +301,16 @@ struct RouteCtx {
     server_socket: Arc<UdpSocket>,
     sessions: SessionTable,
     junk: Socks5JunkParams,
+    policy: UdpPolicy,
     log_tx: LogSender,
     metrics: Arc<Metrics>,
     token: CancellationToken,
 }
 
 /// Находит или открывает сессию и ставит датаграмму в её очередь.
-async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr, payload: Vec<u8>) {
+///
+/// `name` — имя назначения, если клиент прислал его (ATYP 0x03), а не адрес.
+async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr, name: Option<String>, payload: Vec<u8>) {
     // Блокировка держится и на время bind: иначе два первых пакета одного
     // клиента подняли бы по сокету каждый, и ответы пошли бы мимо живой сессии.
     let key: SessionKey = (client_src_addr, dst_addr);
@@ -310,6 +331,33 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
             ctx.metrics.quic_session_closed();
         }
     }
+
+    // Имя назначения: присланное клиентом, иначе из кэша «адрес → домен» —
+    // его наполняют DoH-релей и SOCKS5 CONNECT по SNI. Браузер обычно сначала
+    // открывает сайт по TCP и лишь потом переходит на QUIC, так что к этому
+    // моменту адрес уже опознан.
+    let domain = name.or_else(|| ctx.policy.ip_cache.lookup(&dst_addr.ip()));
+    let is_quic = session::is_quic_initial(&payload);
+
+    // Трекер отбрасывается, как в прозрачном режиме: сессия не открывается,
+    // следующие датаграммы придут сюда же. Если адрес общий и кэш ошибся,
+    // браузер откатится на TCP, где имя видно в SNI. В лог — только по
+    // Initial, иначе повторы его засыпали бы.
+    if let Some(d) = &domain
+        && crate::block::is_blocked(d)
+    {
+        if is_quic {
+            log_t(&ctx.log_tx, LogLevel::Info, "log.blocked", vec![
+                ("domain", d.clone()),
+                ("via", "QUIC".to_string()),
+            ]);
+        }
+        return;
+    }
+
+    let bypass = domain
+        .as_deref()
+        .is_some_and(|d| needs_bypass(ctx.policy.is_enabled, d, &ctx.policy.bypass_domains));
 
     // Семейство исходящего сокета должно совпадать с адресом назначения,
     // иначе send упадёт.
@@ -336,7 +384,6 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
         return;
     }
 
-    let is_quic = session::is_quic_initial(&payload);
     let last_seen = Arc::new(std::sync::Mutex::new(Instant::now()));
     let cancel = ctx.token.child_token();
 
@@ -350,7 +397,14 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
         cancel.clone(),
     ));
 
-    log_t(&ctx.log_tx, LogLevel::Warning, "log.socks5_udp_junk", vec![("addr", dst_addr.to_string())]);
+    if bypass {
+        // С именем: по одному адресу не понять, почему поток получил мусор.
+        let target = match &domain {
+            Some(d) => format!("{d} ({dst_addr})"),
+            None => dst_addr.to_string(),
+        };
+        log_t(&ctx.log_tx, LogLevel::Warning, "log.socks5_udp_junk", vec![("addr", target)]);
+    }
     if is_quic {
         ctx.metrics.quic_session_opened();
     }
@@ -359,7 +413,7 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
     // следом за ним.
     let sender = session::spawn_writer(
         upstream,
-        Some((ctx.junk.clone(), is_quic)),
+        bypass.then(|| (ctx.junk.clone(), is_quic)),
         Arc::clone(&ctx.metrics),
         cancel.clone(),
         WriterLog {
