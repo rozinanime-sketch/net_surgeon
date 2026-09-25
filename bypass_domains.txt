@@ -25,6 +25,7 @@ discordapp.com
 discordapp.net
 discord.media
 i.ytimg.com
+youtubei.googleapis.com
 media.discordapp.net
 cdn.discordapp.com
 wattpad.com

@@ -25,6 +25,15 @@ object DataFiles {
      */
     private val ADDED_KEYS = listOf("smart_dns_provider", "smart_dns_bootstrap_ip")
 
+    /**
+     * Домены, добавленные в список обхода после первых версий. Как и
+     * настройки, в старый bypass_domains.txt сами не попадут. Каждый
+     * дописывается один раз: если пользователь его потом удалит, при
+     * следующем запуске он не вернётся — предложенные помним в ADDED_MARK.
+     */
+    private val ADDED_BYPASS = listOf("youtubei.googleapis.com")
+    private const val ADDED_MARK = ".added_bypass"
+
     /** Есть не в каждой сборке: только если при сборке был свой воркер. */
     private val OPTIONAL = listOf(TELEGRAM_RELAY)
 
@@ -39,6 +48,7 @@ object DataFiles {
             }
         }
         addMissingKeys(context)
+        addMissingBypass(context)
         for (name in OPTIONAL) {
             val target = File(dir(context), name)
             if (target.exists()) continue
@@ -66,6 +76,21 @@ object DataFiles {
         val section = lines.indexOfFirst { it.trimStart().startsWith("[") }.takeIf { it >= 0 } ?: lines.size
         lines.addAll(section, missing + "")
         write(context, CONFIG, lines.joinToString("\n"))
+    }
+
+    private fun addMissingBypass(context: Context) {
+        val mark = File(dir(context), ADDED_MARK)
+        val offered = mark.takeIf { it.exists() }?.readLines()?.toSet() ?: emptySet()
+        val fresh = ADDED_BYPASS.filter { it !in offered }
+        if (fresh.isEmpty()) return
+        val current = read(context, BYPASS)
+        val present = current.lineSequence().map { it.trim().lowercase() }.toSet()
+        val missing = fresh.filter { it !in present }
+        if (missing.isNotEmpty()) {
+            val sep = if (current.isEmpty() || current.endsWith("\n")) "" else "\n"
+            write(context, BYPASS, current + sep + missing.joinToString("\n") + "\n")
+        }
+        mark.writeText((offered + fresh).joinToString("\n") + "\n")
     }
 
     fun read(context: Context, name: String): String =
