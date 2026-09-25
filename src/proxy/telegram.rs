@@ -96,10 +96,27 @@ pub fn relay() -> Option<Arc<str>> {
 pub fn reload(log_tx: &LogSender) {
     let host = paths::read_to_string(CONFIG_FILE).ok().and_then(|text| parse(&text));
     if let Some(h) = &host {
-        log_t(log_tx, LogLevel::Info, "log.telegram_relay_active", vec![("host", h.to_string())]);
+        log_t(log_tx, LogLevel::Info, "log.telegram_relay_active", vec![("host", masked(h))]);
     }
     if let Ok(mut guard) = RELAY.write() {
         *guard = host.map(Arc::from);
+    }
+}
+
+/// Адрес воркера для лога: без середины имени.
+///
+/// Адрес — это доступ к квоте аккаунта Cloudflare (поэтому файл не в git и
+/// не в релизном APK), а лог на телефоне отправляют кнопкой «Поделиться».
+/// Раньше в него попадал полный адрес. По маске видно, какой воркер
+/// настроен, но подключиться к нему нельзя:
+/// `net-surgeon-tg.your-subdomain.workers.dev` → `net-surgeon-tg.***.workers.dev`.
+fn masked(host: &str) -> String {
+    let labels: Vec<&str> = host.split('.').collect();
+    match labels.as_slice() {
+        [first, .., a, b] if labels.len() > 3 => format!("{first}.***.{a}.{b}"),
+        [first, _, last] => format!("{first}.***.{last}"),
+        [_, last] => format!("***.{last}"),
+        _ => "***".to_string(),
     }
 }
 
@@ -140,7 +157,10 @@ where
     let path = format!("/apiws?dst={ip}&port={port}");
     let ws = tokio::time::timeout(CONNECT_TIMEOUT, ws::connect(relay_host, &path))
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, rust_i18n::t!("err.relay_timeout").into_owned()))??;
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, rust_i18n::t!("err.relay_timeout").into_owned()))?
+        // Ошибка идёт в лог, а в тексте бывает полный адрес воркера
+        // («host:443: подключение не установилось…»).
+        .map_err(|e| std::io::Error::new(e.kind(), e.to_string().replace(relay_host, &masked(relay_host))))?;
 
     log_t(log_tx, LogLevel::Info, "log.telegram_relayed", vec![("addr", format!("{ip}:{port}"))]);
 
@@ -369,6 +389,14 @@ mod tests {
         assert!(!is_telegram(ip("149.154.167.51"), 22));
         assert!(!is_telegram(ip("1.1.1.1"), 443));
         assert!(!is_telegram(ip("2001:b28:f23d::a"), 443));
+    }
+
+    #[test]
+    fn relay_address_is_masked_for_the_log() {
+        assert_eq!(masked("net-surgeon-tg.your-subdomain.workers.dev"), "net-surgeon-tg.***.workers.dev");
+        assert_eq!(masked("relay.mysite.ru"), "relay.***.ru");
+        assert_eq!(masked("mysite.ru"), "***.ru");
+        assert_eq!(masked("localhost"), "***");
     }
 
     #[test]
