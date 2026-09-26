@@ -64,6 +64,24 @@ jobs:
       - name: тесты статической сборки (musl)
         run: cargo test --target x86_64-unknown-linux-musl
 
+  # README обещает сборку на Rust из `rust-version` в Cargo.toml, а все
+  # остальные задачи идут на свежем stable и не заметят, если код начнёт
+  # требовать новее. clippy здесь нет: его правила меняются от версии к
+  # версии, а обещание касается только сборки. Версию менять вместе с
+  # Cargo.toml.
+  msrv:
+    name: сборка и тесты на Rust 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: тесты
+        run: cargo test --all-features
+
   # На Windows нет прозрачного режима, а сокеты устроены иначе (SOCKET
   # вместо номера файла, Winsock вместо libc). Сломать сборку там легко
   # одним `as_raw_fd`, и с Linux этого не видно.
