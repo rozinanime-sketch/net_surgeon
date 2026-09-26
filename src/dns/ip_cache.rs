@@ -15,7 +15,7 @@ impl IpDomainCache {
 
     pub fn lookup(&self, ip: &IpAddr) -> Option<String> {
         let now = Instant::now();
-        let guard = self.inner.read().unwrap();
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         guard.get(ip).filter(|e| e.expires > now).map(|e| e.domain.clone())
     }
 
@@ -24,7 +24,7 @@ impl IpDomainCache {
         // точки в конце, а сравнение с ними точное. DoH-релей клал имя из
         // запроса как есть, и `YouTube.com` по IP обхода не получал.
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if guard.len() > 20_000 {
             let now = Instant::now();
             guard.retain(|_, e| e.expires > now);

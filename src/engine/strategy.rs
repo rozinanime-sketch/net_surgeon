@@ -249,7 +249,7 @@ pub fn choose_best(
         .into_iter()
         .filter(|(_, score)| score.is_convincing())
         .map(|(strategy, score)| (strategy, reward(score, weights)))
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 /// Лестница: от дешёвой стратегии к дорогой. Первая, давшая Success, побеждает.
@@ -514,7 +514,7 @@ impl StrategyStore {
             return store;
         };
 
-        *store.inner.write().unwrap() = parse_entries(&text);
+        *store.inner.write().unwrap_or_else(|e| e.into_inner()) = parse_entries(&text);
         store
     }
 
@@ -531,7 +531,7 @@ impl StrategyStore {
     /// разумный запасной вариант, а не равноценная замена точному измерению.
     pub fn lookup_detailed(&self, domain: &str, class: HelloClass, ttl_hours: u64) -> Option<(Strategy, MatchKind)> {
         let key = normalize_domain(domain);
-        let guard = self.inner.read().unwrap();
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let usable = usable_at(ttl_hours, now_secs());
 
         // Точная запись решает всё: если она протухла, наследовать стратегию
@@ -568,7 +568,7 @@ impl StrategyStore {
     /// Убирает запись — вызывается, когда диагностика больше не находит
     /// рабочую стратегию. Без этого одна случайная удача жила бы до конца TTL.
     pub fn remove(&self, domain: &str, class: HelloClass) {
-        self.inner.write().unwrap().remove(&(normalize_domain(domain), class));
+        self.inner.write().unwrap_or_else(|e| e.into_inner()).remove(&(normalize_domain(domain), class));
         self.mark_dirty();
     }
 
@@ -614,13 +614,13 @@ impl StrategyStore {
     /// ClientHello другого размера.
     pub fn is_resigned(&self, domain: &str, class: HelloClass, ttl_hours: u64) -> bool {
         let key = (normalize_domain(domain), class);
-        let resigned = self.inner.read().unwrap().get(&key).is_some_and(|e| e.resigned);
+        let resigned = self.inner.read().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|e| e.resigned);
         resigned && self.lookup_detailed(domain, class, ttl_hours).is_some()
     }
 
     fn insert(&self, domain: &str, class: HelloClass, strategy: Strategy, confidence: f64, resigned: bool) {
         let key = (normalize_domain(domain), class);
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
 
         // Накопленные исходы переживают переизмерение, если техника та же:
         // они описывают поведение КОНКРЕТНОЙ стратегии на этом домене, и
@@ -660,7 +660,7 @@ impl StrategyStore {
         use std::sync::atomic::Ordering;
 
         let exact = (normalize_domain(domain), class);
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let usable = usable_at(ttl_hours, now_secs());
 
         // Ключ ищется той же лестницей, что и в `lookup_detailed`: точная
@@ -745,7 +745,7 @@ impl StrategyStore {
     /// хватало: пока его нет, порог уверенности остаётся эвристикой,
     /// а покрытие «23 из 29» ничего не говорит о качестве выбора.
     pub fn live_disagreements(&self, min_samples: u32) -> Vec<(String, Strategy, f64, f64)> {
-        let guard = self.inner.read().unwrap();
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let mut rows: Vec<(String, Strategy, f64, f64)> = guard
             .iter()
             .filter_map(|((domain, class), e)| {
@@ -760,7 +760,7 @@ impl StrategyStore {
                 })
             })
             .collect();
-        rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        rows.sort_by(|a, b| b.3.total_cmp(&a.3));
         rows
     }
 
@@ -790,7 +790,7 @@ impl StrategyStore {
         // сбрасывался после записи и стирал такую пометку.
         self.dirty.store(false, Ordering::Relaxed);
 
-        let guard = self.inner.read().unwrap();
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let mut lines: Vec<String> = guard
             .iter()
             .map(|((domain, class), e)| format!(
@@ -830,11 +830,11 @@ impl StrategyStore {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_empty()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Можно ли сейчас запустить автоматическую диагностику для пары
@@ -847,7 +847,7 @@ impl StrategyStore {
     pub fn claim_auto_diagnosis(&self, domain: &str, class: HelloClass, cooldown: std::time::Duration) -> bool {
         let key = (normalize_domain(domain), class);
         let now = std::time::Instant::now();
-        let mut guard = self.auto_diagnosis.lock().unwrap();
+        let mut guard = self.auto_diagnosis.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get(&key) {
             Some(started) if now.duration_since(*started) < cooldown => false,
             _ => {

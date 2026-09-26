@@ -150,11 +150,11 @@ pub fn attach_logger(tx: LogSender) {
 
 /// Сообщает о переходе домена на системный резолвер — один раз, до возврата.
 fn note_fallback(host: &str) {
-    let already = fallback_set().read().unwrap().contains(host);
+    let already = fallback_set().read().unwrap_or_else(|e| e.into_inner()).contains(host);
     if already {
         return;
     }
-    fallback_set().write().unwrap().insert(host.to_string());
+    fallback_set().write().unwrap_or_else(|e| e.into_inner()).insert(host.to_string());
 
     if let Some(tx) = LOG.get() {
         log_t(tx, LogLevel::Warning, "log.doh_fallback", vec![("domain", host.to_string())]);
@@ -163,7 +163,7 @@ fn note_fallback(host: &str) {
 
 /// Сообщает, что домен снова разрешается через DoH.
 fn note_recovered(host: &str) {
-    let was = fallback_set().write().unwrap().remove(host);
+    let was = fallback_set().write().unwrap_or_else(|e| e.into_inner()).remove(host);
     if was && let Some(tx) = LOG.get() {
         log_t(tx, LogLevel::Success, "log.doh_recovered", vec![("domain", host.to_string())]);
     }
@@ -469,12 +469,12 @@ impl Resolver {
     }
 
     fn provider_down(&self) -> bool {
-        let guard = self.down_until.lock().unwrap();
+        let guard = self.down_until.lock().unwrap_or_else(|e| e.into_inner());
         guard.is_some_and(|until| Instant::now() < until)
     }
 
     fn set_provider_down(&self, down: bool) {
-        *self.down_until.lock().unwrap() = down.then(|| Instant::now() + PROVIDER_BACKOFF);
+        *self.down_until.lock().unwrap_or_else(|e| e.into_inner()) = down.then(|| Instant::now() + PROVIDER_BACKOFF);
     }
 
     /// Снимает запись о «запрос в полёте», чтобы карта не росла по домену
@@ -532,7 +532,7 @@ impl Resolver {
         }
 
         {
-            let mut guard = self.forward.write().unwrap();
+            let mut guard = self.forward.write().unwrap_or_else(|e| e.into_inner());
             if guard.len() > CACHE_MAX_ENTRIES {
                 let now = Instant::now();
                 guard.retain(|_, e| e.expires > now);
@@ -547,7 +547,7 @@ impl Resolver {
     }
 
     fn cached(&self, host: &str) -> Option<Vec<IpAddr>> {
-        let guard = self.forward.read().unwrap();
+        let guard = self.forward.read().unwrap_or_else(|e| e.into_inner());
         let entry = guard.get(host)?;
         (entry.expires > Instant::now()).then(|| entry.ips.clone())
     }

@@ -25,6 +25,11 @@ notebooklm.google.com
 labs.google
 generativelanguage.googleapis.com
 alkalimakersuite-pa.clients6.google.com
+# Приложения Gemini и NotebookLM ходят в свои API, а не на сайт.
+robinfrontend-pa.googleapis.com
+proactivebackend-pa.googleapis.com
+aisandbox-pa.googleapis.com
+notebooklm-pa.googleapis.com
 
 # Grok
 grok.com

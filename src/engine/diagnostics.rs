@@ -569,7 +569,7 @@ async fn diagnose_with(
         let median_ms = if durations.is_empty() {
             None
         } else {
-            durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            durations.sort_by(f64::total_cmp);
             Some(durations[durations.len() / 2])
         };
 

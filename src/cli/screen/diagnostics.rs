@@ -18,6 +18,7 @@ use crate::cli::action::Action;
 
 use super::StepResult;
 
+#[derive(Default)]
 pub struct DiagnosticsState {
     /// Буфер ввода домена; None пока не активен ввод.
     pub input_buffer: Option<String>,

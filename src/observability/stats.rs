@@ -52,7 +52,7 @@ impl Percentiles {
             return None;
         }
         let mut sorted: Vec<f64> = self.window.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(f64::total_cmp);
 
         let p = p.clamp(0.0, 1.0);
         let rank = (p * (sorted.len() - 1) as f64).round() as usize;
