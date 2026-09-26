@@ -7,10 +7,13 @@
     <string name="domains">Домены</string>
     <string name="trackers">Трекеры</string>
     <string name="telegram">Telegram</string>
+    <string name="ai_services">Нейросети</string>
     <string name="title_bypass">Домены для обхода</string>
     <string name="title_block">Блокировка трекеров</string>
     <string name="title_telegram">Ретранслятор Telegram</string>
     <string name="hint_telegram">Адрес своего воркера Cloudflare, например net-surgeon-tg.&lt;поддомен&gt;.workers.dev. Как его завести — cloudflare/README.md в репозитории. Пусто — Telegram идёт напрямую. Применится после перезапуска обхода.</string>
+    <string name="title_smart_dns">Нейросети (умный DNS)</string>
+    <string name="hint_smart_dns">Сервисы, закрытые для России по IP: их имена разрешаются через умный DNS. Домен на строку, поддомены учитываются. Применится после перезапуска обхода.</string>
     <string name="hint_domains">Домен на строку, поддомены учитываются. Применится после перезапуска обхода.</string>
     <string name="autostart">Включать при запуске телефона</string>
     <string name="always_on_hint">Надёжнее системная «Постоянная VPN»: Настройки → VPN → net surgeon. Нажмите, чтобы открыть.</string>

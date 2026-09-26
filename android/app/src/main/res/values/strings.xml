@@ -8,10 +8,13 @@
     <string name="domains">Domains</string>
     <string name="trackers">Trackers</string>
     <string name="telegram">Telegram</string>
+    <string name="ai_services">AI services</string>
     <string name="title_bypass">Bypass domains</string>
     <string name="title_block">Tracker blocking</string>
     <string name="title_telegram">Telegram relay</string>
     <string name="hint_telegram">Address of your own Cloudflare worker, e.g. net-surgeon-tg.&lt;subdomain&gt;.workers.dev. How to set one up: cloudflare/README.md in the repository. Empty — Telegram goes directly. Takes effect after the bypass is restarted.</string>
+    <string name="title_smart_dns">AI services (smart DNS)</string>
+    <string name="hint_smart_dns">Services that block Russia by IP: their names are resolved through the smart DNS. One domain per line; subdomains are included. Takes effect after the bypass is restarted.</string>
     <string name="hint_domains">One domain per line; subdomains are included. Takes effect after the bypass is restarted.</string>
     <string name="autostart">Turn on when the phone starts</string>
     <string name="always_on_hint">System “Always-on VPN” is more reliable: Settings → VPN → net surgeon. Tap to open.</string>

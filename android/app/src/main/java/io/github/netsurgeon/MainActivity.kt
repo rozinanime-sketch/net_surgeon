@@ -74,16 +74,28 @@ class MainActivity : Activity() {
         }
         root.addView(toggle, LinearLayout.LayoutParams(MATCH_PARENT, dp(64)))
 
+        // Два ряда по две: четыре кнопки в один ряд на телефоне не влезают.
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row.addView(Button(this).apply {
             text = getString(R.string.domains)
             setOnClickListener { openEditor(DataFiles.BYPASS, getString(R.string.title_bypass)) }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        // Сервисы меняют адреса без предупреждения, и пользователь может
+        // дописать новый домен сам, не дожидаясь релиза.
         row.addView(Button(this).apply {
+            text = getString(R.string.ai_services)
+            setOnClickListener {
+                openEditor(DataFiles.SMART_DNS, getString(R.string.title_smart_dns), getString(R.string.hint_smart_dns))
+            }
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        root.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row2.addView(Button(this).apply {
             text = getString(R.string.trackers)
             setOnClickListener { openEditor(DataFiles.BLOCK, getString(R.string.title_block)) }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        row.addView(Button(this).apply {
+        row2.addView(Button(this).apply {
             text = getString(R.string.telegram)
             setOnClickListener {
                 openEditor(
@@ -92,7 +104,7 @@ class MainActivity : Activity() {
                 )
             }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        root.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(row2, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
         root.addView(CheckBox(this).apply {
             text = getString(R.string.autostart)
