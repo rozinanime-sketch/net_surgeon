@@ -57,9 +57,9 @@ YouTube, Discord, нейросети, закрытые для России, Tele
 ### Linux
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.6.2/net_surgeon-0.6.2-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.6.2-x86_64-linux.tar.gz
-cd net_surgeon-0.6.2
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.6.3/net_surgeon-0.6.3-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.6.3-x86_64-linux.tar.gz
+cd net_surgeon-0.6.3
 ./run.sh
 ```
 
@@ -154,7 +154,7 @@ cd net_surgeon-0.6.2
 Нужен Rust 1.88 или новее (проще всего через [rustup](https://rustup.rs)).
 
 ```sh
-git clone --branch v0.6.2 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.6.3 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```
@@ -170,6 +170,9 @@ cd net_surgeon
 
 - `bypass_domains.txt` — сайты, для которых включается обход.
 - `smart_dns_domains.txt` — сайты, адреса которых узнаются через умный DNS.
+
+  Списки можно править. Домены, добавленные в новой версии, программа
+  дописывает в них сама, по одному разу: удалённые вами не вернутся.
 - `config.toml` — настройки. У каждого параметра есть комментарий, но лучше
   не менять их без нужды.
 - `strategies.txt` — подобранные техники. Создаётся сам; удалите, чтобы всё

@@ -60,9 +60,9 @@ window and the proxy settings go back to what they were.
 ### Linux
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.6.2/net_surgeon-0.6.2-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.6.2-x86_64-linux.tar.gz
-cd net_surgeon-0.6.2
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.6.3/net_surgeon-0.6.3-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.6.3-x86_64-linux.tar.gz
+cd net_surgeon-0.6.3
 ./run.sh
 ```
 
@@ -157,7 +157,7 @@ The script's messages on this path are in Russian:
 Requires Rust 1.88 or newer (easiest via [rustup](https://rustup.rs)).
 
 ```sh
-git clone --branch v0.6.2 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.6.3 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```
@@ -174,6 +174,9 @@ Building the Android app is described (in Russian) in
 
 - `bypass_domains.txt` — sites the bypass applies to.
 - `smart_dns_domains.txt` — sites resolved through the smart DNS.
+
+  You can edit both lists. Domains added in a new version are appended to
+  them automatically, once each: domains you remove will not come back.
 - `config.toml` — settings. Every option has a comment (in Russian); better
   leave them alone unless needed.
 - `strategies.txt` — the chosen techniques. Created automatically; delete it
