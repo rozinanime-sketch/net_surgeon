@@ -51,32 +51,31 @@
 
 ### Готовая сборка
 
-Нужна glibc 2.39 или новее: Ubuntu 24.04, Debian 13, Fedora 40, Arch,
-CachyOS и их ровесники. На более старой системе соберите программу из
-исходников (ниже).
+Программа собрана статически (musl) и работает на любом дистрибутиве
+x86_64, в том числе старом.
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.6.0/net_surgeon-0.6.0-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.6.0-x86_64-linux.tar.gz
-cd net_surgeon-0.6.0
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.6.1/net_surgeon-0.6.1-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.6.1-x86_64-linux.tar.gz
+cd net_surgeon-0.6.1
 ./run.sh
 ```
 
 ### Из исходников
 
 ```sh
-git clone --branch v0.6.0 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.6.1 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```
 
 `run.sh` сам соберёт программу при первом запуске и пересоберёт, если код
-изменился. Без `--branch v0.6.0` скачается текущая версия из `main`, а не релиз.
+изменился. Без `--branch v0.6.1` скачается текущая версия из `main`, а не релиз.
 
 ### Windows
 
-1. Скачайте `net_surgeon-0.6.0-x86_64-windows.zip` со
-   [страницы релиза](https://github.com/rozinanime-sketch/net_surgeon/releases/tag/v0.6.0)
+1. Скачайте `net_surgeon-0.6.1-x86_64-windows.zip` со
+   [страницы релиза](https://github.com/rozinanime-sketch/net_surgeon/releases/tag/v0.6.1)
    и распакуйте в любую папку.
 2. Запустите `net_surgeon.exe` двойным щелчком. Права администратора не нужны.
 3. Если Windows покажет «Система Windows защитила ваш компьютер», нажмите
@@ -91,7 +90,7 @@ cd net_surgeon
 
 ### Android
 
-Скачайте `net_surgeon-0.6.0-arm64.apk` со [страницы релиза](https://github.com/rozinanime-sketch/net_surgeon/releases/tag/v0.6.0)
+Скачайте `net_surgeon-0.6.1-arm64.apk` со [страницы релиза](https://github.com/rozinanime-sketch/net_surgeon/releases/tag/v0.6.1)
 и откройте на телефоне. Android попросит разрешить установку из этого
 источника — это нормально для приложений не из Google Play. Нужен Android 8
 или новее и 64-битный процессор (arm64), то есть почти любой телефон последних

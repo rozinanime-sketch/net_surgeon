@@ -1,5 +1,5 @@
 _version: 1
-app.title: "NET SURGEON v0.6.0"
+app.title: "NET SURGEON v0.6.1"
 menu.panel_title: "Меню"
 menu.domains: "Домены"
 menu.blocklist: "Трекеры"

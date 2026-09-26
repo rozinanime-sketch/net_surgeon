@@ -52,6 +52,18 @@ jobs:
       - name: сборка и тесты без интерфейса
         run: cargo test --no-default-features
 
+      # Релиз для Linux собирается статически под musl, чтобы работать на
+      # любом дистрибутиве. aws-lc (криптография rustls) там собирается
+      # своим C-компилятором, musl-gcc, и сломаться может незаметно.
+      - name: установить musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: тесты статической сборки (musl)
+        run: cargo test --target x86_64-unknown-linux-musl
+
   # На Windows нет прозрачного режима, а сокеты устроены иначе (SOCKET
   # вместо номера файла, Winsock вместо libc). Сломать сборку там легко
   # одним `as_raw_fd`, и с Linux этого не видно.
