@@ -19,8 +19,9 @@
 //!
 //! * обычный выход из интерфейса и Ctrl-C без него — `restore` в `main`;
 //! * паника — через `Drop` у [`RestoreOnDrop`];
-//! * закрытие окна консоли, выход из системы, выключение — обработчиком
-//!   консольных событий: система даёт на него несколько секунд.
+//! * закрытие окна консоли, выход из системы, выключение, а также Ctrl-C
+//!   там, где его никто не перехватывает (фоновый режим интерфейса), —
+//!   обработчиком консольных событий: система даёт на него несколько секунд.
 //!
 //! Не ловится только принудительное завершение (диспетчер задач). На этот
 //! случай следующий запуск узнаёт свой адрес в настройках и считает, что
@@ -34,7 +35,8 @@ use windows_sys::Win32::Networking::WinInet::{
     INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
 };
 use windows_sys::Win32::System::Console::{
-    CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    SetConsoleCtrlHandler,
 };
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_SAM_FLAGS, REG_SZ, RRF_RT_REG_DWORD,
@@ -192,11 +194,20 @@ fn notify() {
     }
 }
 
-/// Закрытие окна консоли, выход из системы, выключение. Возвращает FALSE:
-/// событие должны увидеть и остальные обработчики, включая системный,
-/// который завершает процесс.
+/// Любое консольное событие, после которого процесс может завершиться.
+///
+/// Ctrl-C тоже: в фоновом режиме интерфейса терминал не в raw-режиме, и
+/// Ctrl-C доходит до системного обработчика, который убивает процесс, не
+/// давая `main` вернуть настройки. В headless его ловит tokio и выход
+/// идёт штатно, а повторный `restore` ничего не делает.
+///
+/// Возвращает FALSE: событие должны увидеть и остальные обработчики,
+/// включая системный, который завершает процесс.
 unsafe extern "system" fn on_console_event(event: u32) -> windows_sys::core::BOOL {
-    if matches!(event, CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
+    if matches!(
+        event,
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    ) {
         let _ = restore();
     }
     0

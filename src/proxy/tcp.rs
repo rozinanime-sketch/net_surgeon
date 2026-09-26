@@ -29,6 +29,7 @@ pub async fn run_tcp_proxy(
     token: CancellationToken,
     ip_cache: Arc<IpDomainCache>,
     strategies: Arc<StrategyStore>,
+    on_listening: impl FnOnce(),
 ) {
     let listener = match TcpListener::bind(&listen_address).await {
         Ok(l) => l,
@@ -40,6 +41,7 @@ pub async fn run_tcp_proxy(
 
     metrics.set_tcp_listening(true);
     log_t(&log_tx, LogLevel::Success, "log.tcp_listening", vec![("addr", listen_address.clone())]);
+    on_listening();
 
     loop {
         tokio::select! {

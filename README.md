@@ -51,7 +51,9 @@
 
 ### Готовая сборка
 
-Программа собрана статически и работает на любом дистрибутиве.
+Нужна glibc 2.39 или новее: Ubuntu 24.04, Debian 13, Fedora 40, Arch,
+CachyOS и их ровесники. На более старой системе соберите программу из
+исходников (ниже).
 
 ```sh
 curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.6.0/net_surgeon-0.6.0-x86_64-linux.tar.gz

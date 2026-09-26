@@ -40,6 +40,37 @@ use tokio_util::sync::CancellationToken;
 /// он не поднимается, а интерфейс не показывает его панель.
 pub const TRANSPARENT_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
+/// HTTP-прокси занял порт: теперь на него можно направлять приложения.
+///
+/// На Windows он прописывается системным прокси. Именно здесь, после bind,
+/// а не при запуске: второй экземпляр программы, не сумев занять порт,
+/// иначе всё равно прописал бы прокси, принял бы его за след прошлого
+/// запуска и при выходе выключил бы его из-под работающего первого.
+/// И здесь же, а не при старте программы, потому что перезапуск прокси мог
+/// сменить порт; прежние настройки system_proxy запоминает только в первый раз.
+fn on_http_listening(config: &Config, log_tx: &LogSender) {
+    #[cfg(windows)]
+    let system_proxy_on = config.system_proxy
+        && match crate::system_proxy::enable(config.port) {
+            Ok(addr) => {
+                log_t(log_tx, LogLevel::Success, "log.system_proxy_on", vec![("addr", addr)]);
+                true
+            }
+            Err(e) => {
+                log_t(log_tx, LogLevel::Error, "log.system_proxy_failed", vec![("error", e.to_string())]);
+                false
+            }
+        };
+    #[cfg(not(windows))]
+    let system_proxy_on = false;
+
+    // Системный прокси делает то же, что прозрачный режим: приложения
+    // настраивать не нужно. Подсказка нужна, только если его нет.
+    if config.transparent_port > 0 && !TRANSPARENT_SUPPORTED && !system_proxy_on {
+        log_t(log_tx, LogLevel::Warning, "log.transparent_unsupported", vec![]);
+    }
+}
+
 pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn run_all(
@@ -64,28 +95,6 @@ pub async fn run_all(
         ]);
     }
     log_t(&log_tx, LogLevel::Info, "log.proxy_port_socks5", vec![("port", config.socks5_port.to_string()), ("udp_port", config.socks5_udp_port.to_string())]);
-    // Здесь, а не при старте программы: перезапуск прокси мог сменить порт.
-    // Прежние настройки system_proxy запоминает только в первый раз.
-    #[cfg(windows)]
-    let system_proxy_on = config.system_proxy
-        && match crate::system_proxy::enable(config.port) {
-            Ok(addr) => {
-                log_t(&log_tx, LogLevel::Success, "log.system_proxy_on", vec![("addr", addr)]);
-                true
-            }
-            Err(e) => {
-                log_t(&log_tx, LogLevel::Error, "log.system_proxy_failed", vec![("error", e.to_string())]);
-                false
-            }
-        };
-    #[cfg(not(windows))]
-    let system_proxy_on = false;
-
-    // Системный прокси делает то же, что прозрачный режим: приложения
-    // настраивать не нужно. Подсказка нужна, только если его нет.
-    if config.transparent_port > 0 && !TRANSPARENT_SUPPORTED && !system_proxy_on {
-        log_t(&log_tx, LogLevel::Warning, "log.transparent_unsupported", vec![]);
-    }
 
     // Здесь, а не при старте программы: run_all зовётся и при перезапуске
     // прокси из интерфейса, и правки списка применяются тогда же, когда
@@ -103,7 +112,12 @@ pub async fn run_all(
         let ip_cache = Arc::clone(&ip_cache);
         let strategies = Arc::clone(&strategies);
         tokio::spawn(async move {
-            tcp::run_tcp_proxy(listen_address, config.enabled, domains, config.bypass.clone(), config.strategy_ttl_hours, log_tx, metrics, token, ip_cache, strategies).await;
+            let on_listening = {
+                let config = Arc::clone(&config);
+                let log_tx = log_tx.clone();
+                move || on_http_listening(&config, &log_tx)
+            };
+            tcp::run_tcp_proxy(listen_address, config.enabled, domains, config.bypass.clone(), config.strategy_ttl_hours, log_tx, metrics, token, ip_cache, strategies, on_listening).await;
         })
     };
 
