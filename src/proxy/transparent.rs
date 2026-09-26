@@ -41,7 +41,6 @@
 //! прокси запускается в отдельной группе, и исключение делается по ней.
 
 use std::collections::HashSet;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -180,7 +179,7 @@ async fn handle(
 ) {
     // Куда клиент шёл на самом деле. Без этого перехваченное соединение
     // некуда переслать: peer_addr() показывает наш же порт.
-    let Some(target_addr) = socket::original_dst(client.as_raw_fd()) else {
+    let Some(target_addr) = socket::original_dst(socket::raw_sock(&client)) else {
         log_t(log_tx, LogLevel::Warning, "log.transparent_no_dst", vec![]);
         return;
     };
@@ -308,7 +307,7 @@ async fn handle(
         ("bypass", (strategy != Strategy::None).to_string()),
     ]);
 
-    let server_fd = server.as_raw_fd();
+    let server_fd = socket::raw_sock(&server);
     let (mut client_reader, mut client_writer) = client.into_split();
     let (mut server_reader, mut server_writer) = server.into_split();
 

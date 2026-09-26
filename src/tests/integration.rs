@@ -15,7 +15,6 @@
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
-use std::os::fd::AsRawFd;
 
 use tokio::net::{TcpListener, TcpStream};
 
@@ -120,7 +119,7 @@ async fn tls_record_strategy_produces_records_hiding_the_hostname() {
     let (port, collector) = spawn_collector().await;
 
     let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
-    let fd = upstream.as_raw_fd();
+    let fd = crate::bypass::socket::raw_sock(&upstream);
     first_packet(&mut upstream, fd, &hello, Strategy::TlsRecord, &test_bypass_params())
         .await
         .expect("стратегия должна примениться");
@@ -194,7 +193,7 @@ async fn direct_strategy_leaves_the_packet_untouched() {
     let (port, collector) = spawn_collector().await;
 
     let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
-    let fd = upstream.as_raw_fd();
+    let fd = crate::bypass::socket::raw_sock(&upstream);
     first_packet(&mut upstream, fd, &hello, Strategy::None, &test_bypass_params())
         .await
         .expect("прямая отправка");
@@ -210,7 +209,7 @@ async fn sni_split_changes_segmentation_but_not_bytes() {
     let (port, collector) = spawn_collector().await;
 
     let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
-    let fd = upstream.as_raw_fd();
+    let fd = crate::bypass::socket::raw_sock(&upstream);
     first_packet(&mut upstream, fd, &hello, Strategy::SniSplit, &test_bypass_params())
         .await
         .expect("сплит по SNI");
@@ -235,7 +234,7 @@ async fn parallel_connections_do_not_interfere() {
             let (port, collector) = spawn_collector().await;
 
             let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
-            let fd = upstream.as_raw_fd();
+            let fd = crate::bypass::socket::raw_sock(&upstream);
     first_packet(&mut upstream, fd, &hello, Strategy::TlsRecord, &test_bypass_params())
                 .await
                 .expect("стратегия");
@@ -261,7 +260,7 @@ async fn oob_byte_is_dropped_by_the_receiver() {
     let (port, collector) = spawn_collector().await;
 
     let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
-    let fd = upstream.as_raw_fd();
+    let fd = crate::bypass::socket::raw_sock(&upstream);
     first_packet(&mut upstream, fd, &hello, Strategy::Oob, &test_bypass_params())
         .await
         .expect("oob");

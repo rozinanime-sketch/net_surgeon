@@ -329,10 +329,7 @@ async fn handle_connect(
     let _ = server.set_nodelay(true);
 
     // Дескриптор до разделения: disorder и oob работают с сокетом напрямую.
-    let server_fd = {
-        use std::os::fd::AsRawFd;
-        server.as_raw_fd()
-    };
+    let server_fd = crate::bypass::socket::raw_sock(&server);
 
     let requested_domain = extract_domain(&target);
 

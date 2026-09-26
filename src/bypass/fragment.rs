@@ -12,10 +12,9 @@
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-use std::os::fd::RawFd;
-
 use crate::config::BypassParams;
 use super::{random, socket};
+use super::socket::RawSock;
 
 /// Как именно был разбит ClientHello — для лога вызывающей стороны.
 pub struct SplitInfo {
@@ -83,7 +82,7 @@ where
 /// Возвращает `Ok(None)`, если SNI не найден или ядро отказало в смене TTL.
 pub async fn split_with_disorder<W>(
     server_writer: &mut W,
-    fd: RawFd,
+    fd: RawSock,
     data: &[u8],
     ttl: u32,
 ) -> std::io::Result<Option<SplitInfo>>
@@ -139,7 +138,7 @@ where
 /// хопов и до сервера не доходит. Соединение при этом не рвётся, а тихо
 /// виснет — и в бою это выглядит как провал стратегии, а не как сбой.
 /// Честная ошибка закрывает соединение сразу, и клиент переподключается.
-fn restore_ttl(fd: RawFd, ttl: u32) -> std::io::Result<()> {
+fn restore_ttl(fd: RawSock, ttl: u32) -> std::io::Result<()> {
     if socket::set_ttl(fd, ttl) {
         Ok(())
     } else {
@@ -194,7 +193,7 @@ pub struct FakeInfo {
 /// возвращается `Ok(None)`, и вызывающий откатывается на другую стратегию.
 pub async fn split_with_fake<W>(
     server_writer: &mut W,
-    fd: RawFd,
+    fd: RawSock,
     data: &[u8],
     ttl: u32,
     decoy_sni: &str,
@@ -257,7 +256,7 @@ where
 /// потока — и разбор SNI смещается на один символ.
 pub async fn split_with_oob<W>(
     server_writer: &mut W,
-    fd: RawFd,
+    fd: RawSock,
     data: &[u8],
 ) -> std::io::Result<Option<SplitInfo>>
 where

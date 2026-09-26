@@ -46,6 +46,12 @@ base64 = "0.22"
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 
+# Техники обхода на Windows (src/bypass/socket.rs): TTL и OOB через Winsock.
+# Обе библиотеки уже приходят с tokio, так что сборка от них не растёт.
+[target.'cfg(windows)'.dependencies]
+socket2 = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
+
 # Сборка по размеру: 11,6 МБ → 4,5 МБ. Прокси упирается в сеть, а не
 # в процессор, так что оптимизация по размеру вместо скорости незаметна.
 #

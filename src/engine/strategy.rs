@@ -1460,7 +1460,7 @@ pub mod apply {
     /// `Ok(None)` — запись не удалась, соединение надо закрывать.
     pub async fn first_packet<W>(
         writer: &mut W,
-        fd: std::os::fd::RawFd,
+        fd: crate::bypass::socket::RawSock,
         data: &[u8],
         strategy: Strategy,
         bypass: &BypassParams,

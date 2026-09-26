@@ -13,14 +13,37 @@
 //! возвращают «не поддерживается». Вызывающий код это уже умеет обрабатывать:
 //! техника откатывается на обычный сплит, а не падает. Так порт на другую ОС
 //! становится задачей «дописать реализацию», а не «понять, почему не собирается».
+//!
+//! На Windows TTL и OOB дописаны через `socket2`: `IP_TTL`,
+//! `IPV6_UNICAST_HOPS` и `MSG_OOB` в Winsock есть. `SO_DOMAIN` там нет,
+//! поэтому семейство берётся из локального адреса сокета. `SO_ORIGINAL_DST`
+//! и `TCP_REPAIR` остаются заглушками: прозрачного режима на Windows пока нет.
 
-use std::os::fd::RawFd;
+/// Сокет в том виде, в каком его знает система: номер файла в Unix,
+/// `SOCKET` в Windows. Техники получают его до разделения потока на половины,
+/// потому что половины tokio сокет наружу не отдают.
+#[cfg(unix)]
+pub type RawSock = std::os::fd::RawFd;
+#[cfg(windows)]
+pub type RawSock = std::os::windows::io::RawSocket;
+
+/// Сокет потока для техник ниже. Одна функция вместо `as_raw_fd` в каждом
+/// месте вызова: иначе каждое из них пришлось бы размечать под две системы.
+#[cfg(unix)]
+pub fn raw_sock(stream: &impl std::os::fd::AsRawFd) -> RawSock {
+    stream.as_raw_fd()
+}
+
+#[cfg(windows)]
+pub fn raw_sock(stream: &impl std::os::windows::io::AsRawSocket) -> RawSock {
+    stream.as_raw_socket()
+}
 
 /// Доступны ли на этой платформе техники, требующие управления TTL и OOB.
 /// Диагностика может пропускать соответствующие пробы, а не тратить время
 /// на заведомо неуспешные попытки.
 pub const fn supports_ttl_tricks() -> bool {
-    cfg!(any(target_os = "linux", target_os = "android"))
+    cfg!(any(target_os = "linux", target_os = "android", windows))
 }
 
 /// Номер опции `SO_ORIGINAL_DST`. Крейт `libc` её не экспортирует,
@@ -30,7 +53,7 @@ const SO_ORIGINAL_DST: libc::c_int = 80;
 
 /// Один запрос `SO_ORIGINAL_DST` на заданном уровне протокола.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn original_dst_at(fd: RawFd, level: libc::c_int) -> Option<libc::sockaddr_storage> {
+fn original_dst_at(fd: RawSock, level: libc::c_int) -> Option<libc::sockaddr_storage> {
     // sockaddr_storage, а не sockaddr_in: он достаточно велик и для IPv6,
     // а ядро само скажет семейство через ss_family.
     let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -62,7 +85,7 @@ fn original_dst_at(fd: RawFd, level: libc::c_int) -> Option<libc::sockaddr_stora
 ///
 /// Linux-специфично, как и остальное в этом модуле.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn original_dst(fd: RawFd) -> Option<std::net::SocketAddr> {
+pub fn original_dst(fd: RawSock) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     // Спрашиваем оба уровня: у IPv6-соединения conntrack отвечает только на
@@ -92,14 +115,14 @@ pub fn original_dst(fd: RawFd) -> Option<std::net::SocketAddr> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn original_dst(_fd: RawFd) -> Option<std::net::SocketAddr> {
+pub fn original_dst(_fd: RawSock) -> Option<std::net::SocketAddr> {
     None
 }
 
 /// Определяет семейство адресов сокета, чтобы выбрать правильную опцию TTL:
 /// у IPv4 это `IP_TTL`, у IPv6 — `IPV6_UNICAST_HOPS`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn socket_domain(fd: RawFd) -> Option<libc::c_int> {
+fn socket_domain(fd: RawSock) -> Option<libc::c_int> {
     let mut domain: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
 
@@ -118,7 +141,7 @@ fn socket_domain(fd: RawFd) -> Option<libc::c_int> {
 
 /// Текущий TTL (или hop limit) сокета.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn get_ttl(fd: RawFd) -> Option<u32> {
+pub fn get_ttl(fd: RawSock) -> Option<u32> {
     let (level, name) = match socket_domain(fd)? {
         libc::AF_INET6 => (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS),
         _ => (libc::IPPROTO_IP, libc::IP_TTL),
@@ -136,7 +159,7 @@ pub fn get_ttl(fd: RawFd) -> Option<u32> {
 
 /// Устанавливает TTL. Возвращает false, если ядро отказало.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn set_ttl(fd: RawFd, ttl: u32) -> bool {
+pub fn set_ttl(fd: RawSock, ttl: u32) -> bool {
     let Some(domain) = socket_domain(fd) else {
         return false;
     };
@@ -174,7 +197,7 @@ pub fn set_ttl(fd: RawFd, ttl: u32) -> bool {
 /// воркере tokio не отдаёт задачу планировщику, а просто крутит поток —
 /// то есть на заполненном буфере тормозил все соединения этого воркера.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub async fn send_oob(fd: RawFd, byte: u8) -> std::io::Result<()> {
+pub async fn send_oob(fd: RawSock, byte: u8) -> std::io::Result<()> {
     let buf = [byte];
 
     for _ in 0..3 {
@@ -200,23 +223,80 @@ pub async fn send_oob(fd: RawFd, byte: u8) -> std::io::Result<()> {
     ))
 }
 
+// --- Windows: те же TTL и OOB через socket2 ---
+
+/// Одалживает сокет у вызывающего на время `f`.
+///
+/// Закрывать его здесь нельзя, он принадлежит потоку tokio. Поэтому
+/// `BorrowedSocket`, а не `Socket::from_raw_socket`: у второго `Drop`
+/// закрыл бы чужой сокет.
+#[cfg(windows)]
+fn with_sock<T>(sock: RawSock, f: impl FnOnce(socket2::SockRef<'_>) -> T) -> T {
+    // SAFETY: вызывающий держит поток живым, пока идёт вызов, а сокет
+    // из него взят через `raw_sock` того же потока.
+    let borrowed = unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(sock) };
+    f(socket2::SockRef::from(&borrowed))
+}
+
+#[cfg(windows)]
+fn is_ipv6(sock: &socket2::SockRef<'_>) -> Option<bool> {
+    sock.local_addr().ok().map(|a| a.is_ipv6())
+}
+
+#[cfg(windows)]
+pub fn get_ttl(sock: RawSock) -> Option<u32> {
+    with_sock(sock, |s| {
+        let ttl = if is_ipv6(&s)? { s.unicast_hops_v6() } else { s.ttl_v4() };
+        ttl.ok()
+    })
+}
+
+#[cfg(windows)]
+pub fn set_ttl(sock: RawSock, ttl: u32) -> bool {
+    with_sock(sock, |s| match is_ipv6(&s) {
+        Some(true) => s.set_unicast_hops_v6(ttl).is_ok(),
+        Some(false) => s.set_ttl_v4(ttl).is_ok(),
+        None => false,
+    })
+}
+
+/// То же, что версия для Linux: сокет неблокирующий, и на занятом буфере
+/// Winsock отвечает `WSAEWOULDBLOCK`, которое std переводит в `WouldBlock`.
+#[cfg(windows)]
+pub async fn send_oob(sock: RawSock, byte: u8) -> std::io::Result<()> {
+    for _ in 0..3 {
+        match with_sock(sock, |s| s.send_out_of_band(&[byte])) {
+            Ok(1) => return Ok(()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+        tokio::task::yield_now().await;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        rust_i18n::t!("err.oob_busy").into_owned(),
+    ))
+}
+
 // --- Заглушки для платформ без нужных опций сокета ---
 //
 // Возвращают «не поддерживается», а не паникуют: техники disorder и oob
 // в этом случае просто откатываются на обычный сплит.
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn get_ttl(_fd: RawFd) -> Option<u32> {
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+pub fn get_ttl(_fd: RawSock) -> Option<u32> {
     None
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn set_ttl(_fd: RawFd, _ttl: u32) -> bool {
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+pub fn set_ttl(_fd: RawSock, _ttl: u32) -> bool {
     false
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub async fn send_oob(_fd: RawFd, _byte: u8) -> std::io::Result<()> {
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+pub async fn send_oob(_fd: RawSock, _byte: u8) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         rust_i18n::t!("err.oob_unsupported").into_owned(),
@@ -246,7 +326,7 @@ mod repair {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn set_int_opt(fd: RawFd, name: libc::c_int, value: libc::c_int) -> bool {
+fn set_int_opt(fd: RawSock, name: libc::c_int, value: libc::c_int) -> bool {
     let rc = unsafe {
         libc::setsockopt(
             fd,
@@ -265,7 +345,7 @@ fn set_int_opt(fd: RawFd, name: libc::c_int, value: libc::c_int) -> bool {
 /// отсутствие `CAP_NET_ADMIN`. Вызывающий код тогда откатывается
 /// на технику, не требующую привилегий.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn tcp_send_seq(fd: RawFd) -> Option<u32> {
+pub fn tcp_send_seq(fd: RawSock) -> Option<u32> {
     use repair::*;
 
     if !set_int_opt(fd, TCP_REPAIR, 1) {
@@ -300,7 +380,7 @@ pub fn tcp_send_seq(fd: RawFd) -> Option<u32> {
 /// После этого следующая запись переиспользует те же номера, то есть
 /// перезаписывает фальшивые данные настоящими.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn set_tcp_send_seq(fd: RawFd, seq: u32) -> bool {
+pub fn set_tcp_send_seq(fd: RawSock, seq: u32) -> bool {
     use repair::*;
 
     if !set_int_opt(fd, TCP_REPAIR, 1) {
@@ -367,13 +447,13 @@ pub fn tcp_repair_available() -> bool {
 
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn tcp_send_seq(_fd: RawFd) -> Option<u32> {
+pub fn tcp_send_seq(_fd: RawSock) -> Option<u32> {
     None
 }
 
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn set_tcp_send_seq(_fd: RawFd, _seq: u32) -> bool {
+pub fn set_tcp_send_seq(_fd: RawSock, _seq: u32) -> bool {
     false
 }
 

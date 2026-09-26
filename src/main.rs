@@ -8,6 +8,10 @@
 use net_surgeon::{bootstrap, headless};
 
 /// Перевод сообщения запуска на язык по умолчанию.
+///
+/// Нужен только перехвату (Linux) и интерфейсу: без них переводить
+/// здесь нечего, и неиспользуемая функция валила бы clippy.
+#[cfg(any(target_os = "linux", feature = "tui"))]
 fn tr(key: &str, args: &[(&str, String)]) -> String {
     let args: Vec<(String, String)> = args.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
     net_surgeon::observability::i18n::translate(net_surgeon::default_language(), key, &args)

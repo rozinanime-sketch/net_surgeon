@@ -52,6 +52,31 @@ jobs:
       - name: сборка и тесты без интерфейса
         run: cargo test --no-default-features
 
+  # На Windows нет прозрачного режима, а сокеты устроены иначе (SOCKET
+  # вместо номера файла, Winsock вместо libc). Сломать сборку там легко
+  # одним `as_raw_fd`, и с Linux этого не видно.
+  windows:
+    name: clippy и тесты на Windows
+    runs-on: windows-latest
+    env:
+      # aws-lc (криптография rustls) на x86_64 хочет NASM, которого на
+      # раннере нет. Готовые объектные файлы из самого крейта его заменяют.
+      AWS_LC_SYS_PREBUILT_NASM: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: тесты
+        run: cargo test --all-features
+
   fuzz:
     name: фаззинг разборщиков
     runs-on: ubuntu-latest

@@ -112,10 +112,7 @@ pub async fn handle_connect(
     }
 
     // Дескриптор до разделения: disorder и oob работают с сокетом напрямую.
-    let server_fd = {
-        use std::os::fd::AsRawFd;
-        server_stream.as_raw_fd()
-    };
+    let server_fd = crate::bypass::socket::raw_sock(&server_stream);
 
     let (mut client_reader, mut client_writer) = client_stream.into_split();
     let (mut server_reader, mut server_writer) = server_stream.into_split();

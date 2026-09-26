@@ -177,8 +177,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
     // Пятая панель — прозрачный режим — появляется только когда порт задан
     // (0 = выключено). Иначе она бы всегда пустовала и просто отъедала место
-    // у остальных четырёх, которые нужны всегда.
-    let show_transparent = s.transparent_port > 0;
+    // у остальных четырёх, которые нужны всегда. На системах без
+    // прозрачного режима она пустовала бы так же.
+    let show_transparent = s.transparent_port > 0 && crate::proxy::TRANSPARENT_SUPPORTED;
 
     let cols = if show_transparent {
         Layout::default()

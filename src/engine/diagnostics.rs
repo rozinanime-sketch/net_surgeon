@@ -376,10 +376,7 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
 
     // Дескриптор берём до разделения: техники disorder и oob работают
     // с сокетом напрямую (setsockopt/MSG_OOB), а половины его не отдают.
-    let fd = {
-        use std::os::fd::AsRawFd;
-        stream.as_raw_fd()
-    };
+    let fd = crate::bypass::socket::raw_sock(&stream);
 
     let (mut reader, mut writer) = stream.into_split();
 
@@ -709,11 +706,26 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut hello = vec![0u8; 5];
-            stream.read_exact(&mut hello).await.unwrap();
-            let len = u16::from_be_bytes([hello[3], hello[4]]) as usize;
-            let mut body = vec![0u8; len];
-            stream.read_exact(&mut body).await.unwrap();
+            // Записи читаются, пока ClientHello не соберётся целиком:
+            // tls_record режет его на несколько. Недочитанный хвост при
+            // закрытии превращается в RST, и Windows по RST выбрасывает
+            // ответ, который клиент ещё не прочитал (Linux его отдаёт).
+            let mut handshake = Vec::new();
+            loop {
+                let mut header = [0u8; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).await.unwrap();
+                handshake.extend_from_slice(&body);
+                // Заголовок Handshake: тип (1 байт) и длина (3 байта).
+                if handshake.len() >= 4 {
+                    let msg_len = u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
+                    if handshake.len() >= 4 + msg_len {
+                        break;
+                    }
+                }
+            }
             if !reply.is_empty() {
                 stream.write_all(reply).await.unwrap();
             }

@@ -5,6 +5,7 @@ mod http;
 mod https;
 pub mod telegram;
 mod transparent;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod transparent_udp;
 // pub, потому что подмодули ходят друг к другу (socks5/udp.rs читает
 // udp::quic_parser) и на них смотрят интеграционные тесты.
@@ -30,6 +31,15 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Только до начала пересылки: дальше молчание нормально (keep-alive,
 /// long polling), и обрывать его нельзя.
+/// Есть ли на этой системе прозрачный режим.
+///
+/// Он держится на перехвате средствами ядра: правило nftables заворачивает
+/// трафик на порт, conntrack помнит исходный адрес. В Windows ни того, ни
+/// другого нет, там это делает драйвер WinDivert, и его пока не завезли.
+/// Без перехвата слушатель на порту ждал бы вечно, поэтому на таких системах
+/// он не поднимается, а интерфейс не показывает его панель.
+pub const TRANSPARENT_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
 pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn run_all(
@@ -54,6 +64,9 @@ pub async fn run_all(
         ]);
     }
     log_t(&log_tx, LogLevel::Info, "log.proxy_port_socks5", vec![("port", config.socks5_port.to_string()), ("udp_port", config.socks5_udp_port.to_string())]);
+    if config.transparent_port > 0 && !TRANSPARENT_SUPPORTED {
+        log_t(&log_tx, LogLevel::Warning, "log.transparent_unsupported", vec![]);
+    }
 
     // Здесь, а не при старте программы: run_all зовётся и при перезапуске
     // прокси из интерфейса, и правки списка применяются тогда же, когда
@@ -137,7 +150,7 @@ pub async fn run_all(
         let ip_cache = Arc::clone(&ip_cache);
         let strategies = Arc::clone(&strategies);
         tokio::spawn(async move {
-            if config.transparent_port > 0 {
+            if config.transparent_port > 0 && TRANSPARENT_SUPPORTED {
                 transparent::run_transparent_proxy(
                     &config.listen_host,
                     config.transparent_port,
@@ -161,6 +174,7 @@ pub async fn run_all(
     // Слушатель поднимается отдельной задачей, потому что требует
     // CAP_NET_ADMIN и может не стартовать там, где TCP-часть работает.
     // Его отказ не должен утаскивать за собой остальное.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let transparent_udp_task = {
         let config = Arc::clone(&config);
         let domains = Arc::clone(&domains);
@@ -184,6 +198,9 @@ pub async fn run_all(
             }
         })
     };
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let transparent_udp_task = tokio::spawn(async {});
 
     let socks5_udp_task = {
         let config = Arc::clone(&config);

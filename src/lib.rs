@@ -145,8 +145,26 @@ pub fn default_language() -> &'static str {
     let system = ["LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
         .filter_map(|name| std::env::var(name).ok())
-        .find(|v| !v.is_empty());
+        .find(|v| !v.is_empty())
+        .or_else(windows_ui_language);
     language_from(explicit.as_deref(), system.as_deref())
+}
+
+/// Язык интерфейса Windows.
+///
+/// В Windows переменных LANG и LC_* обычно нет вовсе, и без этого русская
+/// система получала английский интерфейс. Нужен только основной язык
+/// (младшие 10 бит идентификатора), страна для перевода не важна.
+#[cfg(windows)]
+fn windows_ui_language() -> Option<String> {
+    const LANG_RUSSIAN: u16 = 0x19;
+    let lang_id = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
+    Some(if lang_id & 0x3ff == LANG_RUSSIAN { "ru" } else { "en" }.to_string())
+}
+
+#[cfg(not(windows))]
+fn windows_ui_language() -> Option<String> {
+    None
 }
 
 fn language_from(explicit: Option<&str>, system: Option<&str>) -> &'static str {

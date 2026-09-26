@@ -175,20 +175,24 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
 
 #[cfg(unix)]
 type TerminateSignal = Option<tokio::signal::unix::Signal>;
-#[cfg(not(unix))]
-type TerminateSignal = ();
+/// В Windows сигналов нет; ближе всего к SIGTERM закрытие окна консоли.
+/// После него система даёт процессу несколько секунд, и этого хватает,
+/// чтобы сохранить strategies.txt.
+#[cfg(windows)]
+type TerminateSignal = Option<tokio::signal::windows::CtrlClose>;
 
 #[cfg(unix)]
 fn terminate_signal() -> TerminateSignal {
     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok()
 }
 
-#[cfg(not(unix))]
-fn terminate_signal() -> TerminateSignal {}
+#[cfg(windows)]
+fn terminate_signal() -> TerminateSignal {
+    tokio::signal::windows::ctrl_close().ok()
+}
 
-/// Ждёт SIGTERM. Если подписаться не удалось — не завершается никогда,
-/// и остаётся Ctrl-C.
-#[cfg(unix)]
+/// Ждёт SIGTERM (в Windows — закрытия окна). Если подписаться не удалось —
+/// не завершается никогда, и остаётся Ctrl-C.
 async fn wait_terminate(signal: &mut TerminateSignal) {
     match signal {
         Some(s) => {
@@ -196,9 +200,4 @@ async fn wait_terminate(signal: &mut TerminateSignal) {
         }
         None => std::future::pending().await,
     }
-}
-
-#[cfg(not(unix))]
-async fn wait_terminate(_signal: &mut TerminateSignal) {
-    std::future::pending().await
 }
