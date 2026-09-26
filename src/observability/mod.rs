@@ -7,6 +7,7 @@
 //! в лог (см. комментарий в observability/logging.rs).
 
 pub mod error;
+pub mod glyph;
 pub mod i18n;
 pub mod logging;
 pub mod metrics;

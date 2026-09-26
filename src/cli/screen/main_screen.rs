@@ -13,6 +13,7 @@ use ratatui::{
 
 use crate::cli::action::Action;
 use crate::cli::app::{App, Focus, MenuItem};
+use crate::observability::glyph;
 use crate::observability::logging::{LogLevel, LogPayload};
 
 use super::domains_editor::DomainList;
@@ -151,7 +152,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(i, item)| {
             let selected = i == app.selected;
-            let prefix = if selected { "▶ " } else { "  " };
+            let prefix = if selected { glyph::SELECTED } else { "  " };
             let style = if selected {
                 Style::default().fg(Color::White).bg(Color::Rgb(42, 42, 90))
             } else if *item == MenuItem::Quit {
@@ -413,13 +414,13 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
         .take(visible_height)
         .map(|entry| {
             let (icon, color) = match entry.level {
-                LogLevel::Info => ("[i]", Color::LightBlue),
-                LogLevel::Success => ("[✓]", Color::LightGreen),
+                LogLevel::Info => ("[i]".to_string(), Color::LightBlue),
+                LogLevel::Success => (format!("[{}]", glyph::OK), Color::LightGreen),
                 // Не эмодзи: ⚡ ratatui считает шириной в 2 клетки, а терминалы
                 // часто рисуют в одну. Строка съезжала, и при частичной
                 // перерисовке на экране оставались обрывки старого текста.
-                LogLevel::Warning => ("[!]", Color::Yellow),
-                LogLevel::Error => ("[✗]", Color::LightRed),
+                LogLevel::Warning => ("[!]".to_string(), Color::Yellow),
+                LogLevel::Error => (format!("[{}]", glyph::ERROR), Color::LightRed),
             };
             ListItem::new(Line::from(vec![
                 Span::styled(icon, Style::default().fg(color)),

@@ -58,6 +58,9 @@ pub mod engine;
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
 pub mod firewall;
 pub mod headless;
+/// Системный прокси Windows вместо прозрачного режима, которого там нет.
+#[cfg(windows)]
+pub mod system_proxy;
 pub mod observability;
 pub mod protocol;
 pub mod proxy;

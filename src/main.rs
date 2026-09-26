@@ -6,6 +6,7 @@
 //! аргументов там не при чём.
 
 use net_surgeon::{bootstrap, headless};
+use net_surgeon::observability::glyph;
 
 /// Перевод сообщения запуска на язык по умолчанию.
 ///
@@ -52,7 +53,7 @@ async fn main() {
     let startup = match bootstrap() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[✗] {}", e);
+            eprintln!("[{}] {}", glyph::ERROR, e);
             std::process::exit(1);
         }
     };
@@ -63,13 +64,19 @@ async fn main() {
     if std::env::args().any(|a| a == "--firewall") {
         let cfg = &startup.config;
         match net_surgeon::firewall::install(cfg.transparent_port, cfg.udp_port) {
-            Ok(msg) => eprintln!("[✓] {}", msg),
+            Ok(msg) => eprintln!("[{}] {}", glyph::OK, msg),
             Err(e) => {
-                eprintln!("[✗] {}", tr("startup.transparent_failed", &[("error", e)]));
+                eprintln!("[{}] {}", glyph::ERROR, tr("startup.transparent_failed", &[("error", e)]));
                 std::process::exit(1);
             }
         }
     }
+
+    // Системный прокси Windows включает запуск прокси (proxy::run_all), а
+    // вернуть прежние настройки нужно при любом выходе, в том числе при
+    // панике. Закрытие окна консоли ловит сам system_proxy.
+    #[cfg(windows)]
+    let _system_proxy = net_surgeon::system_proxy::RestoreOnDrop;
 
     match parse_mode() {
         Mode::Headless => headless::run(false, startup).await,
@@ -117,8 +124,11 @@ fn run_tui_with(startup: net_surgeon::Startup, diagnostics_only: bool) {
         ip_cache,
         strategies,
     ) {
-        eprintln!("[✗] {}", tr("startup.tui_error", &[("error", e.to_string())]));
+        eprintln!("[{}] {}", glyph::ERROR, tr("startup.tui_error", &[("error", e.to_string())]));
         eprintln!("[i] {}", tr("startup.tui_hint", &[]));
+        // process::exit не запускает Drop, и RestoreOnDrop из main не сработает.
+        #[cfg(windows)]
+        let _ = net_surgeon::system_proxy::restore();
         std::process::exit(1);
     }
 }

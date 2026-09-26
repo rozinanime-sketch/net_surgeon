@@ -64,7 +64,26 @@ pub async fn run_all(
         ]);
     }
     log_t(&log_tx, LogLevel::Info, "log.proxy_port_socks5", vec![("port", config.socks5_port.to_string()), ("udp_port", config.socks5_udp_port.to_string())]);
-    if config.transparent_port > 0 && !TRANSPARENT_SUPPORTED {
+    // Здесь, а не при старте программы: перезапуск прокси мог сменить порт.
+    // Прежние настройки system_proxy запоминает только в первый раз.
+    #[cfg(windows)]
+    let system_proxy_on = config.system_proxy
+        && match crate::system_proxy::enable(config.port) {
+            Ok(addr) => {
+                log_t(&log_tx, LogLevel::Success, "log.system_proxy_on", vec![("addr", addr)]);
+                true
+            }
+            Err(e) => {
+                log_t(&log_tx, LogLevel::Error, "log.system_proxy_failed", vec![("error", e.to_string())]);
+                false
+            }
+        };
+    #[cfg(not(windows))]
+    let system_proxy_on = false;
+
+    // Системный прокси делает то же, что прозрачный режим: приложения
+    // настраивать не нужно. Подсказка нужна, только если его нет.
+    if config.transparent_port > 0 && !TRANSPARENT_SUPPORTED && !system_proxy_on {
         log_t(&log_tx, LogLevel::Warning, "log.transparent_unsupported", vec![]);
     }
 

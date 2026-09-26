@@ -33,12 +33,13 @@ fn language() -> String {
     crate::default_language().to_string()
 }
 
-fn level_marker(level: LogLevel) -> &'static str {
+fn level_marker(level: LogLevel) -> String {
+    use crate::observability::glyph;
     match level {
-        LogLevel::Info => "[i]",
-        LogLevel::Success => "[✓]",
-        LogLevel::Warning => "[⚡]",
-        LogLevel::Error => "[✗]",
+        LogLevel::Info => "[i]".to_string(),
+        LogLevel::Success => format!("[{}]", glyph::OK),
+        LogLevel::Warning => "[!]".to_string(),
+        LogLevel::Error => format!("[{}]", glyph::ERROR),
     }
 }
 
@@ -65,7 +66,8 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
 
     if let Some(reason) = &startup.domains_error {
         eprintln!(
-            "[✗] {}",
+            "[{}] {}",
+            crate::observability::glyph::ERROR,
             render(
                 &lang,
                 &LogPayload::Translated {
@@ -76,7 +78,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
         );
     } else if startup.domains.is_empty() {
         eprintln!(
-            "[⚡] {}",
+            "[!] {}",
             render(&lang, &LogPayload::Translated { key: "startup.domains_empty".into(), args: vec![] })
         );
     }
@@ -89,7 +91,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
         // а без него единственное осмысленное поведение это сказать,
         // что делать нечего, и выйти.
         println!(
-            "[⚡] {}",
+            "[!] {}",
             render(&lang, &LogPayload::Translated { key: "log.diagnostics_only_mode".into(), args: vec![] })
         );
         return;
@@ -121,7 +123,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
                         if strategies.is_dirty()
                             && let Err(e) = strategies.save()
                         {
-                            eprintln!("[✗] {}", crate::observability::i18n::translate(crate::default_language(), "startup.strategies_save_failed", &[("error".into(), e.to_string())]));
+                            eprintln!("[{}] {}", crate::observability::glyph::ERROR, crate::observability::i18n::translate(crate::default_language(), "startup.strategies_save_failed", &[("error".into(), e.to_string())]));
                         }
                     }
                 }
@@ -169,7 +171,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
     if startup.strategies.is_dirty()
         && let Err(e) = startup.strategies.save()
     {
-        eprintln!("[✗] {}", crate::observability::i18n::translate(&lang, "startup.strategies_save_failed", &[("error".into(), e.to_string())]));
+        eprintln!("[{}] {}", crate::observability::glyph::ERROR, crate::observability::i18n::translate(&lang, "startup.strategies_save_failed", &[("error".into(), e.to_string())]));
     }
 }
 

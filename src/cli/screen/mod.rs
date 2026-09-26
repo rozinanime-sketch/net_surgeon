@@ -98,6 +98,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::DomainsEditor(state) => domains_editor::draw(frame, frame.area(), state, app.proxy_started),
         Screen::Diagnostics(state) => diagnostics::draw(frame, frame.area(), state),
     }
+
+    // Фон, который никто не задал, иначе берётся у терминала. У PowerShell
+    // он синий, и синие строки лога на нём не читаются. Заливаются только
+    // клетки без своего фона, так что выделение в меню остаётся как было.
+    #[cfg(windows)]
+    for cell in frame.buffer_mut().content.iter_mut() {
+        if cell.bg == ratatui::style::Color::Reset {
+            cell.bg = ratatui::style::Color::Black;
+        }
+    }
 }
 
 /// Общий хелпер для всех попапов — вычисляет прямоугольник по центру экрана.

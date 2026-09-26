@@ -239,7 +239,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &DomainsEditorState, proxy_st
             .enumerate()
             .map(|(i, domain)| {
                 let selected = i == editor.selected && !is_editing;
-                let prefix = if selected { "▶ " } else { "  " };
+                let prefix = if selected { crate::observability::glyph::SELECTED } else { "  " };
                 let style = if selected {
                     Style::default().fg(Color::White).bg(Color::Rgb(42, 42, 90))
                 } else {

@@ -104,6 +104,13 @@ pub struct Config {
     /// из SNI в ClientHello.
     #[serde(default)]
     pub transparent_port: u16,
+    /// Прописывать ли программу системным прокси Windows на время работы.
+    ///
+    /// Прозрачного режима там нет, и без этого прокси пришлось бы включать
+    /// в настройках руками. Прежние настройки возвращаются при выходе (см.
+    /// src/system_proxy.rs). На других системах не действует.
+    #[serde(default = "default_true")]
+    pub system_proxy: bool,
     pub enabled: bool,
     pub bypass: BypassParams,
     #[serde(default)]

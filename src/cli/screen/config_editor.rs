@@ -308,7 +308,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, editor: &ConfigEditorState
             Style::default().fg(Color::DarkGray)
         };
 
-        let prefix = if is_selected { "▶ " } else { "  " };
+        let prefix = if is_selected { crate::observability::glyph::SELECTED } else { "  " };
         let label = crate::observability::i18n::translate(lang, field.label_key, &[]);
 
         lines.push(Line::from(vec![

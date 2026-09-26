@@ -293,7 +293,7 @@ fn run_app(
     if strategies.is_dirty()
         && let Err(e) = strategies.save()
     {
-        eprintln!("[✗] {}", rust_i18n::t!("startup.strategies_save_failed", error = e));
+        eprintln!("[{}] {}", crate::observability::glyph::ERROR, rust_i18n::t!("startup.strategies_save_failed", error = e));
     }
 
     Ok(())

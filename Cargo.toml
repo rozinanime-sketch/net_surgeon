@@ -50,7 +50,15 @@ crossterm = { version = "0.28", optional = true }
 # Обе библиотеки уже приходят с tokio, так что сборка от них не растёт.
 [target.'cfg(windows)'.dependencies]
 socket2 = "0.6"
-windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    # Системный прокси (src/system_proxy.rs): реестр, уведомление
+    # программ об изменении и закрытие окна консоли.
+    "Win32_Networking_WinInet",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+] }
 
 # Сборка по размеру: 11,6 МБ → 4,5 МБ. Прокси упирается в сеть, а не
 # в процессор, так что оптимизация по размеру вместо скорости незаметна.
