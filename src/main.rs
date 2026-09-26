@@ -113,13 +113,14 @@ fn run_tui(_startup: net_surgeon::Startup) {
 
 #[cfg(feature = "tui")]
 fn run_tui_with(startup: net_surgeon::Startup, diagnostics_only: bool) {
-    let net_surgeon::Startup { config, domains, domains_error, metrics, ip_cache, strategies } = startup;
+    let net_surgeon::Startup { config, domains, domains_error, list_updates, metrics, ip_cache, strategies } = startup;
 
     if let Err(e) = net_surgeon::cli::run(
         diagnostics_only,
         config,
         domains,
         domains_error,
+        list_updates,
         metrics,
         ip_cache,
         strategies,

@@ -83,6 +83,11 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
         );
     }
 
+    for update in &startup.list_updates {
+        let (level, payload) = update.log_message();
+        eprintln!("{} {}", level_marker(level), render(&lang, &payload));
+    }
+
     let token = CancellationToken::new();
 
     if diagnostics_only || startup.config.diagnostics_only {

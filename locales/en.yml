@@ -202,6 +202,8 @@ field.block_trackers: "Block trackers"
 status.transparent: "Transparent"
 startup.domains_missing: "Bypass list could not be read (bypass_domains.txt): %{error}. Bypass is off for every domain."
 startup.domains_empty: "Bypass list is empty: bypass_domains.txt holds no domains, so bypass will never trigger."
+startup.list_domains_added: "Added to %{file} (new in this version): %{domains}. Domains you remove will not come back."
+startup.list_update_failed: "Could not add new domains to %{file}: %{error}"
 error.config_bad_value: 'Value "%{value}" does not fit this field: expected %{expected}. File left unchanged.'
 error.config_would_break: "That edit would make config.toml unreadable (%{error}). File left unchanged."
 log.transparent_bypass_via_ip: "Transparent mode: %{ip} resolved to %{domain} from the DNS cache — enabling bypass"

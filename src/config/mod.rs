@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use serde::Deserialize;
 
+pub mod list_updates;
 pub mod paths;
 
 // Секция [ranges] удалена вместе с тем, что её использовало.
@@ -194,6 +195,11 @@ pub struct Config {
     /// То же, что `doh_bootstrap_ip`, но для `smart_dns_provider`.
     #[serde(default)]
     pub smart_dns_bootstrap_ip: Option<std::net::IpAddr>,
+
+    /// Дописывать в списки доменов те, что появились в новой версии.
+    /// Только добавляет и каждый домен один раз (см. list_updates.rs).
+    #[serde(default = "default_true")]
+    pub add_new_domains: bool,
 
     /// Блокировать домены из block_domains.txt — счётчики вроде
     /// Яндекс.Метрики. По умолчанию выключено: прокси, который молча режет

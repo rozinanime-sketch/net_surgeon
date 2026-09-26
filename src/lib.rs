@@ -96,6 +96,9 @@ pub struct Startup {
     /// отсутствии файла, а это молча выключает обход для всех доменов.
     /// Причину показывает тот, у кого есть куда её показать.
     pub domains_error: Option<String>,
+    /// Что дописано в списки доменов при запуске (см. list_updates.rs).
+    /// Показывает тот, у кого есть лог.
+    pub list_updates: Vec<config::list_updates::ListUpdate>,
     pub metrics: Arc<Metrics>,
     pub ip_cache: Arc<IpDomainCache>,
     pub strategies: Arc<StrategyStore>,
@@ -107,6 +110,10 @@ pub struct Startup {
 /// режимам запуска нужен одинаково настроенный.
 pub fn bootstrap() -> Result<Startup, String> {
     let config = Arc::new(config::load_config()?);
+
+    // До чтения списков: иначе дописанное заработало бы только со
+    // следующего запуска.
+    let list_updates = if config.add_new_domains { config::list_updates::apply() } else { Vec::new() };
 
     let (domains, domains_error) = config::load_bypass_domains();
     let domains = Arc::new(domains);
@@ -127,7 +134,7 @@ pub fn bootstrap() -> Result<Startup, String> {
         Arc::clone(&ip_cache),
     );
 
-    Ok(Startup { config, domains, domains_error, metrics, ip_cache, strategies })
+    Ok(Startup { config, domains, domains_error, list_updates, metrics, ip_cache, strategies })
 }
 
 /// Язык сообщений. Обёртка нужна, чтобы бинарь не зависел от rust_i18n

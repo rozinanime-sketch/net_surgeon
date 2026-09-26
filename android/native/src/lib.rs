@@ -159,6 +159,10 @@ fn start(tun_fd: i32, data_dir: String, lang: String) -> Option<String> {
     if let Some(reason) = &startup.domains_error {
         nlog::log_t(&log_tx, LogLevel::Error, "startup.domains_missing", vec![("error", reason.clone())]);
     }
+    for update in &startup.list_updates {
+        let (level, payload) = update.log_message();
+        let _ = log_tx.send(nlog::LogMessage { level, payload });
+    }
 
     let socks = format!("socks5://127.0.0.1:{}", startup.config.socks5_port);
     let proxy = match tun2proxy::ArgProxy::try_from(socks.as_str()) {

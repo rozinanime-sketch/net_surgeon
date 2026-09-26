@@ -78,6 +78,7 @@ pub fn run(
     config: Arc<Config>,
     domains: Arc<HashSet<String>>,
     domains_error: Option<String>,
+    list_updates: Vec<crate::config::list_updates::ListUpdate>,
     metrics: Arc<Metrics>,
     ip_cache: Arc<IpDomainCache>,
     strategies: Arc<StrategyStore>,
@@ -102,6 +103,11 @@ pub fn run(
         app.push_log_t(LogLevel::Error, "startup.domains_missing", vec![("error".to_string(), reason)]);
     } else if domains.is_empty() {
         app.push_log_t(LogLevel::Warning, "startup.domains_empty", vec![]);
+    }
+
+    for update in &list_updates {
+        let (level, payload) = update.log_message();
+        app.push_payload(level, payload);
     }
 
     if app.diagnostics_only {

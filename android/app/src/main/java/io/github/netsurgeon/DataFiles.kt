@@ -25,21 +25,8 @@ object DataFiles {
      */
     private val ADDED_KEYS = listOf("smart_dns_provider", "smart_dns_bootstrap_ip")
 
-    /**
-     * Домены, добавленные в список обхода после первых версий. Как и
-     * настройки, в старый bypass_domains.txt сами не попадут. Каждый
-     * дописывается один раз: если пользователь его потом удалит, при
-     * следующем запуске он не вернётся — предложенные помним в файле-метке.
-     */
-    private val ADDED_BYPASS = listOf("youtubei.googleapis.com")
-
-    /** То же для умного DNS: API, в которые ходят приложения Gemini и NotebookLM. */
-    private val ADDED_SMART_DNS = listOf(
-        "robinfrontend-pa.googleapis.com",
-        "proactivebackend-pa.googleapis.com",
-        "aisandbox-pa.googleapis.com",
-        "notebooklm-pa.googleapis.com",
-    )
+    // Новые домены в уже существующие списки дописывает ядро при запуске
+    // (src/config/list_updates.rs), с теми же файлами-метками, что были здесь.
 
     /** Есть не в каждой сборке: только если при сборке был свой воркер. */
     private val OPTIONAL = listOf(TELEGRAM_RELAY)
@@ -55,8 +42,6 @@ object DataFiles {
             }
         }
         addMissingKeys(context)
-        addOnce(context, BYPASS, ADDED_BYPASS, ".added_bypass")
-        addOnce(context, SMART_DNS, ADDED_SMART_DNS, ".added_smart_dns")
         for (name in OPTIONAL) {
             val target = File(dir(context), name)
             if (target.exists()) continue
@@ -84,22 +69,6 @@ object DataFiles {
         val section = lines.indexOfFirst { it.trimStart().startsWith("[") }.takeIf { it >= 0 } ?: lines.size
         lines.addAll(section, missing + "")
         write(context, CONFIG, lines.joinToString("\n"))
-    }
-
-    /** Дописывает в список [name] ещё не предложенные [domains]; предложенные помнит в [markName]. */
-    private fun addOnce(context: Context, name: String, domains: List<String>, markName: String) {
-        val mark = File(dir(context), markName)
-        val offered = mark.takeIf { it.exists() }?.readLines()?.toSet() ?: emptySet()
-        val fresh = domains.filter { it !in offered }
-        if (fresh.isEmpty()) return
-        val current = read(context, name)
-        val present = current.lineSequence().map { it.trim().lowercase() }.toSet()
-        val missing = fresh.filter { it !in present }
-        if (missing.isNotEmpty()) {
-            val sep = if (current.isEmpty() || current.endsWith("\n")) "" else "\n"
-            write(context, name, current + sep + missing.joinToString("\n") + "\n")
-        }
-        mark.writeText((offered + fresh).joinToString("\n") + "\n")
     }
 
     fun read(context: Context, name: String): String =
