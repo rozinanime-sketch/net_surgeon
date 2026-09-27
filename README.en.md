@@ -67,7 +67,8 @@ window and the proxy settings go back to what they were.
 > interception off, put `transparent_port = 0`.
 >
 > Like zapret, the program sees only the start of each HTTPS connection and
-> the server's first reply; the rest of the traffic bypasses it, so the
+> the server's first reply, and only the first packets of QUIC and calls;
+> the rest of the traffic, voice and games included, bypasses it, so the
 > interception does not raise ping. Because of that, transparent mode lacks
 > the two techniques that change the number of bytes in the stream (TLS
 > records and OOB); instead it has the decoy (fake), which is unavailable

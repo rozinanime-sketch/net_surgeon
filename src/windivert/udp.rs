@@ -11,7 +11,8 @@
 //! Что перехватывается и что с этим делать — то же, что в Linux:
 //!
 //! * UDP/443 (QUIC) и UDP на порты звонков (`session::CALL_PORTS`, сети
-//!   Telegram) — см. [`filter`];
+//!   Telegram) — см. [`filter`]; из QUIC и звонков в программу попадают
+//!   только первые датаграммы, узнаваемые по байтам, остальное идёт мимо;
 //! * адрес трекера — датаграммы выбрасываются, браузер уходит на TCP, где
 //!   имя видно и соединение сбрасывается уже по SNI;
 //! * сайт из списка обхода или звонок (`session::is_call_flow`) — перед
@@ -131,11 +132,33 @@ pub(super) fn range(base: Ipv4Addr, bits: u8) -> (Ipv4Addr, Ipv4Addr) {
 
 /// Часть фильтра WinDivert для UDP: что отдавать в [`Tracker`] и на DNS.
 ///
-/// Тот же набор, что у правил nftables в Linux (`firewall::ruleset`):
+/// Те же потоки, что у правил nftables в Linux (`firewall::ruleset`):
 /// QUIC, DNS, порты звонков вне локальных сетей и сети Telegram. Звонки,
 /// как и в Linux, только по IPv4.
+///
+/// Но не все их датаграммы, а только те, перед которыми может понадобиться
+/// мусор или которые надо выбросить: мусор уходит перед первой датаграммой
+/// потока, а она узнаётся по байтам. Раньше через программу шёл каждый
+/// пакет QUIC (видео YouTube) и каждый пакет на портах 50000–65535 (голос
+/// и игры), и под нагрузкой они ждали в очереди драйвера. Теперь:
+///
+/// * QUIC — только пакеты с длинным заголовком Initial (и 0-RTT: у них
+///   тот же диапазон первого байта, 0xC0–0xDF). Трекер выбрасывается тоже
+///   по Initial: без него рукопожатие не начнётся.
+/// * Порты звонков — только STUN (им начинают звонок WebRTC и Telegram
+///   между собеседниками) и запрос IP discovery голоса Discord. Сам голос
+///   и игры на тех же портах идут мимо программы.
+/// * Сети Telegram — по-прежнему всё: у голоса через его серверы нет
+///   узнаваемого первого пакета. Эти потоки есть только во время звонка
+///   в Telegram.
+///
+/// Счётчик QUIC-сессий в интерфейсе из-за этого приблизительный: сессия
+/// считается закрытой через две минуты после последнего Initial.
 pub fn filter(dns: bool, calls: bool) -> String {
-    let mut parts = vec![format!("udp.DstPort == {HTTPS_PORT}")];
+    let mut parts = vec![format!(
+        "(udp.DstPort == {HTTPS_PORT} and udp.PayloadLength > 0 \
+         and udp.Payload[0] >= 192 and udp.Payload[0] <= 223)"
+    )];
     if dns {
         parts.push("udp.DstPort == 53".into());
     }
@@ -153,7 +176,13 @@ pub fn filter(dns: bool, calls: bool) -> String {
             .map(|(a, b)| format!("(udp.DstPort >= {a} and udp.DstPort <= {b})"))
             .collect::<Vec<_>>()
             .join(" or ");
-        parts.push(format!("(ip and {local} and ({ports}))"));
+        // STUN: магическое число 0x2112A442 в байтах 4..8. Discord: 74 байта,
+        // тип 0x0001, длина 70 (см. session::is_stun, is_discord_ip_discovery).
+        let first = "((udp.PayloadLength >= 20 and udp.Payload[4] == 33 and udp.Payload[5] == 18 \
+                     and udp.Payload[6] == 164 and udp.Payload[7] == 66) \
+                     or (udp.PayloadLength == 74 and udp.Payload[0] == 0 and udp.Payload[1] == 1 \
+                     and udp.Payload[2] == 0 and udp.Payload[3] == 70))";
+        parts.push(format!("(ip and {local} and ({ports}) and {first})"));
 
         let telegram = crate::proxy::telegram::networks_v4()
             .map(|(ip, bits)| {
@@ -399,13 +428,37 @@ mod tests {
 
     #[test]
     fn filter_matches_linux_rules() {
-        assert_eq!(filter(false, false), "(outbound and udp and (udp.DstPort == 443))");
+        let quic = filter(false, false);
+        assert!(quic.contains("udp.DstPort == 443"));
+        assert!(quic.contains("udp.Payload[0] >= 192"), "только длинные заголовки QUIC");
+        assert!(!quic.contains("udp.DstPort == 53"));
         let f = filter(true, true);
         assert!(f.contains("udp.DstPort == 53"));
         assert!(f.contains("(udp.DstPort >= 50000 and udp.DstPort <= 65535)"));
         assert!(f.contains("!(ip.DstAddr >= 192.168.0.0 and ip.DstAddr <= 192.168.255.255)"));
         assert!(f.contains("(ip.DstAddr >= 149.154.160.0 and ip.DstAddr <= 149.154.175.255)"));
         assert!(f.contains("!(ip.DstAddr >= 255.255.255.255 and ip.DstAddr <= 255.255.255.255)"));
+        assert!(f.contains("udp.Payload[4] == 33"), "на портах звонков — только STUN");
+        assert!(f.contains("udp.PayloadLength == 74"), "и IP discovery Discord");
+    }
+
+    /// Фильтр пропускает ровно то, что узнают session::is_stun и
+    /// is_discord_ip_discovery: байты в фильтре записаны вручную, и
+    /// разойтись с проверкой в коде они не должны.
+    #[test]
+    fn filter_signatures_match_the_call_detectors() {
+        let mut stun = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42];
+        stun.extend_from_slice(&[0u8; 12]);
+        assert!(crate::proxy::udp::session::is_stun(&stun));
+        assert_eq!((stun[4], stun[5], stun[6], stun[7]), (33, 18, 164, 66));
+
+        let mut discovery = vec![0x00, 0x01, 0x00, 70];
+        discovery.resize(74, 0);
+        assert!(crate::proxy::udp::session::is_discord_ip_discovery(&discovery));
+
+        let quic = initial();
+        assert!(crate::proxy::udp::session::is_quic_initial(&quic));
+        assert!((192..=223).contains(&quic[0]), "Initial попадает в диапазон фильтра");
     }
 
     #[test]
