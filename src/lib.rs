@@ -58,9 +58,14 @@ pub mod engine;
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
 pub mod firewall;
 pub mod headless;
-/// Системный прокси Windows вместо прозрачного режима, которого там нет.
+/// Системный прокси Windows: работает и без прав администратора, которые
+/// нужны прозрачному режиму.
 #[cfg(windows)]
 pub mod system_proxy;
+/// Прозрачный режим Windows (драйвер WinDivert). Логика перезаписи
+/// пакетов собирается и в тестах на других системах.
+#[cfg(any(windows, test))]
+pub mod windivert;
 pub mod observability;
 pub mod protocol;
 pub mod proxy;

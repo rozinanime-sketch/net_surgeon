@@ -51,6 +51,23 @@ cargo build --release --target x86_64-pc-windows-gnu
 say "Android"
 ./android/build.sh release
 
+# Драйвер прозрачного режима Windows (src/windivert). Готовая подписанная
+# сборка с сайта автора: драйвер без подписи Microsoft Windows не загрузит,
+# так что собирать его самим бессмысленно. Сумма закреплена, чтобы подмена
+# архива на GitHub не попала в релиз молча.
+WINDIVERT_V=2.2.2
+WINDIVERT_SHA256=63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15
+WINDIVERT_DIR=target/windivert
+WINDIVERT_ZIP=$WINDIVERT_DIR/WinDivert-$WINDIVERT_V-A.zip
+say "WinDivert $WINDIVERT_V"
+mkdir -p "$WINDIVERT_DIR"
+[[ -f $WINDIVERT_ZIP ]] || curl -fsSLo "$WINDIVERT_ZIP" \
+    "https://github.com/basil00/WinDivert/releases/download/v$WINDIVERT_V/WinDivert-$WINDIVERT_V-A.zip"
+echo "$WINDIVERT_SHA256  $WINDIVERT_ZIP" | sha256sum -c --quiet - \
+    || die "у $WINDIVERT_ZIP не та контрольная сумма"
+unzip -oq "$WINDIVERT_ZIP" -d "$WINDIVERT_DIR"
+WINDIVERT_SRC=$WINDIVERT_DIR/WinDivert-$WINDIVERT_V-A
+
 LINUX_BIN=target/x86_64-unknown-linux-musl/release/net_surgeon
 WIN_BIN=target/x86_64-pc-windows-gnu/release/net_surgeon.exe
 APK=android/app/build/outputs/apk/release/app-release.apk
@@ -81,6 +98,9 @@ COMMON=(LICENSE README.md config.toml bypass_domains.txt block_domains.txt smart
 cp "${COMMON[@]}" run.sh setup-transparent.sh "$DIST/linux/net_surgeon-$V/"
 cp "$LINUX_BIN" "$DIST/linux/net_surgeon-$V/target/release/"
 cp "${COMMON[@]}" "$WIN_BIN" "$DIST/windows/net_surgeon-$V/"
+# WinDivert под LGPL: библиотека кладётся без изменений и с лицензией.
+cp "$WINDIVERT_SRC/x64/WinDivert.dll" "$WINDIVERT_SRC/x64/WinDivert64.sys" "$DIST/windows/net_surgeon-$V/"
+cp "$WINDIVERT_SRC/LICENSE" "$DIST/windows/net_surgeon-$V/WinDivert-LICENSE.txt"
 
 tar -C "$DIST/linux" --owner=root --group=root -czf "$DIST/net_surgeon-$V-x86_64-linux.tar.gz" "net_surgeon-$V"
 # zip есть не везде, а python3 — почти везде.

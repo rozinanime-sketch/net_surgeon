@@ -6,7 +6,8 @@
 //! прописать адрес, curl — передать `--proxy`. Настраивать каждое приложение
 //! отдельно неудобно, а часть их прокси вообще не поддерживает.
 //!
-//! Здесь соединения перехватываются правилом iptables на уровне ядра.
+//! Здесь соединения перехватываются правилом iptables на уровне ядра
+//! (в Windows — драйвером WinDivert, см. модуль `windivert`).
 //! Приложение думает, что подключается к серверу напрямую, и ничего
 //! настраивать не нужно.
 //!
@@ -69,6 +70,13 @@ fn ipv6_companion(listen_host: &str) -> Option<&'static str> {
     }
 }
 
+/// Строка «слушает» в логе: подсказка, чем включается перехват, у систем
+/// своя.
+#[cfg(not(windows))]
+const LISTENING_KEY: &str = "log.transparent_listening";
+#[cfg(windows)]
+const LISTENING_KEY: &str = "log.transparent_listening_windows";
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_transparent_proxy(
     listen_host: &str,
@@ -83,6 +91,12 @@ pub async fn run_transparent_proxy(
     ip_cache: Arc<IpDomainCache>,
     strategies: Arc<StrategyStore>,
 ) {
+    // В Windows развёрнутый перехватом пакет приходит на адрес сетевой
+    // карты, а не на 127.0.0.1, и слушатель на петле его не принял бы.
+    // Подключиться из сети он при этом не даёт: такие пакеты выбрасывает
+    // тот же перехват (см. windivert::nat).
+    let listen_host = if cfg!(windows) { "0.0.0.0" } else { listen_host };
+
     let addr = format!("{}:{}", listen_host, port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -95,8 +109,7 @@ pub async fn run_transparent_proxy(
         }
     };
 
-    metrics.set_transparent_listening(true);
-    log_t(&log_tx, LogLevel::Success, "log.transparent_listening", vec![("addr", addr.clone())]);
+    log_t(&log_tx, LogLevel::Success, LISTENING_KEY, vec![("addr", addr.clone())]);
 
     // IPv6-слушатель необязателен: на машине без IPv6 он не поднимется,
     // и это не повод выключать IPv4-часть. Правило ip6tables в run.sh
@@ -106,7 +119,7 @@ pub async fn run_transparent_proxy(
             let addr_v6 = format!("[{}]:{}", host, port);
             match TcpListener::bind(&addr_v6).await {
                 Ok(l) => {
-                    log_t(&log_tx, LogLevel::Success, "log.transparent_listening", vec![("addr", addr_v6)]);
+                    log_t(&log_tx, LogLevel::Success, LISTENING_KEY, vec![("addr", addr_v6)]);
                     Some(l)
                 }
                 Err(e) => {
@@ -120,6 +133,23 @@ pub async fn run_transparent_proxy(
         }
         None => None,
     };
+
+    // Перехват включается после слушателей: иначе первые перехваченные
+    // соединения упёрлись бы в закрытый порт. Не включился — слушатели
+    // не нужны: без перехвата к ним никто не придёт.
+    #[cfg(windows)]
+    let _diverter = match crate::windivert::Diverter::start(port, &log_tx) {
+        Ok(d) => {
+            log_t(&log_tx, LogLevel::Success, "log.windivert_on", vec![]);
+            d
+        }
+        Err(e) => {
+            log_t(&log_tx, LogLevel::Warning, "log.windivert_failed", vec![("error", e)]);
+            return;
+        }
+    };
+
+    metrics.set_transparent_listening(true);
 
     let serve = |listener: TcpListener| {
         let bypass_domains = Arc::clone(&bypass_domains);
@@ -179,7 +209,11 @@ async fn handle(
 ) {
     // Куда клиент шёл на самом деле. Без этого перехваченное соединение
     // некуда переслать: peer_addr() показывает наш же порт.
-    let Some(target_addr) = socket::original_dst(socket::raw_sock(&client)) else {
+    #[cfg(not(windows))]
+    let target_addr = socket::original_dst(socket::raw_sock(&client));
+    #[cfg(windows)]
+    let target_addr = client.peer_addr().ok().and_then(crate::windivert::original_dst);
+    let Some(target_addr) = target_addr else {
         log_t(log_tx, LogLevel::Warning, "log.transparent_no_dst", vec![]);
         return;
     };

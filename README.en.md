@@ -27,9 +27,10 @@ All files are on the [latest release](https://github.com/rozinanime-sketch/net_s
   pieces (disorder), inserts an out-of-band byte.
 - **Picks the technique itself** for each site, remembers it and re-measures
   it when it stops working.
-- **No setup needed:** on Windows it sets the system proxy by itself, on
-  Linux it intercepts the whole machine's traffic, on Android it works as a
-  VPN without root.
+- **No setup needed:** on Linux and on Windows (as administrator) it
+  intercepts the whole machine's traffic, without administrator rights on
+  Windows it sets the system proxy by itself, on Android it works as a VPN
+  without root.
 - **Encrypts DNS** (DoH) so the ISP can't spoof site addresses.
 - **Opens AI services closed to Russia** (ChatGPT, Claude, Gemini, Grok,
   Copilot) through a smart DNS.
@@ -46,16 +47,26 @@ The interface is in English and Russian and follows the system language.
 ### Windows
 
 1. Download the Windows archive and unpack it anywhere.
-2. Double-click `net_surgeon.exe`. No administrator rights needed.
+2. Run `net_surgeon.exe`: right-click → “Run as administrator”. Then all
+   programs go through the bypass (transparent mode). A plain double-click
+   also works, but then only browsers do (see below).
 3. If you see “Windows protected your PC”, click “More info → Run anyway”:
    the program has no paid code signature.
 
 While the window is open, the browser goes through the bypass. Close the
 window and the proxy settings go back to what they were.
 
-> There is no transparent mode on Windows yet: the bypass covers browsers and
-> programs that use the Windows proxy settings. To set the proxy yourself,
-> put `system_proxy = false` in `config.toml`.
+> **Transparent mode** turns on by itself when the program runs as
+> administrator: the [WinDivert](https://reqrypt.org/windivert.html) driver
+> (included in the archive) sends the HTTPS of all programs, including the
+> Discord app and games, through the bypass.
+> Without administrator rights only the system proxy works: the bypass
+> covers browsers and programs that use the Windows proxy settings. To set
+> the proxy yourself, put `system_proxy = false` in `config.toml`; to turn
+> interception off, put `transparent_port = 0`.
+>
+> An antivirus may complain about WinDivert: it is a packet interception
+> driver, the same one GoodbyeDPI and zapret use.
 
 ### Linux
 
@@ -90,6 +101,7 @@ also add a site from the program itself, in the “Domains” menu.
 | Problem | What to do |
 |---|---|
 | **Windows:** no internet after quitting | Settings → Network & Internet → Proxy → turn the proxy off. The program was probably killed from Task Manager |
+| **Windows:** the log says “port … does not accept intercepted connections” | A firewall or antivirus blocks connections to the transparent mode port (1083). Allow it for `net_surgeon.exe` |
 | **Linux:** no internet after quitting | `./run.sh off` |
 | A site doesn't open | Check that it is in `bypass_domains.txt`. If it is, run “Diagnostics” for it or delete `strategies.txt` to re-measure everything |
 | Nothing is bypassed | Turn off your VPN: through it the ISP doesn't see the traffic, so the bypass is useless |

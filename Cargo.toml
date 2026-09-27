@@ -55,6 +55,10 @@ socket2 = "0.6"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    # Прозрачный режим (src/windivert): WinDivert.dll подгружается во время
+    # работы, а владелец соединения ищется в таблице сокетов системы.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_LibraryLoader",
     # Системный прокси (src/system_proxy.rs): реестр, уведомление
     # программ об изменении и закрытие окна консоли.
     "Win32_Networking_WinInet",
