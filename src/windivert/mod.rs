@@ -92,9 +92,17 @@ mod imp {
     }
 
     /// Работающий перехват. Останавливается при уничтожении.
+    ///
+    /// TCP и UDP перехватываются разными дескрипторами, каждый в своём
+    /// потоке. С одним общим голос звонка стоял в очереди за пакетами
+    /// всех HTTPS-соединений машины: их поток разворачивает на слушатель
+    /// по одному, а на каждом SYN ещё и перебирает таблицу соединений
+    /// системы (`owner_pid`). Под загрузкой это давало звонку лишние
+    /// десятки миллисекунд, а в Linux ничего подобного нет: там TCP
+    /// разворачивает ядро.
     pub struct Diverter {
-        handle: Arc<Handle>,
-        thread: Option<std::thread::JoinHandle<()>>,
+        handles: Vec<Arc<Handle>>,
+        threads: Vec<std::thread::JoinHandle<()>>,
         port: u16,
     }
 
@@ -107,44 +115,56 @@ mod imp {
             // (см. udp::filter). Чужое: входящие на порт слушателя из сети,
             // их выбрасываем. Петля не нужна: на 127.0.0.1 никто ничего не
             // обходит, а свои запросы к DoH-релею иначе поймались бы снова.
-            let filter = format!(
-                "!loopback and ((tcp and ((outbound and (tcp.DstPort == {HTTPS_PORT} or tcp.SrcPort == {port})) \
-                 or (inbound and tcp.DstPort == {port}))) or {})",
-                udp::filter(ctx.dns_relay.is_some(), ctx.calls())
+            let tcp_filter = format!(
+                "!loopback and tcp and ((outbound and (tcp.DstPort == {HTTPS_PORT} or tcp.SrcPort == {port})) \
+                 or (inbound and tcp.DstPort == {port}))"
             );
-            let handle = Arc::new(Handle::open(&filter)?);
+            let udp_filter = format!("!loopback and {}", udp::filter(ctx.dns_relay.is_some(), ctx.calls()));
+            // Оба открываются до запуска потоков: не открылся второй — первый
+            // закроется вместе с Arc, и перехват не останется наполовину.
+            let tcp = Arc::new(Handle::open(&tcp_filter)?);
+            let udp = Arc::new(Handle::open(&udp_filter)?);
             allow_in_firewall(port, log_tx);
 
-            let thread = {
-                let handle = Arc::clone(&handle);
-                let log_tx = log_tx.clone();
+            // Не запустился второй поток — Drop остановит первый.
+            let mut diverter = Diverter { handles: vec![Arc::clone(&tcp), Arc::clone(&udp)], threads: Vec::new(), port };
+            let log = log_tx.clone();
+            diverter.threads.push(
                 std::thread::Builder::new()
-                    .name("windivert".into())
-                    .spawn(move || run(&handle, port, &ctx, &log_tx))
-                    .map_err(|e| e.to_string())?
-            };
-            Ok(Diverter { handle, thread: Some(thread), port })
+                    .name("windivert-tcp".into())
+                    .spawn(move || run_tcp(&tcp, port, &log))
+                    .map_err(|e| e.to_string())?,
+            );
+            let log = log_tx.clone();
+            diverter.threads.push(
+                std::thread::Builder::new()
+                    .name("windivert-udp".into())
+                    .spawn(move || run_udp(&udp, &ctx, &log))
+                    .map_err(|e| e.to_string())?,
+            );
+            Ok(diverter)
         }
     }
 
     impl Drop for Diverter {
         fn drop(&mut self) {
-            self.handle.shutdown();
-            if let Some(t) = self.thread.take() {
+            for h in &self.handles {
+                h.shutdown();
+            }
+            for t in self.threads.drain(..) {
                 let _ = t.join();
             }
             remove_firewall_rule(self.port);
         }
     }
 
-    fn run(handle: &Arc<Handle>, port: u16, ctx: &UdpContext, log_tx: &LogSender) {
-        let mut nat = Nat::new(port);
-        let mut udp_flows: Tracker<(Vec<u8>, Address)> = Tracker::default();
+    /// Принимает пакеты, пока перехват не закрыт, и отдаёт их `on_packet`.
+    /// Когда цикл кончился, дескриптор закрыт: после shutdown драйвер
+    /// больше не забирает пакеты, и они идут мимо перехвата, как будто
+    /// программы нет.
+    fn recv_loop(handle: &Handle, log_tx: &LogSender, mut on_packet: impl FnMut(&mut [u8], Address)) {
         let mut buf = vec![0u8; ffi::MTU_MAX];
-        let me = std::process::id();
-        let mut warned = false;
         let mut errors = 0u32;
-
         loop {
             let mut addr = Address::zeroed();
             let len = match handle.recv(&mut buf, &mut addr) {
@@ -154,29 +174,44 @@ mod imp {
                     len
                 }
                 // Слишком большой пакет и прочие разовые сбои: пакет потерян,
-                // TCP его повторит. Перехват из-за этого не бросаем.
+                // отправитель его повторит. Перехват из-за этого не бросаем.
                 Some(Err(e)) => {
                     errors += 1;
                     if errors < MAX_RECV_ERRORS {
                         continue;
                     }
                     // Сбой не разовый. Дескриптор закрывается ниже: иначе
-                    // пакеты копились бы в драйвере, и без HTTPS осталась
+                    // пакеты копились бы в драйвере, и без сети осталась
                     // бы вся машина.
                     log_t(log_tx, LogLevel::Error, "log.windivert_failed", vec![("error", e.to_string())]);
                     break;
                 }
             };
-            let pkt = &mut buf[..len];
+            on_packet(&mut buf[..len], addr);
+        }
+        handle.shutdown();
+    }
 
-            if let Some(u) = udp::parse(pkt) {
-                match ctx.dns_relay {
-                    Some(relay) if u.dport == 53 => forward_dns(handle, &ctx.runtime, relay, pkt.to_vec(), addr),
-                    _ => on_udp(handle, &mut udp_flows, pkt, &addr, ctx, log_tx),
-                }
-                continue;
+    fn run_udp(handle: &Arc<Handle>, ctx: &UdpContext, log_tx: &LogSender) {
+        let mut flows: Tracker<(Vec<u8>, Address)> = Tracker::default();
+        recv_loop(handle, log_tx, |pkt, addr| {
+            let Some(u) = udp::parse(pkt) else {
+                handle.send(pkt, &addr);
+                return;
+            };
+            match ctx.dns_relay {
+                Some(relay) if u.dport == 53 => forward_dns(handle, &ctx.runtime, relay, pkt.to_vec(), addr),
+                _ => on_udp(handle, &mut flows, pkt, &addr, ctx, log_tx),
             }
+        });
+    }
 
+    fn run_tcp(handle: &Arc<Handle>, port: u16, log_tx: &LogSender) {
+        let mut nat = Nat::new(port);
+        let me = std::process::id();
+        let mut warned = false;
+
+        recv_loop(handle, log_tx, |pkt, mut addr| {
             let verdict = nat.process(pkt, addr.outbound(), Instant::now(), |ip, port| {
                 owner_pid(ip, port).is_some_and(|pid| pid != me)
             });
@@ -202,10 +237,7 @@ mod imp {
                     handle.send(pkt, &addr);
                 }
             }
-        }
-        // После shutdown драйвер больше не забирает пакеты, и они идут
-        // мимо перехвата, как будто программы нет.
-        handle.shutdown();
+        });
     }
 
     /// Сколько ошибок приёма подряд терпеть, прежде чем выключить перехват.
