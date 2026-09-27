@@ -193,7 +193,9 @@ pub fn init(
     let _ = SMART.set(smart);
 }
 
-/// Разрешает `host:port` в один адрес, готовый для подключения.
+/// Разрешает `host:port` во все адреса в том порядке, в каком их перебирает
+/// [`connect`]: от DoH, если он включён и ответил, иначе от системного
+/// резолвера с запасным DoH.
 ///
 /// Вынесено отдельно от `connect`, потому что резолв и подключение нельзя
 /// мерить и ограничивать одним таймаутом: запрос к DoH — это HTTPS-обмен,
@@ -202,17 +204,17 @@ pub fn init(
 /// внутрь которого попадал и резолв, — и живые домены получали вердикт
 /// «TCP не открылся», хотя до них попросту не успевали дойти.
 ///
-/// `None` означает «разрешай сам»: DoH выключен, хост уже адрес,
-/// либо резолв не удался и нужен откат на системный резолвер.
-pub async fn resolve_first(target: &str) -> Option<SocketAddr> {
+/// Все адреса, а не первый: раньше диагностика брала один, и если это был
+/// мёртвый адрес (у discord.com 162.159.136.232 не отвечает на SYN),
+/// домен получал «TCP не установился», хотя прокси, перебирающий адреса,
+/// до него доходил.
+pub async fn resolve_all(target: &str) -> Vec<SocketAddr> {
     match resolve_target(target).await {
-        Resolution::Resolved(addrs) => addrs.into_iter().next(),
-        Resolution::Failed(host) => {
-            note_fallback(&host);
-            None
-        }
-        Resolution::NotApplicable => None,
+        Resolution::Resolved(addrs) if !addrs.is_empty() => return addrs,
+        Resolution::Failed(host) => note_fallback(&host),
+        _ => {}
     }
+    lookup_system(target).await.unwrap_or_default()
 }
 
 /// Сколько ждать одного адреса, прежде чем перейти к следующему.
@@ -347,20 +349,6 @@ async fn resolve_unresolvable(target: &str) -> Option<Vec<SocketAddr>> {
         ]);
     }
     Some(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
-}
-
-/// Для диагностики: адрес через запасной DoH, только если системный
-/// резолвер имя не нашёл. `None` — система справилась (проба подключается
-/// по имени, как раньше) или не справился и DoH.
-///
-/// Иначе проба домена, заблокированного на уровне DNS, давала «TCP не
-/// открылся» — и вердикт «блокировка по IP», хотя прокси до него дойдёт.
-pub async fn resolve_if_system_fails(target: &str) -> Option<SocketAddr> {
-    let found = tokio::net::lookup_host(target).await.is_ok_and(|mut addrs| addrs.next().is_some());
-    if found {
-        return None;
-    }
-    resolve_unresolvable(target).await?.into_iter().next()
 }
 
 /// Откуда взялся адрес. Различать важно: «DoH выключен» и «DoH сломался» —

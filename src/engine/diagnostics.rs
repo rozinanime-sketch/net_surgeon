@@ -185,6 +185,10 @@ const RESPONSE_TIMEOUT_FACTOR: u32 = 10;
 
 /// Нижняя граница ожидания: на быстрой сети RTT бывает 2-3 мс, и без пола
 /// таймаут вышел бы меньше времени обработки на сервере.
+/// Сколько адресов домена пробовать, прежде чем сдаться. Больше трёх
+/// мёртвых подряд не встречалось, а каждый стоит полного таймаута.
+const MAX_PROBE_ADDRESSES: usize = 3;
+
 const RESPONSE_TIMEOUT_MIN: Duration = Duration::from_millis(800);
 
 /// Верхняя граница — прежнее фиксированное значение.
@@ -342,21 +346,20 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
     // получает «TCP не открылся» просто потому, что резолв был медленным.
     // Если системный резолвер имя не знает (блокировка на уровне DNS),
     // адрес берётся у запасного DoH — так же, как это сделает прокси.
-    let resolved = match crate::dns::resolver::resolve_first(target).await {
-        Some(addr) => Some(addr),
-        None => crate::dns::resolver::resolve_if_system_fails(target).await,
+    //
+    // Адреса перебираются по очереди, как в бою: один мёртвый адрес в
+    // ответе DNS иначе превращал живой домен в «TCP не установился».
+    let mut connected = None;
+    for addr in crate::dns::resolver::resolve_all(target).await.into_iter().take(MAX_PROBE_ADDRESSES) {
+        let started = Instant::now();
+        if let Ok(Ok(s)) = tokio::time::timeout(RESPONSE_TIMEOUT_MAX, TcpStream::connect(addr)).await {
+            connected = Some((s, started.elapsed()));
+            break;
+        }
+    }
+    let Some((stream, connect_rtt)) = connected else {
+        return ProbeOutcome::ConnectFailed;
     };
-
-    let connect_started = Instant::now();
-    let connect_result = match resolved {
-        Some(addr) => tokio::time::timeout(RESPONSE_TIMEOUT_MAX, TcpStream::connect(addr)).await,
-        None => tokio::time::timeout(RESPONSE_TIMEOUT_MAX, TcpStream::connect(target)).await,
-    };
-    let stream = match connect_result {
-        Ok(Ok(s)) => s,
-        _ => return ProbeOutcome::ConnectFailed,
-    };
-    let connect_rtt = connect_started.elapsed();
 
     // Как в бою: боевые пути выключают Nagle на соединении с сервером, и
     // проба обязана делать то же. Иначе вторая часть разрезанного ClientHello
@@ -550,10 +553,19 @@ async fn diagnose_with(
         let mut attempts = 0u32;
         let mut durations: Vec<f64> = Vec::new();
 
-        for trial in 0..trials_count {
+        // Неудачное подключение — не вердикт о технике: до ClientHello дело
+        // не дошло. Раньше оно засчитывалось провалом, и на домене с частью
+        // заблокированных адресов (facebook.com) OOB с 2 успехами из 2
+        // дошедших проб получал 2/5 и отбраковывался. Такие пробы
+        // повторяются, но не больше чем вдвое против обычного, а две подряд
+        // значат, что сервер сейчас недоступен вовсе, и серия прекращается.
+        let mut tries = 0u32;
+        let mut unreachable_in_row = 0u32;
+        while attempts < trials_count && tries < trials_count * 2 {
             // Разрежение серии: пауза перед всеми пробами, кроме первой.
             // В тщательном проходе она длиннее — там и цель другая, не скорость.
-            if trial > 0 {
+            tries += 1;
+            if tries > 1 {
                 let gap = if early_abandon {
                     crate::bypass::random::in_range(timing.gap_min_ms, timing.gap_max_ms)
                 } else {
@@ -564,12 +576,20 @@ async fn diagnose_with(
 
             let hello = crate::bypass::tls::build_client_hello_sized(domain, timing.hello_size);
             let (outcome, ms) = probe_tcp(target, &hello, strategy, bypass_params).await;
+            if outcome == ProbeOutcome::ConnectFailed {
+                unreachable_in_row += 1;
+                if unreachable_in_row == 2 {
+                    break;
+                }
+                continue;
+            }
+            unreachable_in_row = 0;
             attempts += 1;
             if outcome == ProbeOutcome::Success {
                 successes += 1;
                 durations.push(ms);
             }
-            if early_abandon && trial + 1 == 2 && successes == 0 {
+            if early_abandon && attempts == 2 && successes == 0 {
                 break;
             }
         }

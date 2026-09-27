@@ -599,3 +599,142 @@ async fn socks5_accepts_greeting_and_request_in_one_segment() {
 
     token.cancel();
 }
+
+/// Живая проверка техник на целом соединении, а не на первом ответе.
+///
+/// Диагностика судит по первым байтам ответа сервера: этого хватает, чтобы
+/// понять, прошёл ли ClientHello, но не видно, доживёт ли соединение до
+/// конца. Здесь через настоящий SOCKS5-сервер программы с принудительно
+/// заданной техникой идёт полноценный HTTPS-запрос, и ответ дочитывается
+/// целиком — десятки килобайт, больше порога, после которого некоторые
+/// блокировки глушат поток.
+///
+/// Ходит в сеть, поэтому не запускается по умолчанию:
+///   cargo test --all-features live_techniques -- --ignored --nocapture
+/// Порт 8443: на 443 исходящие соединения перехватывает запущенный
+/// прозрачный режим, и проверялась бы его стратегия, а не заданная.
+///
+/// Disorder на части сетей изредка не проходит, и это не ошибка кода: по
+/// записи трафика после перестановки пакетов сервер не отвечает вовсе,
+/// даже на повторы с обычным TTL, — соединение глушат по пути.
+#[tokio::test]
+#[ignore]
+async fn live_techniques_complete_https_exchange() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::engine::strategy::{HelloClass, StrategyStore};
+    use crate::observability::logging::{self, LogPayload};
+    use crate::observability::metrics::Metrics;
+    use crate::proxy::socks5::tcp::run_socks5_server;
+
+    const PORT: u16 = 8443;
+    // API Discord на 8443 не отвечает даже напрямую (Cloudflare выдаёт 522),
+    // поэтому только статика: страница больше 16 КБ и картинка с CDN.
+    let targets = [("discord.com", "/"), ("cdn.discordapp.com", "/embed/avatars/0.png")];
+    let strategies = [Strategy::None, Strategy::SniSplit, Strategy::TlsRecord, Strategy::Oob, Strategy::Disorder];
+
+    let tls = {
+        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    };
+
+    let mut failures = Vec::new();
+    for strategy in strategies {
+        // Свой прокси на каждую технику: хранилище стратегий общее на сервер.
+        let store = Arc::new(StrategyStore::new());
+        let hosts: HashSet<String> = targets.iter().map(|(h, _)| h.to_string()).collect();
+        for host in &hosts {
+            store.set(host, HelloClass::Small, strategy, 1.0);
+            store.set(host, HelloClass::Large, strategy, 1.0);
+        }
+        let socks_port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let token = CancellationToken::new();
+        let (log_tx, mut log_rx) = logging::channel();
+        {
+            let token = token.clone();
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                run_socks5_server(
+                    "127.0.0.1", socks_port, 0, true, Arc::new(hosts),
+                    test_bypass_params(), 24, log_tx, Metrics::new(), token, store,
+                    Arc::new(crate::dns::ip_cache::IpDomainCache::new()),
+                ).await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for (host, path) in targets {
+            let exchange = async {
+                let mut sock = TcpStream::connect(("127.0.0.1", socks_port)).await?;
+                sock.write_all(&[0x05, 0x01, 0x00]).await?;
+                let mut greeting = [0u8; 2];
+                sock.read_exact(&mut greeting).await?;
+                let mut request = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+                request.extend_from_slice(host.as_bytes());
+                request.extend_from_slice(&PORT.to_be_bytes());
+                sock.write_all(&request).await?;
+                let mut reply = [0u8; 10];
+                sock.read_exact(&mut reply).await?;
+                if reply[1] != 0 {
+                    return Err(std::io::Error::other(format!("SOCKS5 отказ {}", reply[1])));
+                }
+                let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+                let mut stream = tls.connect(name, sock).await?;
+                let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n");
+                stream.write_all(req.as_bytes()).await?;
+                let mut body = Vec::new();
+                // Cloudflare закрывает TLS без close_notify — это не провал.
+                match stream.read_to_end(&mut body).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !body.is_empty() => {}
+                    Err(e) => return Err(e),
+                }
+                Ok(body)
+            };
+            let verdict = match tokio::time::timeout(Duration::from_secs(20), exchange).await {
+                Ok(Ok(body)) => {
+                    let status = String::from_utf8_lossy(&body[..body.len().min(12)]).to_string();
+                    let ok = status.starts_with("HTTP/1.1 2") || status.starts_with("HTTP/1.1 3");
+                    if !ok {
+                        failures.push(format!("{strategy:?} {host}{path}: {status}"));
+                    }
+                    format!("{status} — {} Б", body.len())
+                }
+                Ok(Err(e)) => {
+                    failures.push(format!("{strategy:?} {host}{path}: {e}"));
+                    format!("ошибка: {e}")
+                }
+                Err(_) => {
+                    failures.push(format!("{strategy:?} {host}{path}: таймаут"));
+                    "таймаут 20 с".to_string()
+                }
+            };
+            println!("{:10} {host}{path}: {verdict}", format!("{strategy:?}"));
+        }
+
+        token.cancel();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while let Ok(msg) = log_rx.try_recv() {
+            let text = match msg.payload {
+                LogPayload::NestedTranslated { key, nested_arg, nested_key, args } =>
+                    crate::observability::i18n::translate_nested("ru", &key, &nested_arg, &nested_key, &args),
+                LogPayload::Translated { key, args } => crate::observability::i18n::translate("ru", &key, &args),
+                LogPayload::Plain(s) => s,
+            };
+            if text.contains("прожило") || text.contains("отправлен (") {
+                println!("           лог: {text}");
+            }
+        }
+    }
+    assert!(failures.is_empty(), "не прошли:\n{}", failures.join("\n"));
+}
