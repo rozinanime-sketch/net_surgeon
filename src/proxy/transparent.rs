@@ -85,12 +85,18 @@ pub async fn run_transparent_proxy(
     bypass_domains: Arc<HashSet<String>>,
     bypass_params: BypassParams,
     strategy_ttl_hours: u64,
+    junk: crate::config::Socks5JunkParams,
     log_tx: LogSender,
     metrics: Arc<Metrics>,
     token: CancellationToken,
     ip_cache: Arc<IpDomainCache>,
     strategies: Arc<StrategyStore>,
 ) {
+    // Мусор перед QUIC нужен только перехвату Windows: в Linux QUIC идёт
+    // своим слушателем (transparent_udp).
+    #[cfg(not(windows))]
+    let _ = junk;
+
     // В Windows развёрнутый перехватом пакет приходит на адрес сетевой
     // карты, а не на 127.0.0.1, и слушатель на петле его не принял бы.
     // Подключиться из сети он при этом не даёт: такие пакеты выбрасывает
@@ -138,9 +144,22 @@ pub async fn run_transparent_proxy(
     // соединения упёрлись бы в закрытый порт. Не включился — слушатели
     // не нужны: без перехвата к ним никто не придёт.
     #[cfg(windows)]
-    let _diverter = match crate::windivert::Diverter::start(port, &log_tx) {
+    let quic = crate::windivert::QuicContext {
+        policy: crate::proxy::socks5::udp::UdpPolicy {
+            is_enabled,
+            bypass_domains: Arc::clone(&bypass_domains),
+            ip_cache: Arc::clone(&ip_cache),
+        },
+        junk: junk.clone(),
+        metrics: Arc::clone(&metrics),
+    };
+    #[cfg(windows)]
+    let _diverter = match crate::windivert::Diverter::start(port, quic, &log_tx) {
         Ok(d) => {
             log_t(&log_tx, LogLevel::Success, "log.windivert_on", vec![]);
+            // QUIC перехватывается тем же драйвером, что и TCP, так что
+            // отметка в интерфейсе ставится вместе с ним.
+            metrics.set_transparent_udp_listening(true);
             d
         }
         Err(e) => {
@@ -193,6 +212,8 @@ pub async fn run_transparent_proxy(
     }
 
     metrics.set_transparent_listening(false);
+    #[cfg(windows)]
+    metrics.set_transparent_udp_listening(false);
 }
 
 #[allow(clippy::too_many_arguments)]

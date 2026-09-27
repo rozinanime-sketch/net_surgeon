@@ -11,7 +11,8 @@
 //! принимает их обратно. На нём же работают GoodbyeDPI и zapret (winws).
 //! TCP он не обходит сам, а только разворачивает соединения на 443 в тот
 //! же прозрачный слушатель, что и в Linux ([`nat`]). Выбор стратегии, SNI,
-//! запасные адреса — всё общее.
+//! запасные адреса — всё общее. QUIC обрабатывается прямо на пакетах
+//! ([`quic`]): прокси для него не нужен.
 //!
 //! # Условия
 //!
@@ -26,6 +27,7 @@
 #[cfg(windows)]
 mod ffi;
 pub mod nat;
+pub mod quic;
 
 #[cfg(windows)]
 pub use imp::*;
@@ -38,7 +40,19 @@ mod imp {
 
     use super::ffi::{self, Address, Handle};
     use super::nat::{Nat, Verdict, HTTPS_PORT};
+    use super::quic::{self, Policy, Step, Tracker};
+    use crate::bypass::{fragment, needs_bypass, random};
+    use crate::config::Socks5JunkParams;
     use crate::observability::logging::{log_t, LogLevel, LogSender};
+    use crate::observability::metrics::Metrics;
+    use crate::proxy::socks5::udp::UdpPolicy;
+
+    /// Что нужно перехвату QUIC: решать, какие потоки обходить, и чем.
+    pub struct QuicContext {
+        pub policy: UdpPolicy,
+        pub junk: Socks5JunkParams,
+        pub metrics: Arc<Metrics>,
+    }
 
     /// Куда шло перехваченное соединение.
     ///
@@ -62,13 +76,13 @@ mod imp {
         /// Включает перехват на слушатель `port`. Слушатель к этому моменту
         /// уже должен быть поднят: иначе первые перехваченные соединения
         /// получили бы отказ.
-        pub fn start(port: u16, log_tx: &LogSender) -> Result<Diverter, String> {
-            // Своё: исходящие на 443 и ответы слушателя. Чужое: входящие
-            // на порт слушателя из сети, их выбрасываем. Петля не нужна:
-            // на 127.0.0.1 никто ничего не обходит.
+        pub fn start(port: u16, quic: QuicContext, log_tx: &LogSender) -> Result<Diverter, String> {
+            // Своё: исходящие на 443 (TCP и QUIC) и ответы слушателя. Чужое:
+            // входящие на порт слушателя из сети, их выбрасываем. Петля не
+            // нужна: на 127.0.0.1 никто ничего не обходит.
             let filter = format!(
-                "tcp and !loopback and ((outbound and (tcp.DstPort == {HTTPS_PORT} or tcp.SrcPort == {port})) \
-                 or (inbound and tcp.DstPort == {port}))"
+                "!loopback and ((tcp and ((outbound and (tcp.DstPort == {HTTPS_PORT} or tcp.SrcPort == {port})) \
+                 or (inbound and tcp.DstPort == {port}))) or (outbound and udp.DstPort == {HTTPS_PORT}))"
             );
             let handle = Arc::new(Handle::open(&filter)?);
             allow_in_firewall(port, log_tx);
@@ -78,7 +92,7 @@ mod imp {
                 let log_tx = log_tx.clone();
                 std::thread::Builder::new()
                     .name("windivert".into())
-                    .spawn(move || run(&handle, port, &log_tx))
+                    .spawn(move || run(&handle, port, &quic, &log_tx))
                     .map_err(|e| e.to_string())?
             };
             Ok(Diverter { handle, thread: Some(thread), port })
@@ -95,8 +109,9 @@ mod imp {
         }
     }
 
-    fn run(handle: &Handle, port: u16, log_tx: &LogSender) {
+    fn run(handle: &Arc<Handle>, port: u16, ctx: &QuicContext, log_tx: &LogSender) {
         let mut nat = Nat::new(port);
+        let mut quic_flows: Tracker<(Vec<u8>, Address)> = Tracker::default();
         let mut buf = vec![0u8; ffi::MTU_MAX];
         let me = std::process::id();
         let mut warned = false;
@@ -125,6 +140,11 @@ mod imp {
                 }
             };
             let pkt = &mut buf[..len];
+
+            if quic::parse(pkt).is_some() {
+                on_udp(handle, &mut quic_flows, pkt, &addr, ctx, log_tx);
+                continue;
+            }
 
             let verdict = nat.process(pkt, addr.outbound(), Instant::now(), |ip, port| {
                 owner_pid(ip, port).is_some_and(|pid| pid != me)
@@ -159,6 +179,98 @@ mod imp {
 
     /// Сколько ошибок приёма подряд терпеть, прежде чем выключить перехват.
     const MAX_RECV_ERRORS: u32 = 100;
+
+    fn on_udp(
+        handle: &Arc<Handle>,
+        flows: &mut Tracker<(Vec<u8>, Address)>,
+        pkt: &[u8],
+        addr: &Address,
+        ctx: &QuicContext,
+        log_tx: &LogSender,
+    ) {
+        let mut domain = None;
+        let (step, count) = flows.process(
+            pkt,
+            Instant::now(),
+            |dst| {
+                let Some(d) = ctx.policy.ip_cache.lookup(&dst) else { return Policy::Pass };
+                let policy = if crate::block::is_blocked(&d) {
+                    Policy::Block
+                } else if needs_bypass(ctx.policy.is_enabled, &d, &ctx.policy.bypass_domains) {
+                    Policy::Bypass
+                } else {
+                    Policy::Pass
+                };
+                domain = Some(d);
+                policy
+            },
+            || (pkt.to_vec(), *addr),
+        );
+        for _ in 0..count.opened {
+            ctx.metrics.quic_session_opened();
+        }
+        for _ in 0..count.closed {
+            ctx.metrics.quic_session_closed();
+        }
+
+        match step {
+            Step::Pass => {
+                handle.send(pkt, addr);
+            }
+            Step::Queued => {}
+            Step::Drop { first } => {
+                if first && let Some(d) = domain {
+                    log_t(log_tx, LogLevel::Info, "log.blocked", vec![
+                        ("domain", d),
+                        ("via", "QUIC".to_string()),
+                    ]);
+                }
+            }
+            Step::Junk(rx) => {
+                if let Some(u) = quic::parse(pkt) {
+                    log_t(log_tx, LogLevel::Info, "log.tproxy_session", vec![
+                        ("addr", SocketAddr::new(u.dst, u.dport).to_string()),
+                        ("domain", domain.unwrap_or_else(|| u.dst.to_string())),
+                        ("bypass", "true".to_string()),
+                    ]);
+                }
+                spawn_junk_sender(Arc::clone(handle), rx, ctx.junk.clone(), Arc::clone(&ctx.metrics));
+            }
+        }
+    }
+
+    /// Шлёт поддельные Initial, потом всё из очереди потока по порядку.
+    /// Отдельным потоком: паузы между мусором остановили бы перехват всей
+    /// машины. Завершается, когда перехват закрывает очередь.
+    fn spawn_junk_sender(
+        handle: Arc<Handle>,
+        rx: std::sync::mpsc::Receiver<(Vec<u8>, Address)>,
+        junk: Socks5JunkParams,
+        metrics: Arc<Metrics>,
+    ) {
+        let _ = std::thread::Builder::new().name("quic-junk".into()).spawn(move || {
+            let Ok((first, addr)) = rx.recv() else { return };
+            if let Some(u) = quic::parse(&first) {
+                for i in 0..junk.count {
+                    let mut fake = quic::with_payload(&first, &u, &fragment::build_fake_quic_initial());
+                    let mut fake_addr = addr;
+                    handle.fix_checksums(&mut fake, &mut fake_addr);
+                    handle.send(&fake, &fake_addr);
+                    metrics.quic_initial_sent();
+                    // Пауза только между мусором, как в Linux: хвостовая
+                    // задерживала бы настоящий пакет ни за чем.
+                    if i + 1 < junk.count {
+                        let delay = random::in_range(junk.delay_min_ms, junk.delay_max_ms);
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                    }
+                }
+            }
+            handle.send(&first, &addr);
+            for (pkt, addr) in rx {
+                handle.send(&pkt, &addr);
+            }
+        });
+    }
 
     /// Какой процесс владеет TCP-сокетом с этим локальным адресом и портом.
     ///

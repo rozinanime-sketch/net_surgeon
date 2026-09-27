@@ -59,7 +59,8 @@ window and the proxy settings go back to what they were.
 > **Transparent mode** turns on by itself when the program runs as
 > administrator: the [WinDivert](https://reqrypt.org/windivert.html) driver
 > (included in the archive) sends the HTTPS of all programs, including the
-> Discord app and games, through the bypass.
+> Discord app and games, through the bypass, and QUIC too, which Chrome
+> uses for YouTube.
 > Without administrator rights only the system proxy works: the bypass
 > covers browsers and programs that use the Windows proxy settings. To set
 > the proxy yourself, put `system_proxy = false` in `config.toml`; to turn

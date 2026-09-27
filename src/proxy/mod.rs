@@ -191,6 +191,7 @@ pub async fn run_all(
                     domains,
                     config.bypass.clone(),
                     config.strategy_ttl_hours,
+                    config.socks5_junk.clone(),
                     log_tx,
                     metrics,
                     token,
