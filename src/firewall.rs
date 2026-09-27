@@ -57,13 +57,16 @@ pub struct Plan {
     pub dns_port: u16,
     /// Перехватывать ли QUIC (нужна маршрутная пара).
     pub quic: bool,
+    /// Перехватывать ли и UDP звонков (`session::CALL_PORTS` и сети
+    /// Telegram). Идёт той же дорогой, что QUIC, и без неё не включается.
+    pub calls: bool,
 }
 
 /// Команды для `nft`, по одной на строку: так их понимает и `nft -f`,
 /// и `nft -i`.
 pub fn ruleset(plan: &Plan) -> String {
     let t = format!("inet {TABLE}");
-    let Plan { gid, port, dns_port, quic } = *plan;
+    let Plan { gid, port, dns_port, quic, calls } = *plan;
     let mut s = String::new();
     let mut add = |line: String| {
         s.push_str(&line);
@@ -94,9 +97,36 @@ pub fn ruleset(plan: &Plan) -> String {
         add(format!("add chain {t} mark_out {{ type route hook output priority mangle; }}"));
         add(format!("add rule {t} mark_out meta skgid {gid} return"));
         add(format!("add rule {t} mark_out meta nfproto ipv4 udp dport 443 meta mark set {MARK:#x}"));
+        // Звонки — той же дорогой: прозрачный UDP-слушатель сам решит,
+        // слать ли мусор (session::is_call_flow). Тот же набор портов и
+        // сетей перехватывает WinDivert в Windows.
+        if calls {
+            let ports = crate::proxy::udp::session::CALL_PORTS
+                .iter()
+                .map(|(a, b)| format!("{a}-{b}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let local = crate::proxy::udp::session::LOCAL_NETS_V4
+                .iter()
+                .map(|(ip, bits)| format!("{}/{bits}", std::net::Ipv4Addr::from(*ip)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            add(format!(
+                "add rule {t} mark_out ip daddr != {{ {local} }} udp dport {{ {ports} }} meta mark set {MARK:#x}"
+            ));
+            let nets = crate::proxy::telegram::networks_v4()
+                .map(|(ip, bits)| format!("{ip}/{bits}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // DNS к ним не трогаем: он уже заворачивается в DoH-релей.
+            add(format!(
+                "add rule {t} mark_out ip daddr {{ {nets} }} udp dport != 53 meta mark set {MARK:#x}"
+            ));
+        }
         add(format!("add chain {t} tproxy_pre {{ type filter hook prerouting priority mangle; }}"));
+        // По метке, а не по порту: помечено ровно то, что выбрано выше.
         add(format!(
-            "add rule {t} tproxy_pre iifname \"lo\" meta nfproto ipv4 udp dport 443 \
+            "add rule {t} tproxy_pre iifname \"lo\" meta nfproto ipv4 meta l4proto udp \
              meta mark {MARK:#x} tproxy ip to 127.0.0.1:{port} accept"
         ));
     }
@@ -114,7 +144,7 @@ struct Held {
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
 /// Ставит перехват. Возвращает, что включено, для сообщения пользователю.
-pub fn install(port: u16, dns_port: u16) -> Result<String, String> {
+pub fn install(port: u16, dns_port: u16, calls: bool) -> Result<String, String> {
     if port == 0 {
         return Err(rust_i18n::t!("fw.no_port").into_owned());
     }
@@ -148,7 +178,7 @@ pub fn install(port: u16, dns_port: u16) -> Result<String, String> {
     }
 
     let routing = add_routing();
-    let plan = Plan { gid: egid, port, dns_port, quic: routing };
+    let plan = Plan { gid: egid, port, dns_port, quic: routing, calls };
     let rules = ruleset(&plan);
 
     // `nft -i` не сообщает об ошибках кодом выхода — он продолжает читать
@@ -193,12 +223,15 @@ pub fn install(port: u16, dns_port: u16) -> Result<String, String> {
         *h = Some(Held { child, stdin, routing });
     }
 
-    let mut what = vec!["TCP/443"];
+    let mut what = vec!["TCP/443".to_string()];
     if routing {
-        what.push("QUIC");
+        what.push("QUIC".into());
+        if calls {
+            what.push(rust_i18n::t!("fw.calls").into_owned());
+        }
     }
     if dns_port > 0 {
-        what.push("DNS");
+        what.push("DNS".into());
     }
     Ok(rust_i18n::t!("fw.installed", rules = what.join(", ")).into_owned())
 }
@@ -367,13 +400,16 @@ mod tests {
 
     #[test]
     fn full_ruleset() {
-        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 1053, quic: true });
+        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 1053, quic: true, calls: true });
         assert!(r.starts_with("add table inet net_surgeon { flags owner; }\n"));
         assert!(r.contains("nat_out meta skgid 951 return"));
         assert!(r.contains("tcp dport 443 redirect to :1083"));
         assert!(r.contains("udp dport 53 redirect to :1053"));
         assert!(r.contains("meta mark set 0x1"));
         assert!(r.contains("tproxy ip to 127.0.0.1:1083 accept"));
+        assert!(r.contains("udp dport { 3478-3481, 19302-19309, 50000-65535 } meta mark set 0x1"));
+        assert!(r.contains("ip daddr != { 127.0.0.0/8, "), "локальные адреса по портам звонков не трогаем");
+        assert!(r.contains("ip daddr { 149.154.160.0/20, "));
         // Исключение своей группы должно идти раньше перехвата в каждой цепочке.
         let skip = r.find("nat_out meta skgid").unwrap();
         assert!(skip < r.find("redirect to :1083").unwrap());
@@ -383,10 +419,11 @@ mod tests {
 
     #[test]
     fn without_dns_and_quic() {
-        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 0, quic: false });
+        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 0, quic: false, calls: true });
         assert!(!r.contains("dport 53"));
         assert!(!r.contains("tproxy"));
         assert!(!r.contains("mark_out"));
+        assert!(!r.contains("50000-65535"), "звонки идут дорогой QUIC и без неё не ставятся");
         assert!(r.contains("tcp dport 443 redirect to :1083"));
     }
 }

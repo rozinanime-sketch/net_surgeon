@@ -1,4 +1,4 @@
-//! Прозрачный режим для UDP — то есть для QUIC.
+//! Прозрачный режим для UDP — то есть для QUIC и звонков.
 //!
 //! # Зачем
 //!
@@ -420,8 +420,15 @@ async fn handle_datagram(
         Some(d) => needs_bypass(is_enabled, d, bypass_domains),
         None => false,
     };
+    // Звонок — мусор и без списка обхода, как в SOCKS5: DPI режет звонки
+    // по STUN, а у ретрансляторов голоса нет имени. Такие потоки сюда
+    // приводят правила для session::CALL_PORTS и сетей Telegram.
+    let call = !bypass
+        && is_enabled
+        && junk.calls
+        && session::is_call_flow(&payload, orig_dst.ip());
     let is_quic = session::is_quic_initial(&payload);
-    let junk_plan = bypass.then(|| (junk.clone(), is_quic));
+    let junk_plan = (bypass || call).then(|| (junk.clone(), is_quic));
 
     let Some(session) = open_session(client_addr, orig_dst, is_quic, junk_plan, log_tx, metrics, token).await else {
         return;
@@ -430,11 +437,17 @@ async fn handle_datagram(
     if is_quic {
         metrics.quic_session_opened();
     }
-    log_t(log_tx, LogLevel::Info, "log.tproxy_session", vec![
-        ("addr", orig_dst.to_string()),
-        ("domain", domain.unwrap_or_else(|| orig_dst.ip().to_string())),
-        ("bypass", bypass.to_string()),
-    ]);
+    // Кроме QUIC сюда приходит UDP на порты звонков, а на них сидят и игры.
+    // О каждой такой сессии без мусора писать незачем: лог утонул бы в них.
+    if call {
+        log_t(log_tx, LogLevel::Info, "log.call_junk", vec![("addr", orig_dst.to_string())]);
+    } else if bypass || orig_dst.port() == 443 {
+        log_t(log_tx, LogLevel::Info, "log.tproxy_session", vec![
+            ("addr", orig_dst.to_string()),
+            ("domain", domain.unwrap_or_else(|| orig_dst.ip().to_string())),
+            ("bypass", bypass.to_string()),
+        ]);
+    }
 
     // Первая датаграмма встаёт в очередь за мусором: задача отправки
     // сначала отработает мусор, потом её — цикл приёма не ждёт ни того,

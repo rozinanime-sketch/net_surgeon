@@ -63,7 +63,7 @@ async fn main() {
     #[cfg(target_os = "linux")]
     if std::env::args().any(|a| a == "--firewall") {
         let cfg = &startup.config;
-        match net_surgeon::firewall::install(cfg.transparent_port, cfg.udp_port) {
+        match net_surgeon::firewall::install(cfg.transparent_port, cfg.udp_port, cfg.enabled && cfg.socks5_junk.calls) {
             Ok(msg) => eprintln!("[{}] {}", glyph::OK, msg),
             Err(e) => {
                 eprintln!("[{}] {}", glyph::ERROR, tr("startup.transparent_failed", &[("error", e)]));

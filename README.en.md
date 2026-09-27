@@ -58,9 +58,9 @@ window and the proxy settings go back to what they were.
 
 > **Transparent mode** turns on by itself when the program runs as
 > administrator: the [WinDivert](https://reqrypt.org/windivert.html) driver
-> (included in the archive) sends the HTTPS of all programs, including the
-> Discord app and games, through the bypass, and QUIC too, which Chrome
-> uses for YouTube.
+> (included in the archive) sends the same traffic through the bypass as on
+> Linux: the HTTPS of all programs, including the Discord app, QUIC, which
+> Chrome uses for YouTube, calls (Discord, Telegram, WebRTC) and DNS.
 > Without administrator rights only the system proxy works: the bypass
 > covers browsers and programs that use the Windows proxy settings. To set
 > the proxy yourself, put `system_proxy = false` in `config.toml`; to turn
@@ -134,9 +134,11 @@ In `plain` mode, point your application at the proxy yourself:
 <details>
 <summary><b>Linux: how interception works and why the network shouldn't break</b></summary>
 
-HTTPS (TCP/443), QUIC (UDP/443) and DNS (UDP/53) are intercepted. The rules
-live in an nftables table owned by the program's process: the kernel deletes
-it as soon as the process exits, even after `kill -9` or a crash. That's why
+HTTPS (TCP/443), QUIC (UDP/443), DNS (UDP/53) and call UDP (Discord voice on
+ports 50000–65535, STUN, Telegram servers) are intercepted. Junk goes before
+a call, as in SOCKS5 mode; turn it off with `calls = false`. The rules live
+in an nftables table owned by the program's process: the kernel deletes it
+as soon as the process exits, even after `kill -9` or a crash. That's why
 sudo is needed only once after download or build — to grant the program
 `cap_net_admin` and the `nsproxy` group.
 

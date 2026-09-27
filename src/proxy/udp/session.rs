@@ -71,14 +71,58 @@ pub fn is_stun(payload: &[u8]) -> bool {
     length == payload.len() - 20 && length.is_multiple_of(4)
 }
 
-/// Похоже ли на поток звонка: STUN или UDP к сетям Telegram.
+/// Первый пакет голоса Discord: запрос IP discovery.
+///
+/// Discord не пользуется STUN. Свой внешний адрес клиент узнаёт у
+/// голосового сервера сам: 74 байта, тип 0x0001, длина 70, дальше SSRC,
+/// адрес и порт. По этому пакету голос Discord и отличается от прочего UDP
+/// на тех же портах.
+pub fn is_discord_ip_discovery(payload: &[u8]) -> bool {
+    payload.len() == 74 && payload[..4] == [0x00, 0x01, 0x00, 70]
+}
+
+/// Похоже ли на поток звонка: STUN, голос Discord или UDP к сетям Telegram.
 ///
 /// Звонки Telegram ходят и на его собственные серверы (ретрансляторы
 /// голоса), и напрямую между собеседниками. Первые узнаются по адресу,
 /// вторые — по STUN в первом пакете. Мусор перед ними — тот же приём,
 /// что `--dpi-desync=fake` с фильтром STUN у zapret.
 pub fn is_call_flow(payload: &[u8], dst: std::net::IpAddr) -> bool {
-    is_stun(payload) || crate::proxy::telegram::is_telegram_network(dst)
+    is_stun(payload) || is_discord_ip_discovery(payload) || crate::proxy::telegram::is_telegram_network(dst)
+}
+
+/// Порты назначения, на которых бывают звонки: STUN (стандартный и
+/// Google, через него идёт WebRTC) и голосовые серверы Discord.
+///
+/// По ним прозрачный режим решает, какой UDP вообще перехватывать, —
+/// одинаково в Linux (правила nftables) и в Windows (фильтр WinDivert).
+/// Весь UDP перехватывать незачем: игры и VPN шли бы через прокси без
+/// всякой пользы. Сети Telegram перехватываются по адресу, на любом порту.
+pub const CALL_PORTS: &[(u16, u16)] = &[(3478, 3481), (19302, 19309), (50000, 65535)];
+
+/// Адреса, UDP к которым по портам звонков не перехватывается: петля,
+/// домашняя сеть, мультикаст. На тех же портах там бывают локальные игры
+/// и службы, а DPI провайдера их всё равно не видит.
+pub const LOCAL_NETS_V4: &[([u8; 4], u8)] = &[
+    ([127, 0, 0, 0], 8),
+    ([10, 0, 0, 0], 8),
+    ([100, 64, 0, 0], 10),
+    ([169, 254, 0, 0], 16),
+    ([172, 16, 0, 0], 12),
+    ([192, 168, 0, 0], 16),
+    ([224, 0, 0, 0], 4),
+    ([255, 255, 255, 255], 32),
+];
+
+/// Один мусорный пакет: поддельный QUIC Initial, если поток — QUIC,
+/// иначе случайные байты. Поток случайных байт перед QUIC сам стал бы
+/// приметой.
+pub fn junk_packet(junk: &Socks5JunkParams, quic: bool) -> Vec<u8> {
+    if quic {
+        fragment::build_fake_quic_initial()
+    } else {
+        random::bytes(random::in_range_usize(junk.size_min, junk.size_max))
+    }
 }
 
 /// Запускает задачу отправки и возвращает очередь для датаграмм.
@@ -137,12 +181,10 @@ pub fn enqueue(sender: &mpsc::Sender<Vec<u8>>, payload: Vec<u8>) {
 
 async fn send_junk(upstream: &UdpSocket, junk: &Socks5JunkParams, quic: bool, metrics: &Metrics) {
     for i in 0..junk.count {
-        let packet = if quic {
+        if quic {
             metrics.quic_initial_sent();
-            fragment::build_fake_quic_initial()
-        } else {
-            random::bytes(random::in_range_usize(junk.size_min, junk.size_max))
-        };
+        }
+        let packet = junk_packet(junk, quic);
 
         let _ = upstream.send(&packet).await;
 
@@ -189,6 +231,20 @@ mod tests {
         quic[0] = 0xC0;
         assert!(!is_stun(&quic));
         assert!(!is_stun(&[0u8; 19]));
+    }
+
+    #[test]
+    fn discord_voice_is_recognised_by_ip_discovery() {
+        let mut discovery = vec![0x00, 0x01, 0x00, 70];
+        discovery.extend_from_slice(&[0u8; 70]);
+        let elsewhere: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        assert!(is_call_flow(&discovery, elsewhere));
+
+        // Ответ сервера (тип 0x0002) и пакет другой длины — не то.
+        let mut reply = discovery.clone();
+        reply[1] = 0x02;
+        assert!(!is_discord_ip_discovery(&reply));
+        assert!(!is_discord_ip_discovery(&discovery[..73]));
     }
 
     #[test]

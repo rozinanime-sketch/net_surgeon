@@ -71,6 +71,28 @@ fn on_http_listening(config: &Config, log_tx: &LogSender) {
     }
 }
 
+/// Куда перехват Windows отдаёт DNS-запросы: DoH-релей. `None` — DNS
+/// не перехватывается.
+///
+/// Только если релей знает адреса своих DoH-серверов заранее
+/// (`doh_bootstrap_ip`, `smart_dns_bootstrap_ip`). В Windows имена за всех
+/// разрешает системная служба DNS, и отличить её запросы, сделанные для
+/// самого релея, от чужих нельзя. Без заранее известного адреса релей
+/// спросил бы систему, система — перехват, перехват — релей, и DNS встал бы
+/// целиком. В Linux этот круг разрывает исключение группы прокси.
+fn dns_relay_for_divert(config: &Config) -> Option<std::net::SocketAddr> {
+    let independent = config.doh_bootstrap_ip.is_some()
+        && (config.smart_dns_provider.is_empty() || config.smart_dns_bootstrap_ip.is_some());
+    if config.udp_port == 0 || !independent {
+        return None;
+    }
+    let host = match config.listen_host.parse::<std::net::IpAddr>() {
+        Ok(ip) if !ip.is_unspecified() => ip,
+        _ => std::net::Ipv4Addr::LOCALHOST.into(),
+    };
+    Some(std::net::SocketAddr::new(host, config.udp_port))
+}
+
 pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn run_all(
@@ -192,6 +214,7 @@ pub async fn run_all(
                     config.bypass.clone(),
                     config.strategy_ttl_hours,
                     config.socks5_junk.clone(),
+                    dns_relay_for_divert(&config),
                     log_tx,
                     metrics,
                     token,

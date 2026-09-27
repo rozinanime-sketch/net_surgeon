@@ -1,27 +1,31 @@
-//! QUIC в прозрачном режиме Windows.
+//! UDP в прозрачном режиме Windows: QUIC, звонки и DNS.
 //!
 //! # Чем отличается от Linux
 //!
-//! В Linux датаграммы UDP/443 заворачиваются правилом TPROXY в прокси, и он
+//! В Linux датаграммы заворачиваются правилом TPROXY в прокси, и он
 //! пересылает их от своего имени, а мусор перед первым пакетом шлёт со
 //! своего сокета. Здесь перехват видит сами пакеты, поэтому прокси не
 //! нужен вовсе: датаграмма уходит от приложения как есть, а мусорные пакеты
 //! вставляются перед ней в тот же поток, с теми же адресами и портами.
 //!
-//! Решение то же, что в Linux, и принимается по адресу через кэш «адрес →
-//! домен»: имя в QUIC зашифровано. Кэш наполняет прозрачный TCP-режим по
-//! SNI, а браузер обычно сначала открывает сайт по TCP.
+//! Что перехватывается и что с этим делать — то же, что в Linux:
 //!
+//! * UDP/443 (QUIC) и UDP на порты звонков (`session::CALL_PORTS`, сети
+//!   Telegram) — см. [`filter`];
 //! * адрес трекера — датаграммы выбрасываются, браузер уходит на TCP, где
 //!   имя видно и соединение сбрасывается уже по SNI;
-//! * сайт из списка обхода и первый пакет — QUIC Initial — сначала мусор
-//!   (поддельные Initial), потом настоящий пакет;
+//! * сайт из списка обхода или звонок (`session::is_call_flow`) — перед
+//!   первым пакетом мусор, как в Linux;
 //! * всё остальное идёт без изменений.
+//!
+//! Имя сайта в QUIC зашифровано, поэтому решение принимается по адресу
+//! через кэш «адрес → домен». Его наполняют DNS (запросы тоже
+//! перехватываются, см. [`reply`]) и прозрачный TCP-режим по SNI.
 //!
 //! Мусор уходит с паузами, а цикл перехвата ждать не может: он держит весь
 //! трафик машины. Поэтому мусор и хвост потока, пришедший за это время,
 //! отправляет отдельный поток ([`Step::Junk`]), строго по порядку: иначе
-//! следующие датаграммы обогнали бы Initial.
+//! следующие датаграммы обогнали бы первый пакет.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -29,6 +33,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::nat::HTTPS_PORT;
+use crate::proxy::udp::session::{CALL_PORTS, LOCAL_NETS_V4};
 
 const IPPROTO_UDP: u8 = 17;
 
@@ -103,12 +108,73 @@ pub fn with_payload(template: &[u8], u: &Udp, payload: &[u8]) -> Vec<u8> {
     pkt
 }
 
-/// Что делать с датаграммами к этому адресу.
+/// Ответ на датаграмму `query`: адреса и порты переставлены, содержимое
+/// другое. Так перехват отвечает на DNS-запрос от имени сервера, к которому
+/// он шёл. Контрольные суммы пересчитывает вызывающий.
+pub fn reply(query: &[u8], u: &Udp, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = with_payload(query, u, payload);
+    let (a, b, n) = if u.ip_len == 40 { (8, 24, 16) } else { (12, 16, 4) };
+    for i in 0..n {
+        pkt.swap(a + i, b + i);
+    }
+    pkt[u.ip_len..u.ip_len + 2].copy_from_slice(&u.dport.to_be_bytes());
+    pkt[u.ip_len + 2..u.ip_len + 4].copy_from_slice(&u.sport.to_be_bytes());
+    pkt
+}
+
+/// Первый и последний адрес сети.
+fn range(base: Ipv4Addr, bits: u8) -> (Ipv4Addr, Ipv4Addr) {
+    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    let start = u32::from(base) & mask;
+    (Ipv4Addr::from(start), Ipv4Addr::from(start | !mask))
+}
+
+/// Часть фильтра WinDivert для UDP: что отдавать в [`Tracker`] и на DNS.
+///
+/// Тот же набор, что у правил nftables в Linux (`firewall::ruleset`):
+/// QUIC, DNS, порты звонков вне локальных сетей и сети Telegram. Звонки,
+/// как и в Linux, только по IPv4.
+pub fn filter(dns: bool, calls: bool) -> String {
+    let mut parts = vec![format!("udp.DstPort == {HTTPS_PORT}")];
+    if dns {
+        parts.push("udp.DstPort == 53".into());
+    }
+    if calls {
+        let local = LOCAL_NETS_V4
+            .iter()
+            .map(|(ip, bits)| {
+                let (a, b) = range(Ipv4Addr::from(*ip), *bits);
+                format!("!(ip.DstAddr >= {a} and ip.DstAddr <= {b})")
+            })
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let ports = CALL_PORTS
+            .iter()
+            .map(|(a, b)| format!("(udp.DstPort >= {a} and udp.DstPort <= {b})"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        parts.push(format!("(ip and {local} and ({ports}))"));
+
+        let telegram = crate::proxy::telegram::networks_v4()
+            .map(|(ip, bits)| {
+                let (a, b) = range(ip, bits);
+                format!("(ip.DstAddr >= {a} and ip.DstAddr <= {b})")
+            })
+            .collect::<Vec<_>>()
+            .join(" or ");
+        parts.push(format!("(ip and udp.DstPort != 53 and ({telegram}))"));
+    }
+    format!("(outbound and udp and ({}))", parts.join(" or "))
+}
+
+/// Что делать с новым потоком.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     Pass,
     Block,
-    Bypass,
+    /// Мусор перед первым пакетом. `quic` — поддельные Initial вместо
+    /// случайных байт.
+    Junk { quic: bool },
 }
 
 /// Что сделать с датаграммой.
@@ -119,7 +185,7 @@ pub enum Step<M> {
     Drop { first: bool },
     /// Новый поток с обходом. Датаграмма уже лежит в очереди: отправитель
     /// шлёт мусор, потом всё из очереди по порядку.
-    Junk(mpsc::Receiver<M>),
+    Junk { rx: mpsc::Receiver<M>, quic: bool },
     /// Датаграмма встала в очередь отправителя мусора.
     Queued,
 }
@@ -154,21 +220,19 @@ impl<M> Default for Tracker<M> {
 impl<M> Tracker<M> {
     /// Решает судьбу исходящей датаграммы.
     ///
-    /// `policy` спрашивается один раз на поток. `item` — то, что кладётся
-    /// в очередь отправителя мусора (пакет с метаданными перехвата).
-    /// Второе значение — изменение числа QUIC-сессий.
+    /// `policy` спрашивается один раз на поток, с заголовками и содержимым
+    /// первой датаграммы. `item` — то, что кладётся в очередь отправителя
+    /// мусора (пакет с метаданными перехвата). Второе значение — изменение
+    /// числа QUIC-сессий.
     pub fn process(
         &mut self,
         pkt: &[u8],
         now: Instant,
-        policy: impl FnOnce(IpAddr) -> Policy,
+        policy: impl FnOnce(&Udp, &[u8]) -> Policy,
         item: impl FnOnce() -> M,
     ) -> (Step<M>, QuicCount) {
         let closed = self.purge(now);
         let Some(u) = parse(pkt) else { return (Step::Pass, closed) };
-        if u.dport != HTTPS_PORT {
-            return (Step::Pass, closed);
-        }
         let payload = &pkt[u.ip_len + 8..];
         let key = Key { src: u.src, sport: u.sport, dst: u.dst };
 
@@ -191,20 +255,18 @@ impl<M> Tracker<M> {
 
         let is_quic = crate::proxy::udp::session::is_quic_initial(payload);
         let mut flow = Flow { last_seen: now, blocked: false, is_quic, queue: None };
-        let step = match policy(u.dst) {
+        let step = match policy(&u, payload) {
             Policy::Block => {
                 flow.blocked = true;
                 Step::Drop { first: true }
             }
-            // Мусор только перед Initial: посреди потока, начатого до
-            // перехвата, он ничего не обходит.
-            Policy::Bypass if is_quic => {
+            Policy::Junk { quic } => {
                 let (tx, rx) = mpsc::channel();
                 let _ = tx.send(item());
                 flow.queue = Some((tx, now + QUEUE_WINDOW));
-                Step::Junk(rx)
+                Step::Junk { rx, quic }
             }
-            _ => Step::Pass,
+            Policy::Pass => Step::Pass,
         };
         let opened = QuicCount { opened: usize::from(is_quic), ..closed };
         self.flows.insert(key, flow);
@@ -241,6 +303,11 @@ mod tests {
 
     const APP: [u8; 4] = [192, 168, 1, 10];
     const SERVER: [u8; 4] = [203, 0, 113, 5];
+
+    /// Как решал бы перехват: мусор перед QUIC.
+    fn bypass(_: &Udp, payload: &[u8]) -> Policy {
+        Policy::Junk { quic: crate::proxy::udp::session::is_quic_initial(payload) }
+    }
 
     fn v4(dport: u16, payload: &[u8]) -> Vec<u8> {
         let mut p = vec![0u8; 28];
@@ -280,16 +347,16 @@ mod tests {
         let mut t: Tracker<u32> = Tracker::default();
         let now = Instant::now();
 
-        let (step, count) = t.process(&v4(443, &initial()), now, |_| Policy::Bypass, || 1);
-        let Step::Junk(rx) = step else { panic!("ожидали мусор") };
+        let (step, count) = t.process(&v4(443, &initial()), now, bypass, || 1);
+        let Step::Junk { rx, quic: true } = step else { panic!("ожидали мусор") };
         assert_eq!(count.opened, 1);
 
-        let (step, _) = t.process(&v4(443, b"next"), now, |_| panic!(), || 2);
+        let (step, _) = t.process(&v4(443, b"next"), now, |_, _| panic!(), || 2);
         assert!(matches!(step, Step::Queued));
         assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![1, 2]);
 
         let later = now + QUEUE_WINDOW;
-        let (step, _) = t.process(&v4(443, b"late"), later, |_| panic!(), || 3);
+        let (step, _) = t.process(&v4(443, b"late"), later, |_, _| panic!(), || 3);
         assert!(matches!(step, Step::Pass));
         // Очередь закрыта: отправитель мусора завершится.
         assert!(rx.recv().is_err());
@@ -299,33 +366,56 @@ mod tests {
     fn tracker_flows_are_dropped_silently_after_the_first() {
         let mut t: Tracker<()> = Tracker::default();
         let now = Instant::now();
-        let (step, _) = t.process(&v4(443, &initial()), now, |_| Policy::Block, || ());
+        let (step, _) = t.process(&v4(443, &initial()), now, |_, _| Policy::Block, || ());
         assert!(matches!(step, Step::Drop { first: true }));
-        let (step, _) = t.process(&v4(443, &initial()), now, |_| panic!(), || ());
+        let (step, _) = t.process(&v4(443, &initial()), now, |_, _| panic!(), || ());
         assert!(matches!(step, Step::Drop { first: false }));
     }
 
-    /// Без Initial мусор бесполезен, а не-QUIC и другие порты не трогаются.
+    /// Мусор получает только новый поток: середина потока, который уже
+    /// шёл, идёт как есть.
     #[test]
-    fn only_initial_to_443_gets_junk() {
+    fn junk_only_for_the_first_datagram() {
         let mut t: Tracker<()> = Tracker::default();
         let now = Instant::now();
-        let (step, count) = t.process(&v4(443, b"short header"), now, |_| Policy::Bypass, || ());
-        assert!(matches!(step, Step::Pass));
-        assert_eq!(count.opened, 0);
+        let (step, count) = t.process(&v4(50007, b"stun"), now, |_, _| Policy::Junk { quic: false }, || ());
+        assert!(matches!(step, Step::Junk { quic: false, .. }));
+        assert_eq!(count.opened, 0, "не QUIC — не QUIC-сессия");
 
-        let (step, _) = t.process(&v4(53, &initial()), now, |_| panic!(), || ());
+        let (step, _) = t.process(&v4(50007, b"voice"), now + QUEUE_WINDOW, |_, _| panic!(), || ());
         assert!(matches!(step, Step::Pass));
+    }
+
+    #[test]
+    fn dns_reply_comes_from_the_server_asked() {
+        let query = v4(53, b"query");
+        let u = parse(&query).unwrap();
+        let answer = reply(&query, &u, b"a longer answer");
+        let r = parse(&answer).unwrap();
+        assert_eq!((r.src, r.sport, r.dst, r.dport), (u.dst, 53, u.src, u.sport));
+        assert_eq!(&answer[28..], b"a longer answer");
+        assert_eq!(u16::from_be_bytes([answer[2], answer[3]]) as usize, answer.len());
+    }
+
+    #[test]
+    fn filter_matches_linux_rules() {
+        assert_eq!(filter(false, false), "(outbound and udp and (udp.DstPort == 443))");
+        let f = filter(true, true);
+        assert!(f.contains("udp.DstPort == 53"));
+        assert!(f.contains("(udp.DstPort >= 50000 and udp.DstPort <= 65535)"));
+        assert!(f.contains("!(ip.DstAddr >= 192.168.0.0 and ip.DstAddr <= 192.168.255.255)"));
+        assert!(f.contains("(ip.DstAddr >= 149.154.160.0 and ip.DstAddr <= 149.154.175.255)"));
+        assert!(f.contains("!(ip.DstAddr >= 255.255.255.255 and ip.DstAddr <= 255.255.255.255)"));
     }
 
     #[test]
     fn idle_quic_sessions_are_counted_as_closed() {
         let mut t: Tracker<()> = Tracker::default();
         let start = Instant::now();
-        t.process(&v4(443, &initial()), start, |_| Policy::Pass, || ());
+        t.process(&v4(443, &initial()), start, |_, _| Policy::Pass, || ());
 
         let later = start + IDLE_TTL + PURGE_EVERY;
-        let (_, count) = t.process(&v4(53, b"x"), later, |_| panic!(), || ());
+        let (_, count) = t.process(&v4(50000, b"x"), later, |_, _| Policy::Pass, || ());
         assert_eq!(count.closed, 1);
     }
 }

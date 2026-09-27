@@ -89,6 +89,12 @@ pub fn is_telegram_network(ip: IpAddr) -> bool {
     })
 }
 
+/// Сети Telegram (IPv4) как «адрес, длина префикса» — для правил перехвата
+/// звонков в nftables и WinDivert.
+pub fn networks_v4() -> impl Iterator<Item = (std::net::Ipv4Addr, u8)> {
+    TELEGRAM_V4.iter().map(|(base, bits)| (std::net::Ipv4Addr::from(*base), *bits))
+}
+
 /// Адрес воркера, если ретранслятор включён.
 pub fn relay() -> Option<Arc<str>> {
     RELAY.read().ok()?.clone()
