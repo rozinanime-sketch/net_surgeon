@@ -5,10 +5,11 @@ use tokio_util::sync::CancellationToken;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::bypass::{extract_domain, matches_list, needs_bypass};
 use crate::dns::ip_cache::IpDomainCache;
-use crate::observability::logging::{LogSender, log_t, LogLevel};
+use crate::observability::logging::{LogSender, log_nested_t, log_t, LogLevel};
 use crate::config::BypassParams;
 use crate::observability::metrics::Metrics;
 use crate::engine::strategy::{apply::Applied, StrategyStore};
@@ -361,6 +362,7 @@ async fn handle_connect(
     // где первым говорит сервер (SSH, SMTP, IMAP, FTP), это взаимная блокировка:
     // клиент ждёт приветствие сервера, прокси — данные клиента, и оба висят.
     // Так же устроен HTTPS-туннель.
+    let opened = Instant::now();
     let to_server = async {
         let mut initial: Vec<u8> = pipelined;
         if initial.is_empty() {
@@ -368,7 +370,7 @@ async fn handle_connect(
             match cr.read(&mut initial_buf).await {
                 Ok(0) | Err(_) => {
                     let _ = sw.shutdown().await;
-                    return (crate::proxy::adaptive::Selected::DIRECT, requested_domain);
+                    return ClientSide::untouched(requested_domain);
                 }
                 Ok(n) => initial.extend_from_slice(&initial_buf[..n]),
             }
@@ -394,7 +396,7 @@ async fn handle_connect(
                 // Трекер по SNI. Серверу не ушло ни байта: закрываем его
                 // сторону, он закроет свою, и клиент получит конец потока.
                 let _ = sw.shutdown().await;
-                return (crate::proxy::adaptive::Selected::DIRECT, requested_domain);
+                return ClientSide::untouched(requested_domain);
             }
         };
         let wants_bypass = needs_bypass(is_enabled, &domain, bypass_domains);
@@ -427,47 +429,62 @@ async fn handle_connect(
                         ("detail", detail),
                     ]);
                 }
-                Err(_) => {
+                Err(e) => {
                     let _ = sw.shutdown().await;
-                    return (selected, domain);
+                    let end = End::new(Side::Server, &e);
+                    return ClientSide { selected, domain, bypass: wants_bypass, sent: 0, end: Some(end) };
                 }
             }
-        } else if sw.write_all(&initial).await.is_err() {
-            return (selected, domain);
+        } else if let Err(e) = sw.write_all(&initial).await {
+            let end = End::new(Side::Server, &e);
+            return ClientSide { selected, domain, bypass: wants_bypass, sent: 0, end: Some(end) };
         }
 
+        let mut sent = initial.len() as u64;
         let mut buf = [0u8; 8192];
-        loop {
+        let end = loop {
             match cr.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break End::fin(Side::Client),
+                Err(e) => break End::new(Side::Client, &e),
                 Ok(n) => {
                     metrics_c2s.add_rx(n as u64);
-                    if sw.write_all(&buf[..n]).await.is_err() {
-                        break;
+                    sent += n as u64;
+                    if let Err(e) = sw.write_all(&buf[..n]).await {
+                        break End::new(Side::Server, &e);
                     }
                 }
             }
-        }
+        };
         // Полузакрытие, а не обрыв: клиент договорил, но сервер ещё может
         // досылать ответ.
         let _ = sw.shutdown().await;
-        (selected, domain)
+        ClientSide { selected, domain, bypass: wants_bypass, sent, end: Some(end) }
     };
     let to_client = async {
         let mut buf = [0u8; 8192];
-        loop {
+        let mut received = 0u64;
+        let mut last_rx = None;
+        let end = loop {
             match sr.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break End::fin(Side::Server),
+                Err(e) => break End::new(Side::Server, &e),
                 Ok(n) => {
-                    responded_flag.store(true, Ordering::Relaxed);
+                    // По первому куску: alert о повреждённых данных — не ответ,
+                    // а провал стратегии (см. tls::is_corruption_alert).
+                    if received == 0 {
+                        responded_flag.store(crate::bypass::tls::server_accepted(&buf[..n]), Ordering::Relaxed);
+                    }
                     metrics_s2c.add_tx(n as u64);
-                    if cw.write_all(&buf[..n]).await.is_err() {
-                        break;
+                    received += n as u64;
+                    last_rx = Some(Instant::now());
+                    if let Err(e) = cw.write_all(&buf[..n]).await {
+                        break End::new(Side::Client, &e);
                     }
                 }
             }
-        }
+        };
         let _ = cw.shutdown().await;
+        (received, last_rx, end)
     };
 
     // join, а не select: select бросает вторую половину, как только закончилась
@@ -475,10 +492,95 @@ async fn handle_connect(
     // для HTTP-подобных протоколов), тем самым обрывал ещё идущий ответ сервера
     // на середине. HTTPS-туннель здесь всегда использовал join — SOCKS5-путь
     // расходился с ним без всякой причины.
-    let ((selected, domain), _) = tokio::join!(to_server, to_client);
+    let (client, (received, last_rx, server_end)) = tokio::join!(to_server, to_client);
 
     // Обратная связь по применённой стратегии — та же, что в HTTPS-туннеле.
-    crate::proxy::adaptive::record_outcome(&adaptive_ctx, &domain, selected, responded.load(Ordering::Relaxed));
+    crate::proxy::adaptive::record_outcome(&adaptive_ctx, &client.domain, client.selected, responded.load(Ordering::Relaxed));
+
+    // Итог соединения — только для доменов с обходом, иначе лог утонет.
+    // Без него обрыв после рукопожатия не виден: стратегия считается
+    // сработавшей, как только сервер ответил хоть чем-то, а блокировка,
+    // которая пропускает начало ответа и потом глушит поток, выглядит
+    // в логе как успех.
+    if client.bypass {
+        let first = client.end.into_iter().chain([server_end]).min_by_key(|e| e.at).expect("есть конец сервера");
+        let life = first.at.duration_since(opened);
+        let idle = first.at.duration_since(last_rx.unwrap_or(opened));
+        log_nested_t(log_tx, LogLevel::Info, "log.conn_closed", "end", first.key(), vec![
+            ("domain", client.domain),
+            ("life", format!("{:.1}", life.as_secs_f64())),
+            ("sent", client.sent.to_string()),
+            ("received", received.to_string()),
+            ("idle", format!("{:.1}", idle.as_secs_f64())),
+            ("detail", first.error.map(|e| format!(" ({e})")).unwrap_or_default()),
+        ]);
+    }
+}
+
+/// Что вернуло направление «клиент → сервер».
+struct ClientSide {
+    selected: crate::proxy::adaptive::Selected,
+    domain: String,
+    /// Включён ли обход — только такие соединения попадают в итог.
+    bypass: bool,
+    sent: u64,
+    /// `None` — до пересылки дело не дошло.
+    end: Option<End>,
+}
+
+impl ClientSide {
+    fn untouched(domain: String) -> Self {
+        ClientSide { selected: crate::proxy::adaptive::Selected::DIRECT, domain, bypass: false, sent: 0, end: None }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Client,
+    Server,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum How {
+    Fin,
+    Reset,
+    Error,
+}
+
+/// Чем и когда кончилось одно направление пересылки.
+#[derive(Debug)]
+struct End {
+    side: Side,
+    how: How,
+    error: Option<String>,
+    at: Instant,
+}
+
+impl End {
+    fn fin(side: Side) -> Self {
+        End { side, how: How::Fin, error: None, at: Instant::now() }
+    }
+
+    fn new(side: Side, e: &std::io::Error) -> Self {
+        // Сброс отдельно от прочих ошибок: RST посреди потока — почерк DPI,
+        // а сервер так закрывается редко.
+        let how = match e.kind() {
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => How::Reset,
+            _ => How::Error,
+        };
+        End { side, how, error: Some(e.to_string()), at: Instant::now() }
+    }
+
+    fn key(&self) -> &'static str {
+        match (self.side, self.how) {
+            (Side::Server, How::Fin) => "close.server_fin",
+            (Side::Server, How::Reset) => "close.server_rst",
+            (Side::Server, How::Error) => "close.server_error",
+            (Side::Client, How::Fin) => "close.client_fin",
+            (Side::Client, How::Reset) => "close.client_rst",
+            (Side::Client, How::Error) => "close.client_error",
+        }
+    }
 }
 
 /// Имя, по которому соединение получает решение об обходе и стратегию.
@@ -572,6 +674,16 @@ mod tests {
         let list: HashSet<String> = ["example.com".to_string()].into();
         let (log_tx, _rx) = crate::observability::logging::channel();
         connection_name(requested, first_packet, cache, &list, true, &log_tx)
+    }
+
+    #[test]
+    fn reset_is_told_apart_from_other_failures() {
+        use std::io::{Error, ErrorKind};
+        let rst = End::new(Side::Server, &Error::from(ErrorKind::ConnectionReset));
+        assert_eq!(rst.key(), "close.server_rst");
+        let other = End::new(Side::Server, &Error::from(ErrorKind::TimedOut));
+        assert_eq!(other.key(), "close.server_error");
+        assert_eq!(End::fin(Side::Client).key(), "close.client_fin");
     }
 
     #[test]

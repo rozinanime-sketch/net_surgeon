@@ -236,7 +236,7 @@ pub async fn handle_connect(
                 Ok(bytes_read) => {
                     if !first_byte_seen {
                         first_byte_seen = true;
-                        responded_s2c.store(true, Ordering::Relaxed);
+                        responded_s2c.store(crate::bypass::tls::server_accepted(&buffer[..bytes_read]), Ordering::Relaxed);
                         // TTFB: сервер реально ответил. Если DPI режет по SNI,
                         // сюда мы просто никогда не попадём — и замер не появится,
                         // что само по себе сигнал.

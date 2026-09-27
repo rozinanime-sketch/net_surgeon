@@ -273,6 +273,29 @@ async fn oob_byte_is_dropped_by_the_receiver() {
     );
 }
 
+/// Disorder и fake меняют TTL и нумерацию на живом сокете. На петле
+/// низкий TTL ничего не отсекает, зато видно главное: после всех
+/// манипуляций сервер получает ровно исходный ClientHello, без дыр и
+/// лишних байт. Fake без CAP_NET_ADMIN откатывается на обычный сплит,
+/// и этот откат тоже обязан доставить данные целыми.
+#[tokio::test]
+async fn ttl_techniques_deliver_the_exact_bytes() {
+    for strategy in [Strategy::Disorder, Strategy::Fake] {
+        let hello = client_hello("ttl.example");
+        let (port, collector) = spawn_collector().await;
+
+        let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+        let fd = crate::bypass::socket::raw_sock(&upstream);
+        first_packet(&mut upstream, fd, &hello, strategy, &test_bypass_params())
+            .await
+            .expect("отправка");
+        drop(upstream);
+
+        let received = collector.await.expect("collector");
+        assert_eq!(received, hello, "{strategy:?}: поток на приёме совпадает с исходным");
+    }
+}
+
 /// Мусор перед UDP-потоком — только для доменов из списка обхода.
 ///
 /// Раньше его получал каждый поток, и на Android первая датаграмма любого

@@ -29,6 +29,10 @@ pub enum ProbeOutcome {
     /// сервера, выглядел как «прямое соединение работает» — обход домену
     /// выключался на сутки.
     Injected,
+    /// Сервер ответил TLS-ошибкой о повреждённых данных: ClientHello дошёл,
+    /// но испорченным. Техника ломает поток по пути, и в бою соединение
+    /// оборвётся, хотя сервер «ответил».
+    Mangled,
     /// Ответ на QUIC Version Negotiation получен: UDP/443 доходит до сервера.
     ///
     /// Отдельно от `Success`, потому что это принципиально более слабое
@@ -52,6 +56,7 @@ impl ProbeOutcome {
             ProbeOutcome::ClosedAfterHello => "verdict.closed_after_hello",
             ProbeOutcome::Success => "verdict.success",
             ProbeOutcome::Injected => "verdict.injected",
+            ProbeOutcome::Mangled => "verdict.mangled",
             ProbeOutcome::NotApplicable => "verdict.not_applicable",
         }
     }
@@ -296,8 +301,13 @@ fn classify_write_error(_e: &std::io::Error) -> ProbeOutcome { ProbeOutcome::Res
 /// сервер вправе ответить отказом (не тот набор шифров, неизвестное имя), и
 /// это всё равно доказывает, что проба до него дошла — а только это
 /// диагностика и выясняет.
+///
+/// Кроме alert о повреждённых данных: он значит, что до сервера дошло не то,
+/// что отправлено (см. [`crate::bypass::tls::is_corruption_alert`]).
 fn classify_reply(reply: &[u8]) -> ProbeOutcome {
-    if crate::bypass::tls::looks_like_tls_reply(reply) {
+    if crate::bypass::tls::is_corruption_alert(reply) {
+        ProbeOutcome::Mangled
+    } else if crate::bypass::tls::looks_like_tls_reply(reply) {
         ProbeOutcome::Success
     } else {
         ProbeOutcome::Injected
@@ -744,6 +754,13 @@ mod tests {
     async fn tls_reply_counts_as_success() {
         assert_eq!(probe(&[0x16, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00], FragStrategy::None).await, ProbeOutcome::Success);
         assert_eq!(probe(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28], FragStrategy::TlsRecord).await, ProbeOutcome::Success);
+    }
+
+    /// Так Cloudflare отвечает на ClientHello, в который попал OOB-байт
+    /// (проверено на discord.com): fatal decode_error.
+    #[tokio::test]
+    async fn corruption_alert_is_not_success() {
+        assert_eq!(probe(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32], FragStrategy::None).await, ProbeOutcome::Mangled);
     }
 
     #[tokio::test]

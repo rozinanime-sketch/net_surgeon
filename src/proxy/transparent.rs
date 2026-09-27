@@ -412,7 +412,7 @@ async fn handle(
                 Ok(len) => {
                     if first {
                         first = false;
-                        responded_flag.store(true, Ordering::Relaxed);
+                        responded_flag.store(crate::bypass::tls::server_accepted(&buf[..len]), Ordering::Relaxed);
                         metrics_s2c.record_ttfb_ms(started.elapsed().as_secs_f64() * 1000.0);
                     }
                     metrics_s2c.add_tx(len as u64);

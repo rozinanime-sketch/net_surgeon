@@ -70,6 +70,36 @@ pub fn looks_like_tls_reply(data: &[u8]) -> bool {
     matches!(data, [HANDSHAKE | ALERT] | [HANDSHAKE | ALERT, 0x03, ..])
 }
 
+/// Жалуется ли сервер на испорченные байты: TLS-alert с кодом, который
+/// означает «пришло не то, что было отправлено», а не «не договорились».
+///
+/// Отдельно от [`looks_like_tls_reply`], потому что любой alert доказывает
+/// лишь, что сервер что-то получил. Техника, которая по пути портит поток,
+/// тоже получает alert: OOB-байт, у которого оборудование оператора срезало
+/// флаг URG, приходит серверу внутрь ClientHello, и Cloudflare отвечает
+/// decode_error. Считать такое успехом нельзя — браузер получает обрыв.
+///
+/// Отказ по существу (handshake_failure, protocol_version, unrecognized_name)
+/// сюда не входит: на синтетический ClientHello сервер вправе так ответить.
+pub fn is_corruption_alert(data: &[u8]) -> bool {
+    const ALERT: u8 = 0x15;
+    const UNEXPECTED_MESSAGE: u8 = 10;
+    const BAD_RECORD_MAC: u8 = 20;
+    const RECORD_OVERFLOW: u8 = 22;
+    const ILLEGAL_PARAMETER: u8 = 47;
+    const DECODE_ERROR: u8 = 50;
+    matches!(
+        data,
+        [ALERT, 0x03, _, _, _, _, UNEXPECTED_MESSAGE | BAD_RECORD_MAC | RECORD_OVERFLOW | ILLEGAL_PARAMETER | DECODE_ERROR, ..]
+    )
+}
+
+/// Принял ли сервер отправленное: первые байты его ответа не жалоба на
+/// испорченный поток. Для обратной связи по стратегии в бою.
+pub fn server_accepted(first_reply: &[u8]) -> bool {
+    !is_corruption_alert(first_reply)
+}
+
 /// Похоже ли начало буфера на TLS handshake. Отличается от [`record_len`]
 /// тем, что отвечает и на неполном заголовке: первого байта достаточно.
 pub fn looks_like_handshake(data: &[u8]) -> bool {

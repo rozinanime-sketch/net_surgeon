@@ -406,13 +406,18 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
     if call {
         log_t(&ctx.log_tx, LogLevel::Info, "log.call_junk", vec![("addr", dst_addr.to_string())]);
     }
+    // С именем: по одному адресу не понять, почему поток получил мусор.
+    let target = match &domain {
+        Some(d) => format!("{d} ({dst_addr})"),
+        None => dst_addr.to_string(),
+    };
     if bypass {
-        // С именем: по одному адресу не понять, почему поток получил мусор.
-        let target = match &domain {
-            Some(d) => format!("{d} ({dst_addr})"),
-            None => dst_addr.to_string(),
-        };
         log_t(&ctx.log_tx, LogLevel::Warning, "log.socks5_udp_junk", vec![("addr", target)]);
+    } else if is_quic && !call {
+        // QUIC без обхода тоже в лог, по одной строке на поток: иначе не
+        // видно, что браузер ушёл на HTTP/3 к сайту, чьё имя прокси не
+        // опознал, и обход к нему просто не применялся.
+        log_t(&ctx.log_tx, LogLevel::Info, "log.socks5_quic", vec![("addr", target)]);
     }
     if is_quic {
         ctx.metrics.quic_session_opened();
