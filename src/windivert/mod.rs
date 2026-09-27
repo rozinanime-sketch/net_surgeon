@@ -9,10 +9,17 @@
 //!
 //! WinDivert — подписанный драйвер, который отдаёт пакеты в программу и
 //! принимает их обратно. На нём же работают GoodbyeDPI и zapret (winws).
-//! TCP он не обходит сам, а только разворачивает соединения на 443 в тот
-//! же прозрачный слушатель, что и в Linux ([`nat`]). Выбор стратегии, SNI,
-//! запасные адреса — всё общее. UDP (QUIC, звонки, DNS) обрабатывается
-//! прямо на пакетах ([`udp`]): прокси для него не нужен.
+//!
+//! Как и они, TCP обходится прямо на пакетах ([`tcp`], [`desync`]): через
+//! программу идёт только начало ClientHello и первый ответ сервера, а всё
+//! остальное соединение остаётся в ядре. Раньше каждое соединение на 443
+//! разворачивалось на прозрачный слушатель целиком, как в примере
+//! streamdump, и через программу шёл каждый пакет в обе стороны. Под
+//! нагрузкой пакеты стояли в очереди драйвера (до 2 с по умолчанию), и
+//! пинг рос в разы. Разворот ([`nat`]) остался только для Telegram, когда
+//! задан ретранслятор: его трафик уходит в воркер, а не к серверу.
+//!
+//! UDP (QUIC, звонки, DNS) обрабатывается на пакетах ([`udp`]).
 //!
 //! # Условия
 //!
@@ -26,7 +33,9 @@
 
 #[cfg(windows)]
 mod ffi;
+pub mod desync;
 pub mod nat;
+pub mod tcp;
 pub mod udp;
 
 #[cfg(windows)]
@@ -40,6 +49,10 @@ mod imp {
 
     use super::ffi::{self, Address, Handle};
     use super::nat::{Nat, Verdict, HTTPS_PORT};
+    use super::tcp::{Engine, Env, Outbound};
+    use crate::config::BypassParams;
+    use crate::engine::strategy::StrategyStore;
+    use crate::proxy::adaptive::{self, Selected};
     use super::udp::{self, Policy, Step, Tracker};
     use crate::bypass::{needs_bypass, random};
     use crate::config::Socks5JunkParams;
@@ -80,6 +93,13 @@ mod imp {
         }
     }
 
+    /// Что нужно перехвату TCP: выбирать стратегию и засчитывать её исход.
+    pub struct TcpContext {
+        pub strategies: Arc<StrategyStore>,
+        pub bypass_params: BypassParams,
+        pub ttl_hours: u64,
+    }
+
     /// Куда шло перехваченное соединение.
     ///
     /// Слушатель видит сервер клиентом: развёрнутый пакет приходит от его
@@ -94,12 +114,7 @@ mod imp {
     /// Работающий перехват. Останавливается при уничтожении.
     ///
     /// TCP и UDP перехватываются разными дескрипторами, каждый в своём
-    /// потоке. С одним общим голос звонка стоял в очереди за пакетами
-    /// всех HTTPS-соединений машины: их поток разворачивает на слушатель
-    /// по одному, а на каждом SYN ещё и перебирает таблицу соединений
-    /// системы (`owner_pid`). Под загрузкой это давало звонку лишние
-    /// десятки миллисекунд, а в Linux ничего подобного нет: там TCP
-    /// разворачивает ядро.
+    /// потоке: пакеты звонка не должны ждать в одной очереди с ClientHello.
     pub struct Diverter {
         handles: Vec<Arc<Handle>>,
         threads: Vec<std::thread::JoinHandle<()>>,
@@ -110,15 +125,13 @@ mod imp {
         /// Включает перехват на слушатель `port`. Слушатель к этому моменту
         /// уже должен быть поднят: иначе первые перехваченные соединения
         /// получили бы отказ.
-        pub fn start(port: u16, ctx: UdpContext, log_tx: &LogSender) -> Result<Diverter, String> {
-            // Своё: исходящие TCP на 443 и ответы слушателя, исходящий UDP
-            // (см. udp::filter). Чужое: входящие на порт слушателя из сети,
-            // их выбрасываем. Петля не нужна: на 127.0.0.1 никто ничего не
-            // обходит, а свои запросы к DoH-релею иначе поймались бы снова.
-            let tcp_filter = format!(
-                "!loopback and tcp and ((outbound and (tcp.DstPort == {HTTPS_PORT} or tcp.SrcPort == {port})) \
-                 or (inbound and tcp.DstPort == {port}))"
-            );
+        pub fn start(port: u16, tcp_ctx: TcpContext, ctx: UdpContext, log_tx: &LogSender) -> Result<Diverter, String> {
+            // Что попадает в программу, см. tcp::filter и udp::filter. Петля
+            // не нужна: на 127.0.0.1 никто ничего не обходит, а свои запросы
+            // к DoH-релею иначе поймались бы снова.
+            let telegram: Option<Vec<_>> = crate::proxy::telegram::relay()
+                .map(|_| crate::proxy::telegram::networks_v4().collect());
+            let tcp_filter = super::tcp::filter(port, telegram.as_deref());
             let udp_filter = format!("!loopback and {}", udp::filter(ctx.dns_relay.is_some(), ctx.calls()));
             // Оба открываются до запуска потоков: не открылся второй — первый
             // закроется вместе с Arc, и перехват не останется наполовину.
@@ -128,11 +141,25 @@ mod imp {
 
             // Не запустился второй поток — Drop остановит первый.
             let mut diverter = Diverter { handles: vec![Arc::clone(&tcp), Arc::clone(&udp)], threads: Vec::new(), port };
+            // До запуска потоков: соединения прокси и пробы диагностики
+            // должны помечаться с первого же ClientHello.
+            crate::bypass::packet_mode::set_active(true);
+            let env = WinEnv {
+                tcp: tcp_ctx,
+                policy: ctx.policy.clone(),
+                log_tx: log_tx.clone(),
+            };
+            let runtime = ctx.runtime.clone();
             let log = log_tx.clone();
             diverter.threads.push(
                 std::thread::Builder::new()
                     .name("windivert-tcp".into())
-                    .spawn(move || run_tcp(&tcp, port, &log))
+                    .spawn(move || {
+                        // Выбор стратегии запускает диагностику и пишет файл
+                        // стратегий — это задачи рантайма tokio.
+                        let _rt = runtime.enter();
+                        run_tcp(&tcp, port, &env, &log)
+                    })
                     .map_err(|e| e.to_string())?,
             );
             let log = log_tx.clone();
@@ -148,6 +175,7 @@ mod imp {
 
     impl Drop for Diverter {
         fn drop(&mut self) {
+            crate::bypass::packet_mode::set_active(false);
             for h in &self.handles {
                 h.shutdown();
             }
@@ -206,13 +234,52 @@ mod imp {
         });
     }
 
-    fn run_tcp(handle: &Arc<Handle>, port: u16, log_tx: &LogSender) {
+    fn run_tcp(handle: &Arc<Handle>, port: u16, env: &WinEnv, log_tx: &LogSender) {
         let mut nat = Nat::new(port);
+        let mut engine = Engine::new();
         let me = std::process::id();
         let mut warned = false;
 
         recv_loop(handle, log_tx, |pkt, mut addr| {
-            let verdict = nat.process(pkt, addr.outbound(), Instant::now(), |ip, port| {
+            let Some(t) = super::desync::parse(pkt) else {
+                handle.send(pkt, &addr);
+                return;
+            };
+            let outbound = addr.outbound();
+            let now = Instant::now();
+
+            // Разворот на слушатель: Telegram (фильтр пропускает его, только
+            // когда задан ретранслятор), ответы слушателя и входящие на его
+            // порт снаружи — их Nat выбрасывает.
+            let to_listener = if outbound {
+                t.sport == port
+                    || (t.dport == HTTPS_PORT && crate::proxy::telegram::is_telegram(t.dst, t.dport))
+            } else {
+                t.dport == port
+            };
+            if !to_listener {
+                if outbound {
+                    match engine.outbound(pkt, now, env) {
+                        Outbound::Send(packets) => {
+                            for mut p in packets {
+                                handle.fix_checksums(&mut p, &mut addr);
+                                handle.send(&p, &addr);
+                            }
+                        }
+                        Outbound::Reset(mut rst) => {
+                            addr.set_outbound(false);
+                            handle.fix_checksums(&mut rst, &mut addr);
+                            handle.send(&rst, &addr);
+                        }
+                    }
+                } else {
+                    engine.inbound(pkt, now, env);
+                    handle.send(pkt, &addr);
+                }
+                return;
+            }
+
+            let verdict = nat.process(pkt, outbound, now, |ip, port| {
                 owner_pid(ip, port).is_some_and(|pid| pid != me)
             });
             match verdict {
@@ -242,6 +309,70 @@ mod imp {
 
     /// Сколько ошибок приёма подряд терпеть, прежде чем выключить перехват.
     const MAX_RECV_ERRORS: u32 = 100;
+
+    /// Остальная программа для перехвата TCP.
+    struct WinEnv {
+        tcp: TcpContext,
+        policy: UdpPolicy,
+        log_tx: LogSender,
+    }
+
+    impl WinEnv {
+        fn adaptive(&self) -> adaptive::Context<'_> {
+            adaptive::Context {
+                strategies: &self.tcp.strategies,
+                bypass_params: &self.tcp.bypass_params,
+                ttl_hours: self.tcp.ttl_hours,
+                log_tx: &self.log_tx,
+            }
+        }
+    }
+
+    impl Env for WinEnv {
+        fn take_mark(&self, local_port: u16) -> Option<crate::bypass::packet_mode::Mark> {
+            crate::bypass::packet_mode::take(local_port)
+        }
+        fn is_blocked(&self, domain: &str) -> bool {
+            crate::block::is_blocked(domain)
+        }
+        fn needs_bypass(&self, domain: &str) -> bool {
+            needs_bypass(self.policy.is_enabled, domain, &self.policy.bypass_domains)
+        }
+        fn select(&self, domain: &str, hello_len: usize) -> Selected {
+            adaptive::select_packet(&self.adaptive(), domain, hello_len)
+        }
+        fn record(&self, domain: &str, selected: Selected, responded: bool) {
+            adaptive::record_outcome(&self.adaptive(), domain, selected, responded);
+        }
+        fn remember(&self, ip: IpAddr, domain: &str) {
+            self.policy.ip_cache.insert(ip, domain.to_string());
+        }
+        fn lookup(&self, ip: IpAddr) -> Option<String> {
+            self.policy.ip_cache.lookup(&ip)
+        }
+        fn decoy(&self, len: usize) -> Vec<u8> {
+            crate::bypass::tls::build_client_hello_sized(&self.tcp.bypass_params.fake_sni, len)
+        }
+        fn log_intercepted(&self, domain: &str, dst: IpAddr, bypass: bool) {
+            log_t(&self.log_tx, LogLevel::Success, "log.transparent_tunnel", vec![
+                ("domain", domain.to_string()),
+                ("addr", SocketAddr::new(dst, HTTPS_PORT).to_string()),
+                ("bypass", bypass.to_string()),
+            ]);
+        }
+        fn log_applied(&self, domain: &str, detail: &str) {
+            log_t(&self.log_tx, LogLevel::Warning, "log.transparent_applied", vec![
+                ("domain", domain.to_string()),
+                ("detail", detail.to_string()),
+            ]);
+        }
+        fn log_blocked(&self, domain: &str) {
+            log_t(&self.log_tx, LogLevel::Info, "log.blocked", vec![
+                ("domain", domain.to_string()),
+                ("via", "SNI".to_string()),
+            ]);
+        }
+    }
 
     fn on_udp(
         handle: &Arc<Handle>,

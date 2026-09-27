@@ -270,6 +270,12 @@ pub async fn connect(target: &str) -> std::io::Result<TcpStream> {
 /// Для прозрачного режима, где адрес уже известен из conntrack.
 pub async fn connect_addr(addr: SocketAddr) -> std::io::Result<TcpStream> {
     match tokio::time::timeout(PER_ADDRESS_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        // Все подключения прокси проходят здесь. Метка — чтобы перехват
+        // пакетов в Windows не обходил их второй раз (см. packet_mode).
+        Ok(Ok(stream)) => {
+            crate::bypass::packet_mode::mark(&stream, crate::bypass::packet_mode::Mark::Own);
+            Ok(stream)
+        }
         Ok(result) => result,
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,

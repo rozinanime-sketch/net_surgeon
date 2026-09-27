@@ -114,6 +114,25 @@ pub fn looks_like_handshake(data: &[u8]) -> bool {
 /// Ищет SNI в TLS ClientHello. Возвращает None, если это не ClientHello,
 /// буфер обрезан или расширения SNI нет (например, подключение по IP).
 pub fn find_sni(data: &[u8]) -> Option<SniLocation> {
+    find_sni_in(data, false)
+}
+
+/// То же, что [`find_sni`], но для начала ClientHello: буфер может
+/// обрываться, лишь бы имя целиком было внутри.
+///
+/// Для перехвата пакетов в Windows: ClientHello браузера (около 1800 байт
+/// с постквантовым ключом) в один TCP-сегмент не помещается, а перехват
+/// видит только первый.
+pub fn find_sni_prefix(data: &[u8]) -> Option<SniLocation> {
+    find_sni_in(data, true)
+}
+
+/// Имя домена из SNI в начале ClientHello — см. [`find_sni_prefix`].
+pub fn sni_host_prefix(data: &[u8]) -> Option<String> {
+    host_at(data, find_sni_prefix(data)?)
+}
+
+fn find_sni_in(data: &[u8], truncated_ok: bool) -> Option<SniLocation> {
     // Заголовок записи: тип 0x16 (handshake), версия 0x03xx
     if data.len() < 5 || data[0] != 0x16 || data[1] != 0x03 {
         return None;
@@ -140,9 +159,12 @@ pub fn find_sni(data: &[u8]) -> Option<SniLocation> {
 
     let extensions_len = u16_at(data, pos)?;
     pos += 2;
-    let extensions_end = pos.checked_add(extensions_len)?;
+    let mut extensions_end = pos.checked_add(extensions_len)?;
     if extensions_end > data.len() {
-        return None;
+        if !truncated_ok {
+            return None;
+        }
+        extensions_end = data.len();
     }
 
     while pos + 4 <= extensions_end {
@@ -181,7 +203,10 @@ pub fn find_sni(data: &[u8]) -> Option<SniLocation> {
 /// Нужна там, где имя больше взять неоткуда: в прозрачном режиме и в
 /// SOCKS5, когда клиент прислал голый IP.
 pub fn sni_host(data: &[u8]) -> Option<String> {
-    let loc = find_sni(data)?;
+    host_at(data, find_sni(data)?)
+}
+
+fn host_at(data: &[u8], loc: SniLocation) -> Option<String> {
     let host = std::str::from_utf8(&data[loc.offset..loc.offset + loc.len]).ok()?;
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     (!host.is_empty()).then_some(host)

@@ -1,4 +1,4 @@
-mod adaptive;
+pub mod adaptive;
 mod tcp;
 mod handshake;
 mod http;

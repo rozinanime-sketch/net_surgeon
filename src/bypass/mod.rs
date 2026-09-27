@@ -1,4 +1,5 @@
 pub mod fragment;
+pub mod packet_mode;
 pub mod random;
 pub mod socket;
 pub mod tls;

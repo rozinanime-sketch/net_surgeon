@@ -4,6 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::BypassParams;
 use crate::bypass::fragment;
+use crate::engine::strategy::Strategy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
@@ -83,6 +84,20 @@ pub enum FragStrategy {
     /// Перестроение ClientHello в две TLS-записи. Единственная техника здесь,
     /// которая работает против DPI, пересобирающего TCP-поток.
     TlsRecord,
+}
+
+impl FragStrategy {
+    /// Та же техника в терминах боевой стратегии.
+    pub fn as_strategy(self) -> Strategy {
+        match self {
+            FragStrategy::None => Strategy::None,
+            FragStrategy::SniSplit => Strategy::SniSplit,
+            FragStrategy::Disorder => Strategy::Disorder,
+            FragStrategy::Oob => Strategy::Oob,
+            FragStrategy::Fake => Strategy::Fake,
+            FragStrategy::TlsRecord => Strategy::TlsRecord,
+        }
+    }
 }
 
 /// Сколько раз проверять каждую позицию. Сеть шумит (потери, таймауты,
@@ -391,11 +406,22 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
     // с сокетом напрямую (setsockopt/MSG_OOB), а половины его не отдают.
     let fd = crate::bypass::socket::raw_sock(&stream);
 
+    // Под перехватом пакетов (Windows) техника применяется к пакетам, а не
+    // к сокету: проба помечает соединение и отдаёт ClientHello целиком, а
+    // перехват режет его так же, как в бою. Иначе мерилось бы не то, что
+    // потом применяется. Метка нужна и прямой пробе: без неё перехват
+    // принял бы пробу за чужое соединение и применил сохранённую стратегию.
+    let packet_mode = crate::bypass::packet_mode::is_active();
+    if packet_mode {
+        crate::bypass::packet_mode::mark(&stream, crate::bypass::packet_mode::Mark::Probe(strategy.as_strategy()));
+    }
+
     let (mut reader, mut writer) = stream.into_split();
 
     // Каждая стратегия возвращает своё (SplitInfo / число чанков / ()) — здесь важен
     // только факт успеха записи, поэтому приводим всё к io::Result<()>.
     let write_result: std::io::Result<()> = match strategy {
+        _ if packet_mode => writer.write_all(hello).await,
         FragStrategy::None => writer.write_all(hello).await,
         FragStrategy::SniSplit => fragment::split_at_sni(&mut writer, hello, bypass_params.split_delay_ms).await.map(|_| ()),
         FragStrategy::TlsRecord => fragment::tls_record_split(&mut writer, hello, bypass_params.split_delay_ms).await.map(|_| ()),
@@ -626,9 +652,14 @@ async fn diagnose_with(
         };
     }
 
+    // Под перехватом пакетов (Windows) меряются только техники, которые он
+    // умеет применить: две TLS-записи и OOB меняют число байт в потоке, а
+    // disorder и fake там работают без низкого TTL и прав на ремонт TCP.
+    let packet_mode = crate::bypass::packet_mode::is_active();
+
     // Ступень 1: две TLS-записи — единственная техника, которой не мешает
     // пересборка TCP-потока, поэтому пробуется первой.
-    let tls_record = trials(&target, domain, FragStrategy::TlsRecord, bypass_params, trials_count, early_abandon, timing).await;
+    let tls_record = if packet_mode { empty } else { trials(&target, domain, FragStrategy::TlsRecord, bypass_params, trials_count, early_abandon, timing).await };
     if early_abandon && tls_record.is_convincing() {
         return DiagnosticResult {
             direct,
@@ -658,7 +689,7 @@ async fn diagnose_with(
     // Ступень 3: OOB-байт. Дешёвый — не платит задержку ретрансмита.
     // На платформах без MSG_OOB и управления TTL пробу не гоняем: она бы
     // просто откатилась на обычный сплит и дала бессмысленный результат.
-    let oob = if crate::bypass::socket::supports_ttl_tricks() {
+    let oob = if !packet_mode && crate::bypass::socket::supports_ttl_tricks() {
         trials(&target, domain, FragStrategy::Oob, bypass_params, trials_count, early_abandon, timing).await
     } else {
         empty
@@ -692,7 +723,7 @@ async fn diagnose_with(
     // обе бесполезны, — факт про эту сеть, а не про технику.
     // Ступень 5: disorder — последним, потому что работает через ретрансмит
     // и добавляет сотни миллисекунд к каждому соединению.
-    let disorder = if crate::bypass::socket::supports_ttl_tricks() {
+    let disorder = if packet_mode || crate::bypass::socket::supports_ttl_tricks() {
         trials(&target, domain, FragStrategy::Disorder, bypass_params, trials_count, early_abandon, timing).await
     } else {
         empty
@@ -701,7 +732,7 @@ async fn diagnose_with(
     // Ступень 6: fake. Последняя и единственная привилегированная — пробуем
     // только когда режим ремонта TCP реально доступен, иначе техника молча
     // откатилась бы на обычный сплит и мы бы измерили не её.
-    let fake = if crate::bypass::socket::fake_supported() && crate::bypass::socket::tcp_repair_available() {
+    let fake = if packet_mode || (crate::bypass::socket::fake_supported() && crate::bypass::socket::tcp_repair_available()) {
         trials(&target, domain, FragStrategy::Fake, bypass_params, trials_count, early_abandon, timing).await
     } else {
         empty

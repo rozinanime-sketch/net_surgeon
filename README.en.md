@@ -66,6 +66,13 @@ window and the proxy settings go back to what they were.
 > the proxy yourself, put `system_proxy = false` in `config.toml`; to turn
 > interception off, put `transparent_port = 0`.
 >
+> Like zapret, the program sees only the start of each HTTPS connection and
+> the server's first reply; the rest of the traffic bypasses it, so the
+> interception does not raise ping. Because of that, transparent mode lacks
+> the two techniques that change the number of bytes in the stream (TLS
+> records and OOB); instead it has the decoy (fake), which is unavailable
+> without administrator rights.
+>
 > An antivirus may complain about WinDivert: it is a packet interception
 > driver, the same one GoodbyeDPI and zapret use.
 
@@ -102,7 +109,7 @@ also add a site from the program itself, in the “Domains” menu.
 | Problem | What to do |
 |---|---|
 | **Windows:** no internet after quitting | Settings → Network & Internet → Proxy → turn the proxy off. The program was probably killed from Task Manager |
-| **Windows:** the log says “port … does not accept intercepted connections” | A firewall or antivirus blocks connections to the transparent mode port (1083). Allow it for `net_surgeon.exe` |
+| **Windows:** the log says “port … does not accept intercepted connections” | A firewall or antivirus blocks connections to the transparent mode port (1083): Telegram goes through it when a relay is set. Allow the port for `net_surgeon.exe` |
 | **Linux:** no internet after quitting | `./run.sh off` |
 | A site doesn't open | Check that it is in `bypass_domains.txt`. If it is, run “Diagnostics” for it or delete `strategies.txt` to re-measure everything |
 | Nothing is bypassed | Turn off your VPN: through it the ISP doesn't see the traffic, so the bypass is useless |

@@ -69,12 +69,31 @@ pub struct Context<'a> {
 
 /// Стратегия для соединения, которому нужен обход.
 pub fn select(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selected {
+    select_with(ctx, domain, hello_len, false)
+}
+
+/// То же для перехвата пакетов (Windows): он умеет не всё.
+///
+/// Запись с техникой, недоступной на пакетах (две TLS-записи, OOB, —
+/// скорее всего, измерена прокси до включения перехвата), считается
+/// отсутствующей: домен перемеряется пакетными техниками. Применить вместо
+/// неё что-то «похожее» значило бы получать провалы, сбрасывать запись и
+/// снова мерить то же самое по кругу.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn select_packet(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selected {
+    select_with(ctx, domain, hello_len, true)
+}
+
+fn select_with(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) -> Selected {
+    let usable = |s: Strategy| !packet || crate::bypass::packet_mode::supports(s);
     let class = HelloClass::of(hello_len);
     // Ручная и массовая диагностика мерят пакетом того же размера, что
     // шлёт браузер: все три боевых пути проходят здесь.
     diagnostics::note_battle_hello(hello_len);
 
-    if let Some((cached, kind)) = ctx.strategies.lookup_detailed(domain, class, ctx.ttl_hours) {
+    if let Some((cached, kind)) = ctx.strategies.lookup_detailed(domain, class, ctx.ttl_hours)
+        && usable(cached)
+    {
         let key = match kind {
             MatchKind::Exact => "log.strategy_from_cache",
             MatchKind::Inherited => "log.strategy_inherited",
@@ -101,6 +120,7 @@ pub fn select(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selected {
     if class == HelloClass::Small
         && let Some((other, _)) = ctx.strategies.lookup_detailed(domain, HelloClass::Large, ctx.ttl_hours)
         && other != Strategy::TlsRecord
+        && usable(other)
         && !ctx.strategies.is_resigned(domain, HelloClass::Large, ctx.ttl_hours)
     {
         log_nested_t(ctx.log_tx, LogLevel::Info, "log.strategy_other_size", "strategy", other.label_key(), vec![
@@ -110,7 +130,8 @@ pub fn select(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selected {
         return Selected { strategy: other, source: None };
     }
 
-    Selected { strategy: unmeasured_default(class), source: None }
+    let fallback = if packet { Strategy::Fake } else { unmeasured_default(class) };
+    Selected { strategy: fallback, source: None }
 }
 
 /// Техника для домена, по которому нет подходящего измерения.

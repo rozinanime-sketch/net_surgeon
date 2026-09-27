@@ -159,7 +159,13 @@ pub async fn run_transparent_proxy(
     #[cfg(windows)]
     let rules = udp.describe();
     #[cfg(windows)]
-    let _diverter = match crate::windivert::Diverter::start(port, udp, &log_tx) {
+    let tcp = crate::windivert::TcpContext {
+        strategies: Arc::clone(&strategies),
+        bypass_params: bypass_params.clone(),
+        ttl_hours: strategy_ttl_hours,
+    };
+    #[cfg(windows)]
+    let _diverter = match crate::windivert::Diverter::start(port, tcp, udp, &log_tx) {
         Ok(d) => {
             log_t(&log_tx, LogLevel::Success, "log.windivert_on", vec![("rules", rules)]);
             // QUIC перехватывается тем же драйвером, что и TCP, так что

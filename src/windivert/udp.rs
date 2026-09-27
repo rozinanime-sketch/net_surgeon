@@ -123,7 +123,7 @@ pub fn reply(query: &[u8], u: &Udp, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Первый и последний адрес сети.
-fn range(base: Ipv4Addr, bits: u8) -> (Ipv4Addr, Ipv4Addr) {
+pub(super) fn range(base: Ipv4Addr, bits: u8) -> (Ipv4Addr, Ipv4Addr) {
     let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
     let start = u32::from(base) & mask;
     (Ipv4Addr::from(start), Ipv4Addr::from(start | !mask))
