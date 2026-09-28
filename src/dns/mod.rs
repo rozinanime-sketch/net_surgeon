@@ -36,6 +36,27 @@ pub fn provider_endpoint(url: &str) -> Option<(&str, u16)> {
     }
 }
 
+/// Текст ошибки вместе со всеми причинами.
+///
+/// reqwest сам печатает только верхний уровень — «error sending request for
+/// url», — а настоящая причина (таймаут, сброс, чужой сертификат от шлюза,
+/// который вскрывает TLS) лежит глубже в `source()`. Без неё по логу не
+/// понять, что делать.
+pub fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        // hyper и rustls нередко повторяют текст обёртки — дубли не нужны.
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 /// HTTP-клиент для запросов к DoH-провайдеру.
 ///
 /// # Зачем здесь `bootstrap`
@@ -98,6 +119,33 @@ fn android_tls() -> rustls::ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_chain_includes_causes_without_repeats() {
+        #[derive(Debug)]
+        struct Wrap(&'static str, Option<Box<Wrap>>);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+
+        let root = Wrap("invalid peer certificate: UnknownIssuer", None);
+        let middle = Wrap("client error (Connect)", Some(Box::new(root)));
+        let top = Wrap("error sending request", Some(Box::new(middle)));
+        assert_eq!(
+            error_chain(&top),
+            "error sending request: client error (Connect): invalid peer certificate: UnknownIssuer",
+        );
+
+        let repeated = Wrap("timed out", Some(Box::new(Wrap("timed out", None))));
+        assert_eq!(error_chain(&repeated), "timed out");
+    }
 
     #[test]
     fn splits_provider_url_into_host_and_port() {

@@ -157,11 +157,11 @@ async fn resolve_via_doh(client: &reqwest::Client, provider: &str, dns_query: &[
         .body(dns_query.to_vec())
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| super::error_chain(&e))?;
 
     if !response.status().is_success() {
         return Err(format!("DoH HTTP status: {}", response.status()));
     }
 
-    response.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
+    response.bytes().await.map(|b| b.to_vec()).map_err(|e| super::error_chain(&e))
 }
