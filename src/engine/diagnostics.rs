@@ -306,9 +306,9 @@ pub struct DiagnosticResult {
     pub oob: SplitScore,
     /// Поддельный ClientHello-приманка перед настоящим.
     ///
-    /// Меряется последней и только при наличии CAP_NET_ADMIN: без него
-    /// TCP_REPAIR недоступен, техника молча выродилась бы в обычный сплит
-    /// и дала бы бессмысленный результат.
+    /// Меряется последней и только там, где приманку есть чем отправить:
+    /// иначе техника молча выродилась бы в обычный сплит и дала бы
+    /// бессмысленный результат.
     pub fake: SplitScore,
 }
 
@@ -323,8 +323,14 @@ fn classify_write_error(_e: &std::io::Error) -> ProbeOutcome { ProbeOutcome::Res
 ///
 /// Кроме alert о повреждённых данных: он значит, что до сервера дошло не то,
 /// что отправлено (см. [`crate::bypass::tls::is_corruption_alert`]).
-fn classify_reply(reply: &[u8]) -> ProbeOutcome {
-    if crate::bypass::tls::is_corruption_alert(reply) {
+fn classify_reply(reply: &[u8], strategy: FragStrategy) -> ProbeOutcome {
+    // Отказ по существу на синтетическую пробу сервер дать вправе, и
+    // обычно это всё равно доказывает, что ClientHello дошёл. Но у fake
+    // отказ значит другое: сервер получил приманку с чужим именем, а
+    // настоящий ClientHello выбросил как повтор. Раньше это засчитывалось
+    // успехом, и fake «проходил» 3/3 там, где соединение рвалось.
+    let decoy_reached_server = matches!(strategy, FragStrategy::Fake) && crate::bypass::tls::is_fatal_alert(reply);
+    if decoy_reached_server || crate::bypass::tls::is_corruption_alert(reply) {
         ProbeOutcome::Mangled
     } else if crate::bypass::tls::looks_like_tls_reply(reply) {
         ProbeOutcome::Success
@@ -427,7 +433,7 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
         FragStrategy::TlsRecord => fragment::tls_record_split(&mut writer, hello, bypass_params.split_delay_ms).await.map(|_| ()),
         FragStrategy::Disorder => fragment::split_with_disorder(&mut writer, fd, hello, bypass_params.disorder_ttl).await.map(|_| ()),
         FragStrategy::Oob => fragment::split_with_oob(&mut writer, fd, hello).await.map(|_| ()),
-        FragStrategy::Fake => fragment::split_with_fake(&mut writer, fd, hello, bypass_params.fake_ttl, &bypass_params.fake_sni).await.map(|_| ()),
+        FragStrategy::Fake => fragment::split_with_fake(&mut writer, fd, hello, bypass_params).await.map(|_| ()),
     };
 
     if let Err(e) = write_result {
@@ -436,7 +442,7 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
 
     let mut buf = [0u8; 64];
     match tokio::time::timeout(response_timeout, reader.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => classify_reply(&buf[..n]),
+        Ok(Ok(n)) if n > 0 => classify_reply(&buf[..n], strategy),
         Ok(Ok(_)) => ProbeOutcome::ClosedAfterHello,
         Ok(Err(e)) => classify_read_error(&e),
         Err(_) => ProbeOutcome::SilentDrop,
@@ -729,10 +735,10 @@ async fn diagnose_with(
         empty
     };
 
-    // Ступень 6: fake. Последняя и единственная привилегированная — пробуем
-    // только когда режим ремонта TCP реально доступен, иначе техника молча
-    // откатилась бы на обычный сплит и мы бы измерили не её.
-    let fake = if packet_mode || (crate::bypass::socket::fake_supported() && crate::bypass::socket::tcp_repair_available()) {
+    // Ступень 6: fake. Последней: как и disorder, платит ретрансмитом. Где
+    // приманку отправить нечем, не пробуем: техника молча откатилась бы на
+    // обычный сплит, и мы бы измерили не её.
+    let fake = if packet_mode || crate::bypass::socket::fake_supported() {
         trials(&target, domain, FragStrategy::Fake, bypass_params, trials_count, early_abandon, timing).await
     } else {
         empty
@@ -812,6 +818,15 @@ mod tests {
     #[tokio::test]
     async fn corruption_alert_is_not_success() {
         assert_eq!(probe(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32], FragStrategy::None).await, ProbeOutcome::Mangled);
+    }
+
+    /// Так Cloudflare отвечает на приманку fake, дошедшую до сервера:
+    /// fatal handshake_failure. Для прочих техник это по-прежнему ответ.
+    #[tokio::test]
+    async fn refusal_after_fake_means_the_decoy_reached_the_server() {
+        const REFUSAL: &[u8] = &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+        assert_eq!(probe(REFUSAL, FragStrategy::Fake).await, ProbeOutcome::Mangled);
+        assert_eq!(probe(REFUSAL, FragStrategy::TlsRecord).await, ProbeOutcome::Success);
     }
 
     #[tokio::test]

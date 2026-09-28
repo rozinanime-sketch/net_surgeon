@@ -17,8 +17,9 @@
 //! На Windows TTL и OOB дописаны через `socket2`: `IP_TTL`,
 //! `IPV6_UNICAST_HOPS` и `MSG_OOB` в Winsock есть. `SO_DOMAIN` там нет,
 //! поэтому семейство берётся из локального адреса сокета. `SO_ORIGINAL_DST`
-//! и `TCP_REPAIR` остаются заглушками: в Windows исходный адрес прозрачного
-//! режима даёт сам перехват (`windivert::original_dst`).
+//! и приманка fake остаются заглушками: в Windows исходный адрес прозрачного
+//! режима даёт сам перехват (`windivert::original_dst`), он же вставляет
+//! приманку (`windivert::desync`).
 
 /// Сокет в том виде, в каком его знает система: номер файла в Unix,
 /// `SOCKET` в Windows. Техники получают его до разделения потока на половины,
@@ -304,157 +305,249 @@ pub async fn send_oob(_fd: RawSock, _byte: u8) -> std::io::Result<()> {
     ))
 }
 
-// --- TCP_REPAIR: отмотка номера последовательности ---
+// --- Приманка fake: подмена данных под ретрансмит ---
 //
-// Нужна для техники fake: фальшивый ClientHello отправляется с низким TTL
-// и до сервера не доходит, но байты уже заняли место в sequence space.
-// Без отмотки сервер увидел бы дыру в нумерации и ждал бы недостающие
-// данные вечно.
+// Приманка должна занять в потоке ровно те номера, что и настоящий
+// ClientHello: DPI, который собирает поток, запоминает первое, что увидел
+// на этих номерах, а повтор считает ретрансмитом и не разбирает. Раньше
+// номер пытались отмотать назад через TCP_REPAIR, но на живом соединении
+// ядро этого не даёт даже с CAP_NET_ADMIN (EPERM, проверено на 7.2).
 //
-// Именно поэтому раньше я считал fake невозможным в userspace. Возможен —
-// но ценой CAP_NET_ADMIN: TCP_REPAIR позволяет переписывать состояние
-// TCP-соединения, и ядро справедливо не даёт этого без привилегий.
+// Приём из ByeDPI (`desync.c`, `send_fake`) обходится без отмотки и без
+// привилегий. Данные отдаются сокету через `vmsplice` + `splice`, то есть
+// без копирования: очередь отправки ссылается прямо на нашу страницу
+// памяти. Сначала там лежит приманка, и она уходит с низким TTL. Сервер
+// её не получает и не подтверждает. Когда она ушла, страница
+// перезаписывается настоящим ClientHello, и ядро, повторяя
+// неподтверждённое, отправляет уже его — с теми же номерами и обычным TTL.
 
-/// Опции из `linux/tcp.h`; крейт `libc` их не экспортирует.
-///
-/// Используются техникой fake (bypass::fragment::split_with_fake).
+/// Сколько ждать, пока приманка покинет очередь отправки. Обычно это
+/// доли миллисекунды: буфер сокета в начале соединения пуст.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod repair {
-    pub const TCP_REPAIR: libc::c_int = 19;
-    pub const TCP_REPAIR_QUEUE: libc::c_int = 20;
-    pub const TCP_QUEUE_SEQ: libc::c_int = 21;
-    pub const TCP_SEND_QUEUE: libc::c_int = 2;
+const FAKE_SEND_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `SIOCOUTQNSD` из `linux/sockios.h`: байты очереди, ещё не отправленные
+/// ни разу. Крейт `libc` её не экспортирует.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SIOCOUTQNSD: libc::c_ulong = 0x894B;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unsent_bytes(fd: RawSock) -> Option<libc::c_int> {
+    let mut n: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(fd, SIOCOUTQNSD as _, &mut n) };
+    (rc == 0).then_some(n)
 }
 
+/// Включает (`key_len` > 0) или снимает (0) TCP-подпись MD5 для пакетов к
+/// собеседнику сокета. Ключ из нулей: его всё равно никто не проверяет, а
+/// сервер без ключа пакет с такой опцией выбрасывает (как в ByeDPI,
+/// `set_md5sig`).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn set_int_opt(fd: RawSock, name: libc::c_int, value: libc::c_int) -> bool {
+fn set_md5sig(fd: RawSock, key_len: u16) -> bool {
+    /// `struct tcp_md5sig` из `linux/tcp.h`; крейт `libc` её не экспортирует.
+    #[repr(C)]
+    struct TcpMd5Sig {
+        addr: libc::sockaddr_storage,
+        flags: u8,
+        prefixlen: u8,
+        keylen: u16,
+        ifindex: libc::c_int,
+        key: [u8; 80],
+    }
+
+    let mut md5: TcpMd5Sig = unsafe { std::mem::zeroed() };
+    md5.keylen = key_len;
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe { libc::getpeername(fd, (&mut md5.addr as *mut libc::sockaddr_storage).cast(), &mut len) };
+    if rc != 0 {
+        return false;
+    }
     let rc = unsafe {
         libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
-            name,
-            &value as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            libc::TCP_MD5SIG,
+            (&md5 as *const TcpMd5Sig).cast(),
+            std::mem::size_of::<TcpMd5Sig>() as libc::socklen_t,
         )
     };
     rc == 0
 }
 
-/// Текущий номер последовательности очереди отправки.
+/// Отправляет `decoy` с TTL `ttl` так, что ядро потом повторит на тех же
+/// номерах `real`. Длины должны совпадать. `md5sig` — вдобавок пометить
+/// приманку MD5-подписью (см. [`set_md5sig`]); повтор уходит уже без неё.
 ///
-/// `None` означает, что режим ремонта недоступен — почти всегда это
-/// отсутствие `CAP_NET_ADMIN`. Вызывающий код тогда откатывается
-/// на технику, не требующую привилегий.
+/// `Ok(false)` — техника здесь не сработала до отправки чего-либо (не та
+/// длина, не вышло выделить память или сменить TTL): вызывающий может
+/// откатиться на другую. Ошибка — приманка могла уйти частично, и
+/// соединение лучше не продолжать.
+///
+/// Настоящие данные уходят только ретрансмитом, поэтому соединение
+/// начинается позже на время RTO: у Linux не меньше 200 мс.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn tcp_send_seq(fd: RawSock) -> Option<u32> {
-    use repair::*;
-
-    if !set_int_opt(fd, TCP_REPAIR, 1) {
-        return None;
+pub async fn send_fake(fd: RawSock, decoy: &[u8], real: &[u8], ttl: u32, md5sig: bool) -> std::io::Result<bool> {
+    if decoy.len() != real.len() || decoy.is_empty() {
+        return Ok(false);
     }
-    if !set_int_opt(fd, TCP_REPAIR_QUEUE, TCP_SEND_QUEUE) {
-        set_int_opt(fd, TCP_REPAIR, 0);
-        return None;
-    }
-
-    let mut seq: libc::c_uint = 0;
-    let mut len = std::mem::size_of::<libc::c_uint>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            TCP_QUEUE_SEQ,
-            &mut seq as *mut libc::c_uint as *mut libc::c_void,
-            &mut len,
-        )
+    let Some(page) = FakePage::new(decoy) else {
+        return Ok(false);
     };
 
-    // Режим ремонта снимаем сразу: пока он включён, запись в сокет
-    // не уходит на провод, а складывается в очередь.
-    set_int_opt(fd, TCP_REPAIR, 0);
-
-    (rc == 0).then_some(seq as u32)
-}
-
-/// Возвращает номер последовательности к сохранённому значению.
-///
-/// После этого следующая запись переиспользует те же номера, то есть
-/// перезаписывает фальшивые данные настоящими.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn set_tcp_send_seq(fd: RawSock, seq: u32) -> bool {
-    use repair::*;
-
-    if !set_int_opt(fd, TCP_REPAIR, 1) {
-        return false;
+    let original_ttl = get_ttl(fd).unwrap_or(64);
+    if !set_ttl(fd, ttl) {
+        return Ok(false);
     }
-    let ok = set_int_opt(fd, TCP_REPAIR_QUEUE, TCP_SEND_QUEUE)
-        && set_int_opt(fd, TCP_QUEUE_SEQ, seq as libc::c_int);
-    set_int_opt(fd, TCP_REPAIR, 0);
-    ok
+    if md5sig && !set_md5sig(fd, 5) {
+        // Ядро без CONFIG_TCP_MD5SIG или запрет на живом соединении: без
+        // подписи приманка дошла бы до сервера — лучше не отправлять вовсе.
+        set_ttl(fd, original_ttl);
+        return Ok(false);
+    }
+
+    let sent = splice_page(fd, &page).await;
+    if sent.is_ok() {
+        // TTL берётся в момент передачи, а не записи в очередь: вернуть его
+        // раньше — и приманка уйдёт с обычным и дойдёт до сервера.
+        let deadline = std::time::Instant::now() + FAKE_SEND_WAIT;
+        while unsent_bytes(fd).is_some_and(|n| n > 0) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+    // Если приманка так и не ушла, подмена безвредна: уйдут сразу настоящие
+    // данные, просто без обмана DPI.
+    page.overwrite(real);
+    // Подпись снимается вместе с TTL: повтор с настоящими данными сервер
+    // должен принять.
+    let unsigned = !md5sig || set_md5sig(fd, 0);
+    let restored = set_ttl(fd, original_ttl) && unsigned;
+
+    sent?;
+    if !restored {
+        return Err(std::io::Error::other(rust_i18n::t!(
+            "err.ttl_restore",
+            ttl = original_ttl,
+            error = std::io::Error::last_os_error()
+        ).into_owned()));
+    }
+    Ok(true)
 }
 
-/// Доступен ли режим ремонта вообще — без живого соединения.
-///
-/// Нужен диагностике: она решает, гонять ли пробы техники fake, ЕЩЁ ДО того,
-/// как откроет сокет. Проверять на боевом соединении поздно — если прав нет,
-/// проба отправит приманку, не сможет отмотать номер и испортит соединение
-/// вместо того, чтобы честно сказать «техника недоступна».
-///
-/// Проверка делается на одноразовом сокете: `TCP_REPAIR` включается и на
-/// неподключённом (на этом держится восстановление соединений в CRIU), а
-/// отказ по правам приходит одинаково в любом состоянии.
-///
-/// Результат кэшируется: полномочия процесса за время работы не меняются,
-/// а проба стоит двух системных вызовов на каждый домен.
+/// Страница с данными приманки. Освобождается при любом исходе; очередь
+/// отправки держит на неё свою ссылку, так что munmap не отнимет данные у
+/// ретрансмита.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn tcp_repair_available() -> bool {
-    use std::sync::OnceLock;
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-
-    *AVAILABLE.get_or_init(|| {
-        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        if fd < 0 {
-            return false;
-        }
-
-        let ok = set_int_opt(fd, repair::TCP_REPAIR, 1);
-        if ok {
-            set_int_opt(fd, repair::TCP_REPAIR, 0);
-        }
-        unsafe { libc::close(fd) };
-        ok
-    })
+struct FakePage {
+    ptr: *mut libc::c_void,
+    len: usize,
 }
 
-/// Может ли техника fake вообще сработать.
+// SAFETY: страница принадлежит только этой структуре, а пишется через
+// `&mut`-свободный `overwrite` строго после того, как ушла приманка.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe impl Send for FakePage {}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe impl Sync for FakePage {}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl FakePage {
+    fn new(data: &[u8]) -> Option<FakePage> {
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                data.len(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        let page = FakePage { ptr, len: data.len() };
+        page.overwrite(data);
+        Some(page)
+    }
+
+    /// Длина задана при создании, лишнее отбрасывается.
+    fn overwrite(&self, data: &[u8]) {
+        let n = data.len().min(self.len);
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.cast::<u8>(), n) };
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Drop for FakePage {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr, self.len) };
+    }
+}
+
+/// Передаёт страницу сокету без копирования: `vmsplice` кладёт в канал
+/// ссылку на неё, `splice` переносит ссылку в очередь сокета.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn splice_page(fd: RawSock, page: &FakePage) -> std::io::Result<()> {
+    let mut pipe = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    struct Close([libc::c_int; 2]);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0[0]);
+                libc::close(self.0[1]);
+            }
+        }
+    }
+    let _close = Close(pipe);
+
+    let len = page.len;
+    // iovec держит сырой указатель: он не должен дожить до await ниже.
+    let queued = {
+        let iov = libc::iovec { iov_base: page.ptr, iov_len: len };
+        unsafe { libc::vmsplice(pipe[1], &iov, 1, libc::SPLICE_F_GIFT) }
+    };
+    if queued < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Канал вмещает 64 КиБ, ClientHello — пару килобайт: vmsplice берёт
+    // всё сразу. Иначе часть приманки ушла бы обычной записью, мимо подмены.
+    if queued as usize != len {
+        return Err(std::io::Error::other(rust_i18n::t!("err.fake_splice").into_owned()));
+    }
+
+    let mut left = len;
+    for _ in 0..100 {
+        let n = unsafe { libc::splice(pipe[0], std::ptr::null_mut(), fd, std::ptr::null_mut(), left, 0) };
+        if n > 0 {
+            left -= n as usize;
+            if left == 0 {
+                return Ok(());
+            }
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        // Сокет неблокирующий: буфер занят — уступаем рантайму и пробуем снова.
+        if n < 0 && err.kind() == std::io::ErrorKind::WouldBlock {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        return Err(err);
+    }
+    Err(std::io::Error::other(rust_i18n::t!("err.fake_splice").into_owned()))
+}
+
+/// Может ли техника fake сработать на сокете прокси.
 ///
-/// Нет, и дело не в правах. Ей нужно после приманки вернуть номер
-/// последовательности назад через `TCP_QUEUE_SEQ`, а ядро разрешает это
-/// только сокету в состоянии CLOSE — то есть при восстановлении соединения
-/// (CRIU), но не на живом. На установленном соединении вызов возвращает
-/// EPERM даже с CAP_NET_ADMIN (проверено на 7.2). В итоге каждая проба
-/// отправляла приманку, падала и теряла соединение.
-///
-/// Пока нет способа писать сырые пакеты с неверным номером (NFQUEUE,
-/// raw-сокет), техника выключена целиком — и в диагностике, и в бою.
+/// В Linux и Android — да, см. [`send_fake`]. В Windows сокетом так не
+/// сделать, там приманку вставляет перехват пакетов (`windivert::desync`).
 pub const fn fake_supported() -> bool {
-    false
+    cfg!(any(target_os = "linux", target_os = "android"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn tcp_repair_available() -> bool {
-    false
+pub async fn send_fake(_fd: RawSock, _decoy: &[u8], _real: &[u8], _ttl: u32, _md5sig: bool) -> std::io::Result<bool> {
+    Ok(false)
 }
-
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn tcp_send_seq(_fd: RawSock) -> Option<u32> {
-    None
-}
-
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn set_tcp_send_seq(_fd: RawSock, _seq: u32) -> bool {
-    false
-}
-

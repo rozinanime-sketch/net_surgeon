@@ -61,16 +61,13 @@ fn fmt_ms(value: Option<f64>) -> String {
 
 /// Предупреждает, что техника fake в этом прогоне не будет измерена.
 ///
-/// Сейчас она выключена всегда (см. `socket::fake_supported`), а раньше
-/// пропускалась без `CAP_NET_ADMIN`. В обоих случаях в отчёте остаётся
-/// строка «0/0», по которой не понять, что техника не провалилась, а просто
-/// не запускалась. Вызывается один раз на прогон, а не на домен — иначе при
-/// массовой диагностике предупреждение повторилось бы для каждого домена.
+/// Иначе в отчёте остаётся строка «0/0», по которой не понять, что техника
+/// не провалилась, а просто не запускалась. Вызывается один раз на прогон,
+/// а не на домен — иначе при массовой диагностике предупреждение
+/// повторилось бы для каждого домена.
 fn warn_if_fake_unavailable(log_tx: &LogSender) {
-    if !crate::bypass::socket::fake_supported() {
+    if !crate::bypass::socket::fake_supported() && !crate::bypass::packet_mode::is_active() {
         log::log_t(log_tx, LogLevel::Info, "log.fake_disabled", vec![]);
-    } else if !crate::bypass::socket::tcp_repair_available() {
-        log::log_t(log_tx, LogLevel::Warning, "log.fake_unavailable", vec![]);
     }
 }
 
@@ -172,6 +169,10 @@ pub fn run(
         }
 
         Action::RunDiagnostics(domain) => {
+            // Точка на конце — полное имя в DNS, но в SNI её никто не шлёт, а
+            // фильтр с ней имя не узнаёт: проба «gateway.discord.gg.» проходила
+            // напрямую, и вывод записывался на имя, которого в бою не бывает.
+            let domain = domain.trim().trim_end_matches('.').to_lowercase();
             app.diagnostics_running = true;
             let log_tx = log_tx.clone();
             let config = Arc::clone(config);

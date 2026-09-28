@@ -114,9 +114,8 @@ pub enum Strategy {
     /// протоколов, доступный только ей — без открытого имени вообще
     /// (подключение по IP, ECH, MTProto).
     ///
-    /// Сейчас выключена целиком (см. `socket::fake_supported`): отмотать
-    /// номер последовательности после приманки через TCP_REPAIR на живом
-    /// соединении ядро не даёт даже с CAP_NET_ADMIN.
+    /// Настоящий ClientHello уходит повтором на тех же номерах, поэтому,
+    /// как и disorder, техника платит временем ретрансмита.
     Fake,
 }
 
@@ -277,10 +276,10 @@ pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
     if result.disorder.is_convincing() {
         return Some(Strategy::Disorder);
     }
-    // Fake последним: он единственный требует CAP_NET_ADMIN, и если
-    // работает что-то непривилегированное, брать его незачем. Зато он
-    // единственный, кому не нужен SNI в настоящем пакете, — поэтому
-    // там, где не прошло ничего, шанс остаётся только у него.
+    // Fake последним: он ждёт ретрансмита, как disorder, и вдобавок шлёт
+    // лишний пакет, так что при любой другой рабочей технике брать его
+    // незачем. Зато он единственный проходит DPI, который собирает поток,
+    // — там, где не прошло ничего, шанс остаётся только у него.
     if result.fake.is_convincing() {
         return Some(Strategy::Fake);
     }
@@ -958,9 +957,9 @@ mod tests {
     }
 
     #[test]
-    fn unprivileged_technique_wins_over_fake() {
-        // Fake требует CAP_NET_ADMIN — если работает что-то без привилегий,
-        // лестница берёт его, даже когда fake тоже прошёл.
+    fn cheaper_technique_wins_over_fake() {
+        // Fake дороже остальных — если работает что-то другое, лестница
+        // берёт его, даже когда fake тоже прошёл.
         let mut r = result(ProbeOutcome::SilentDrop, false);
         r.fake = SplitScore { successes: 3, attempts: 3, confidence: 0.44, median_ms: Some(150.0) };
         r.disorder = SplitScore { successes: 3, attempts: 3, confidence: 0.44, median_ms: Some(400.0) };
@@ -1512,9 +1511,9 @@ pub mod apply {
                 }
             }
             Strategy::Fake => {
-                match fragment::split_with_fake(writer, fd, data, bypass.fake_ttl, &bypass.fake_sni).await? {
+                match fragment::split_with_fake(writer, fd, data, bypass).await? {
                     Some(info) => Ok(Applied::Fake { decoy: info.decoy, real: info.real }),
-                    // Нет CAP_NET_ADMIN — откат на обычный сплит, как у прочих.
+                    // Приманку не собрать или не отправить — откат на обычный сплит, как у прочих.
                     None => {
                         let info = fragment::split_client_hello(writer, data, bypass).await?;
                         Ok(Applied::Split { first: info.first, second: info.second })

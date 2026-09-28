@@ -37,6 +37,9 @@ const FIELD_GROUPS: &[(&str, &[(&str, &str)])] = &[
         ("field.split_delay", "bypass.split_delay_ms"),
         ("field.window_clamp", "bypass.window_clamp"),
         ("field.disorder_ttl", "bypass.disorder_ttl"),
+        ("field.fake_ttl", "bypass.fake_ttl"),
+        ("field.fake_md5sig", "bypass.fake_md5sig"),
+        ("field.fake_sni", "bypass.fake_sni"),
     ]),
     ("config.group_junk", &[
         ("field.junk_count", "socks5_junk.count"),

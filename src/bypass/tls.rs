@@ -94,10 +94,24 @@ pub fn is_corruption_alert(data: &[u8]) -> bool {
     )
 }
 
-/// Принял ли сервер отправленное: первые байты его ответа не жалоба на
-/// испорченный поток. Для обратной связи по стратегии в бою.
+/// Фатальный TLS-alert: сервер оборвал рукопожатие. Уровень лежит в шестом
+/// байте; если он ещё не пришёл, решения нет — `false`.
+pub fn is_fatal_alert(data: &[u8]) -> bool {
+    const ALERT: u8 = 0x15;
+    const FATAL: u8 = 2;
+    matches!(data, [ALERT, 0x03, _, _, _, FATAL, ..])
+}
+
+/// Принял ли сервер отправленное. Для обратной связи по стратегии в бою.
+///
+/// Здесь ClientHello настоящий, от браузера или приложения, и любой
+/// фатальный alert на него означает, что соединение у пользователя
+/// сорвалось. Так выглядит и приманка fake, дошедшая до сервера:
+/// Cloudflare отвечает на неё handshake_failure, а настоящий ClientHello
+/// выбрасывает как повтор. Раньше такой отказ считался ответом, и
+/// нерабочая стратегия не сбрасывалась никогда.
 pub fn server_accepted(first_reply: &[u8]) -> bool {
-    !is_corruption_alert(first_reply)
+    !is_corruption_alert(first_reply) && !is_fatal_alert(first_reply)
 }
 
 /// Похоже ли начало буфера на TLS handshake. Отличается от [`record_len`]
@@ -347,6 +361,62 @@ pub fn build_client_hello_sized(sni: &str, target: usize) -> Vec<u8> {
     record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
     record.extend_from_slice(&handshake);
     record
+}
+
+/// Приманка для техники fake: ClientHello с именем `sni` ровно в `target`
+/// байт. `None` — такой короткий не собрать (меньше ~80 байт).
+///
+/// Приманка должна занять в потоке ровно те номера, что и настоящий
+/// пакет. Обычный [`build_client_hello_sized`] короче ~300 байт не бывает,
+/// а у программы обновления Discord (rustls) ClientHello — 268: для него
+/// fake не применялся вовсе, и обновление висело там, где помогает только
+/// приманка. Поэтому для коротких собирается минимальный пакет: DPI
+/// нужно лишь разобрать в нём имя.
+pub fn build_decoy_hello(sni: &str, target: usize) -> Option<Vec<u8>> {
+    let full = build_client_hello_sized(sni, target);
+    if full.len() == target {
+        return Some(full);
+    }
+
+    let sni_bytes = sni.as_bytes();
+    let mut sni_ext = Vec::new();
+    sni_ext.extend_from_slice(&((sni_bytes.len() + 3) as u16).to_be_bytes());
+    sni_ext.push(0x00);
+    sni_ext.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+    sni_ext.extend_from_slice(sni_bytes);
+    let mut ext = Vec::new();
+    push_ext(&mut ext, 0x0000, &sni_ext);
+    push_ext(&mut ext, 0x002b, &[0x04, 0x03, 0x04, 0x03, 0x03]);
+
+    let suites: &[u8] = &[0x13, 0x01, 0x13, 0x02, 0xc0, 0x2b, 0xc0, 0x2f];
+    // version + random + длина session_id + шифры + сжатие + длина расширений
+    let fixed = 2 + 32 + 1 + 2 + suites.len() + 2 + 2;
+    let base = 5 + 4 + fixed + ext.len();
+    let rem = target.checked_sub(base)?;
+    // Добиваем расширением padding, а остаток короче его заголовка (4 байта)
+    // — длиной session_id: иначе ровно в `target` не попасть.
+    let (session_id, pad) = if rem == 0 || rem >= 4 { (0, rem.checked_sub(4)) } else { (rem, None) };
+    if let Some(pad) = pad {
+        push_ext(&mut ext, 0x0015, &vec![0u8; pad]);
+    }
+
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&super::random::bytes(32));
+    body.push(session_id as u8);
+    body.extend_from_slice(&super::random::bytes(session_id));
+    body.extend_from_slice(&(suites.len() as u16).to_be_bytes());
+    body.extend_from_slice(suites);
+    body.extend_from_slice(&[0x01, 0x00]);
+    body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext);
+
+    let mut handshake = vec![0x01];
+    handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..4]);
+    handshake.extend_from_slice(&body);
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    (record.len() == target).then_some(record)
 }
 
 /// Добавляет расширение TLS: тип(2) длина(2) данные.
@@ -674,4 +744,19 @@ mod tests {
         // Обрезаем на половине — парсер не должен паниковать
         assert_eq!(find_sni(&hello[..hello.len() / 2]), None);
     }
+
+    #[test]
+    fn decoy_fits_any_hello_size() {
+        // От минимального до браузерного: ровно в размер и с разбираемым именем.
+        for target in (60..2000).step_by(1) {
+            let Some(decoy) = build_decoy_hello("www.google.com", target) else {
+                assert!(target < 90, "{target} байт: приманка должна собираться");
+                continue;
+            };
+            assert_eq!(decoy.len(), target);
+            assert_eq!(sni_host(&decoy).as_deref(), Some("www.google.com"), "{target} байт");
+        }
+        assert!(build_decoy_hello("www.google.com", 268).is_some(), "ClientHello программы обновления Discord");
+    }
+
 }

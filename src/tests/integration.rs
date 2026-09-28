@@ -69,6 +69,7 @@ fn test_bypass_params() -> BypassParams {
         window_clamp: 0,
         disorder_ttl: 2,
         fake_ttl: 2,
+        fake_md5sig: false,
         fake_sni: "www.google.com".to_string(),
     }
 }
@@ -273,27 +274,101 @@ async fn oob_byte_is_dropped_by_the_receiver() {
     );
 }
 
-/// Disorder и fake меняют TTL и нумерацию на живом сокете. На петле
-/// низкий TTL ничего не отсекает, зато видно главное: после всех
-/// манипуляций сервер получает ровно исходный ClientHello, без дыр и
-/// лишних байт. Fake без CAP_NET_ADMIN откатывается на обычный сплит,
-/// и этот откат тоже обязан доставить данные целыми.
+/// Disorder меняет TTL на живом сокете. На петле низкий TTL ничего не
+/// отсекает, зато видно главное: после всех манипуляций сервер получает
+/// ровно исходный ClientHello, без дыр и лишних байт.
 #[tokio::test]
-async fn ttl_techniques_deliver_the_exact_bytes() {
-    for strategy in [Strategy::Disorder, Strategy::Fake] {
-        let hello = client_hello("ttl.example");
-        let (port, collector) = spawn_collector().await;
+async fn disorder_delivers_the_exact_bytes() {
+    let hello = client_hello("ttl.example");
+    let (port, collector) = spawn_collector().await;
 
+    let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let fd = crate::bypass::socket::raw_sock(&upstream);
+    first_packet(&mut upstream, fd, &hello, Strategy::Disorder, &test_bypass_params())
+        .await
+        .expect("отправка");
+    drop(upstream);
+
+    let received = collector.await.expect("collector");
+    assert_eq!(received, hello, "поток на приёме совпадает с исходным");
+}
+
+/// Fake: приманка занимает ровно те номера, что и настоящий ClientHello,
+/// а сервер в итоге получает настоящий, без дыр и лишних байт.
+///
+/// На петле низкий TTL ничего не отсекает, но видно другое: очередь
+/// приёмника ссылается на ту же страницу памяти, что и очередь отправки.
+/// Приёмник читает её уже после подмены и получает настоящие данные. Если
+/// бы ядро скопировало приманку, здесь пришло бы чужое имя, — а значит, и
+/// ретрансмит в сети повторил бы приманку вместо настоящего пакета.
+///
+/// Короткий ClientHello (у rustls ~270 байт) проверяется отдельно: под
+/// него приманка собирается в минимальном виде.
+#[tokio::test]
+async fn fake_delivers_the_real_hello_through_the_swapped_page() {
+    use crate::engine::strategy::apply::Applied;
+
+    let browser = crate::bypass::tls::build_client_hello("real.example");
+    // Размер ClientHello программы обновления Discord (rustls).
+    let short = crate::bypass::tls::build_decoy_hello("real.example", 268).expect("268 байт");
+    let faked = crate::bypass::socket::fake_supported();
+
+    for hello in [browser, short] {
+        let (port, collector) = spawn_collector().await;
         let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
         let fd = crate::bypass::socket::raw_sock(&upstream);
-        first_packet(&mut upstream, fd, &hello, strategy, &test_bypass_params())
+        let applied = first_packet(&mut upstream, fd, &hello, Strategy::Fake, &test_bypass_params())
             .await
             .expect("отправка");
         drop(upstream);
 
+        assert_eq!(matches!(applied, Applied::Fake { .. }), faked, "{} байт: применённая техника", hello.len());
         let received = collector.await.expect("collector");
-        assert_eq!(received, hello, "{strategy:?}: поток на приёме совпадает с исходным");
+        assert_eq!(received, hello, "{} байт: на приёме настоящий ClientHello", hello.len());
     }
+}
+
+/// Fake с MD5-подписью, весь путь целиком: приёмник без ключа выбрасывает
+/// подписанную приманку, как сделал бы сервер, и настоящий ClientHello
+/// приходит повтором — позже на время RTO. Если подпись не выставилась,
+/// приманка дошла бы, и повтор бы не понадобился.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn md5_signed_decoy_is_dropped_and_the_real_hello_is_retransmitted() {
+    use crate::engine::strategy::apply::Applied;
+
+    let hello = crate::bypass::tls::build_client_hello("real.example");
+    let params = BypassParams { fake_md5sig: true, ..test_bypass_params() };
+    let (port, collector) = spawn_collector().await;
+
+    let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let fd = crate::bypass::socket::raw_sock(&upstream);
+    let started = std::time::Instant::now();
+    let applied = first_packet(&mut upstream, fd, &hello, Strategy::Fake, &params)
+        .await
+        .expect("отправка");
+    assert!(matches!(applied, Applied::Fake { .. }), "подпись MD5 должна выставляться на живом соединении");
+
+    // Дождаться подтверждения повтора, прежде чем закрыть: иначе FIN ушёл
+    // бы раньше данных.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while unacked_bytes(fd) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let elapsed = started.elapsed();
+    drop(upstream);
+
+    let received = collector.await.expect("collector");
+    assert_eq!(received, hello, "на приёме настоящий ClientHello");
+    assert!(elapsed >= Duration::from_millis(150), "данные пришли повтором, а не с приманкой: {elapsed:?}");
+}
+
+/// Байты в очереди отправки без подтверждения (`SIOCOUTQ`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unacked_bytes(fd: crate::bypass::socket::RawSock) -> libc::c_int {
+    let mut n: libc::c_int = 0;
+    unsafe { libc::ioctl(fd, libc::TIOCOUTQ as _, &mut n) };
+    n
 }
 
 /// Мусор перед UDP-потоком — только для доменов из списка обхода.
