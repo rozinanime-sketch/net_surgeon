@@ -54,6 +54,9 @@ const FIELD_GROUPS: &[(&str, &[(&str, &str)])] = &[
     ("config.group_dns", &[
         ("field.resolve_via_doh", "resolve_via_doh"),
         ("field.doh_provider", "doh_provider"),
+        ("field.doh_bootstrap_ip", "doh_bootstrap_ip"),
+        ("field.smart_dns_provider", "smart_dns_provider"),
+        ("field.smart_dns_bootstrap_ip", "smart_dns_bootstrap_ip"),
         ("field.block_trackers", "block_trackers"),
     ]),
 ];

@@ -183,7 +183,7 @@ pub struct Config {
     /// и резолв имени провайдера не выполняется вообще.
     ///
     /// Пустое поле — обычное поведение, имя провайдера резолвится системой.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "empty_as_none")]
     pub doh_bootstrap_ip: Option<std::net::IpAddr>,
 
     /// «Умный» DoH (например, xbox-dns.ru) для доменов из
@@ -193,7 +193,7 @@ pub struct Config {
     pub smart_dns_provider: String,
 
     /// То же, что `doh_bootstrap_ip`, но для `smart_dns_provider`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "empty_as_none")]
     pub smart_dns_bootstrap_ip: Option<std::net::IpAddr>,
 
     /// Дописывать в списки доменов те, что появились в новой версии.
@@ -206,6 +206,22 @@ pub struct Config {
     /// часть трафика, неожиданен, и включать это должен сам пользователь.
     #[serde(default)]
     pub block_trackers: bool,
+}
+
+/// Адрес, где пустая строка значит «не задан». Без этого `doh_bootstrap_ip = ""`,
+/// обещанный в config.toml как обычное поведение, не разбирался, а редактор
+/// в TUI отказывался сохранять стёртое поле.
+fn empty_as_none<'de, D>(deserializer: D) -> Result<Option<std::net::IpAddr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let text = String::deserialize(deserializer)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse().map(Some).map_err(serde::de::Error::custom)
 }
 
 fn default_listen_host() -> String { "127.0.0.1".to_string() }
@@ -275,6 +291,18 @@ mod tests {
         // умолчаниями из-за неверной секции.
         assert!(config.port > 0);
         assert!(!config.doh_provider.is_empty());
+    }
+
+    #[test]
+    fn empty_bootstrap_address_means_unset() {
+        let text = shipped_config().replace("doh_bootstrap_ip = \"1.1.1.1\"", "doh_bootstrap_ip = \"\"")
+            .replace("doh_bootstrap_ip = \"8.8.8.8\"", "doh_bootstrap_ip = \"\"");
+        assert!(text.contains("doh_bootstrap_ip = \"\""));
+        let config: Config = toml::from_str(&text).expect("пустой адрес должен разбираться");
+        assert_eq!(config.doh_bootstrap_ip, None);
+
+        let text = text.replace("doh_bootstrap_ip = \"\"", "doh_bootstrap_ip = \"не-адрес\"");
+        assert!(toml::from_str::<Config>(&text).is_err());
     }
 
     /// Закреплённый адрес провайдера имеет смысл, только если из адреса
