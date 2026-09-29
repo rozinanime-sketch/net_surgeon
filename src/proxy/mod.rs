@@ -96,6 +96,13 @@ fn dns_relay_for_divert(config: &Config) -> Option<std::net::SocketAddr> {
 
 pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Размер буфера двунаправленной пересылки данных. 16 КБ вместо прежних 4–8:
+/// на потоковом трафике (видео, загрузки) это в разы меньше syscall'ов на
+/// чтение/запись, а значит меньше нагрузка на CPU и выше пропускная. Больше
+/// не берём, чтобы буфер на каждое соединение (× 2 направления) не раздувал
+/// память при множестве соединений.
+pub(crate) const PUMP_BUF: usize = 16 * 1024;
+
 pub async fn run_all(
     config: Arc<Config>,
     domains: Arc<HashSet<String>>,

@@ -207,7 +207,7 @@ pub async fn handle_connect(
         }
 
         // Дальше стратегия уже ни при чём — обычное перекладывание байт.
-        let mut buffer = [0u8; 4096];
+        let mut buffer = [0u8; crate::proxy::PUMP_BUF];
         loop {
             match client_reader.read(&mut buffer).await {
                 Ok(0) => { let _ = server_writer.shutdown().await; break; }
@@ -228,7 +228,7 @@ pub async fn handle_connect(
     let metrics_s2c = Arc::clone(&metrics);
     let responded_s2c = Arc::clone(&responded);
     let server_to_client = async move {
-        let mut buffer = [0u8; 4096];
+        let mut buffer = [0u8; crate::proxy::PUMP_BUF];
         let mut first_byte_seen = false;
         loop {
             match server_reader.read(&mut buffer).await {

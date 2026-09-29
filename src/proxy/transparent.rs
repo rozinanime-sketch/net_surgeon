@@ -482,7 +482,7 @@ async fn handle(
     let metrics_s2c = Arc::clone(metrics);
 
     let to_client = async move {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; crate::proxy::PUMP_BUF];
         let mut first = true;
         loop {
             match server_reader.read(&mut buf).await {
@@ -507,7 +507,7 @@ async fn handle(
 
     let metrics_c2s = Arc::clone(metrics);
     let to_server = async move {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; crate::proxy::PUMP_BUF];
         loop {
             match client_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,

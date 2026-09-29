@@ -449,7 +449,7 @@ async fn handle_connect(
         }
 
         let mut sent = initial.len() as u64;
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; crate::proxy::PUMP_BUF];
         let end = loop {
             match cr.read(&mut buf).await {
                 Ok(0) => break End::fin(Side::Client),
@@ -469,7 +469,7 @@ async fn handle_connect(
         ClientSide { selected, domain, bypass: wants_bypass, sent, end: Some(end) }
     };
     let to_client = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; crate::proxy::PUMP_BUF];
         let mut received = 0u64;
         let mut last_rx = None;
         let end = loop {
