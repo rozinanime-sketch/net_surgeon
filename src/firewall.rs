@@ -47,6 +47,10 @@ const RT_TABLE: u32 = 100;
 
 const CAP_NET_ADMIN: u32 = 12;
 
+/// Пакетный режим: номер очереди NFQUEUE (то же значение — `nfqueue::QUEUE_NUM`).
+/// fwmark'и переотправки и проб берутся из `crate::bypass::packet_mode`.
+const NFQ_QUEUE: u16 = 0;
+
 /// Что включить.
 pub struct Plan {
     /// Группа, трафик которой не перехватывается, — группа самого прокси.
@@ -60,13 +64,16 @@ pub struct Plan {
     /// Перехватывать ли и UDP звонков (`session::CALL_PORTS` и сети
     /// Telegram). Идёт той же дорогой, что QUIC, и без неё не включается.
     pub calls: bool,
+    /// Пакетный режим: TCP/443 не заворачивается на слушатель, а уходит в
+    /// очередь NFQUEUE (`crate::nfqueue`). QUIC и DNS — по-прежнему.
+    pub packet: bool,
 }
 
 /// Команды для `nft`, по одной на строку: так их понимает и `nft -f`,
 /// и `nft -i`.
 pub fn ruleset(plan: &Plan) -> String {
     let t = format!("inet {TABLE}");
-    let Plan { gid, port, dns_port, quic, calls } = *plan;
+    let Plan { gid, port, dns_port, quic, calls, packet } = *plan;
     let mut s = String::new();
     let mut add = |line: String| {
         s.push_str(&line);
@@ -80,7 +87,26 @@ pub fn ruleset(plan: &Plan) -> String {
     // и IPv6 — на [::1], где прокси держит второй слушатель.
     add(format!("add chain {t} nat_out {{ type nat hook output priority -100; }}"));
     add(format!("add rule {t} nat_out meta skgid {gid} return"));
-    add(format!("add rule {t} nat_out tcp dport 443 redirect to :{port}"));
+    if packet {
+        // Пакетный режим: TCP/443 в очередь NFQUEUE вместо разворота на
+        // слушатель. Только IPv4 (raw-сокет переотправки отдаёт IP-заголовок
+        // сам лишь для v4) и только пакет с данными: по флагам PSH+ACK, но не
+        // SYN — иначе SYN занял бы метку/поток раньше самого ClientHello.
+        let reinject = crate::bypass::packet_mode::REINJECT_FWMARK;
+        let probe = crate::bypass::packet_mode::PROBE_FWMARK;
+        let hello = "meta nfproto ipv4 tcp dport 443 tcp flags & (fin | syn | rst | psh | ack) == (psh | ack)";
+        add(format!("add chain {t} queue_out {{ type filter hook output priority 0; }}"));
+        // Свои переотправленные сегменты — мимо очереди.
+        add(format!("add rule {t} queue_out meta mark {reinject:#x} return"));
+        // Пробы диагностики: в очередь, несмотря на исключение группы прокси ниже.
+        add(format!("add rule {t} queue_out meta mark {probe:#x} {hello} queue num {NFQ_QUEUE}"));
+        // Остальной трафик самой программы (DoH, ретранслятор) не трогаем.
+        add(format!("add rule {t} queue_out meta skgid {gid} return"));
+        // ClientHello приложений.
+        add(format!("add rule {t} queue_out {hello} queue num {NFQ_QUEUE}"));
+    } else {
+        add(format!("add rule {t} nat_out tcp dport 443 redirect to :{port}"));
+    }
     if dns_port > 0 {
         // Локальные резолверы (systemd-resolved на 127.0.0.53) не трогаем:
         // наружу они ходят на настоящий адрес, там их и поймает правило.
@@ -144,7 +170,7 @@ struct Held {
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
 /// Ставит перехват. Возвращает, что включено, для сообщения пользователю.
-pub fn install(port: u16, dns_port: u16, calls: bool) -> Result<String, String> {
+pub fn install(port: u16, dns_port: u16, calls: bool, packet: bool) -> Result<String, String> {
     if port == 0 {
         return Err(rust_i18n::t!("fw.no_port").into_owned());
     }
@@ -178,7 +204,7 @@ pub fn install(port: u16, dns_port: u16, calls: bool) -> Result<String, String> 
     }
 
     let routing = add_routing();
-    let plan = Plan { gid: egid, port, dns_port, quic: routing, calls };
+    let plan = Plan { gid: egid, port, dns_port, quic: routing, calls, packet };
     let rules = ruleset(&plan);
 
     // `nft -i` не сообщает об ошибках кодом выхода — он продолжает читать
@@ -400,7 +426,7 @@ mod tests {
 
     #[test]
     fn full_ruleset() {
-        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 1053, quic: true, calls: true });
+        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 1053, quic: true, calls: true, packet: false });
         assert!(r.starts_with("add table inet net_surgeon { flags owner; }\n"));
         assert!(r.contains("nat_out meta skgid 951 return"));
         assert!(r.contains("tcp dport 443 redirect to :1083"));
@@ -419,11 +445,31 @@ mod tests {
 
     #[test]
     fn without_dns_and_quic() {
-        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 0, quic: false, calls: true });
+        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 0, quic: false, calls: true, packet: false });
         assert!(!r.contains("dport 53"));
         assert!(!r.contains("tproxy"));
         assert!(!r.contains("mark_out"));
         assert!(!r.contains("50000-65535"), "звонки идут дорогой QUIC и без неё не ставятся");
         assert!(r.contains("tcp dport 443 redirect to :1083"));
+    }
+
+    /// Пакетный режим: TCP/443 уходит в очередь, а не разворачивается на
+    /// слушатель. DNS-редирект остаётся, свои пакеты мимо, пробы — в очередь.
+    #[test]
+    fn packet_mode_queues_tcp_instead_of_redirect() {
+        use crate::bypass::packet_mode::{PROBE_FWMARK, REINJECT_FWMARK};
+        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 1053, quic: false, calls: false, packet: true });
+        assert!(!r.contains("tcp dport 443 redirect"), "разворота на слушатель нет");
+        assert!(r.contains(&format!("queue num {NFQ_QUEUE}")));
+        assert!(r.contains("udp dport 53 redirect to :1053"), "DNS по-прежнему заворачивается");
+        // Только пакет с данными, не SYN.
+        assert!(r.contains("tcp flags & (fin | syn | rst | psh | ack) == (psh | ack)"));
+        // Переотправленные сегменты — мимо; пробы (по своей метке) — в очередь.
+        assert!(r.contains(&format!("queue_out meta mark {REINJECT_FWMARK:#x} return")));
+        assert!(r.contains(&format!("queue_out meta mark {PROBE_FWMARK:#x}")));
+        // Проба ловится РАНЬШЕ исключения группы прокси, обычный трафик — позже.
+        let probe = r.find(&format!("meta mark {PROBE_FWMARK:#x}")).unwrap();
+        let skip = r.find("queue_out meta skgid").unwrap();
+        assert!(probe < skip, "проба заворачивается несмотря на группу прокси");
     }
 }

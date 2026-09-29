@@ -29,6 +29,7 @@ const FIELD_GROUPS: &[(&str, &[(&str, &str)])] = &[
         ("field.socks5_port", "socks5_port"),
         ("field.socks5_udp_port", "socks5_udp_port"),
         ("field.transparent_port", "transparent_port"),
+        ("field.packet_mode", "packet_mode"),
     ]),
     ("config.group_bypass", &[
         ("field.enabled", "enabled"),

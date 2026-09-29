@@ -84,6 +84,10 @@ pub enum FragStrategy {
     /// Перестроение ClientHello в две TLS-записи. Единственная техника здесь,
     /// которая работает против DPI, пересобирающего TCP-поток.
     TlsRecord,
+    /// Наложение приманки по номеру последовательности. Пакетная техника:
+    /// применяется перехватом, а не сокетом, поэтому меряется только под
+    /// активным перехватом пакетов.
+    Seqovl,
 }
 
 impl FragStrategy {
@@ -96,6 +100,7 @@ impl FragStrategy {
             FragStrategy::Oob => Strategy::Oob,
             FragStrategy::Fake => Strategy::Fake,
             FragStrategy::TlsRecord => Strategy::TlsRecord,
+            FragStrategy::Seqovl => Strategy::Seqovl,
         }
     }
 }
@@ -310,6 +315,10 @@ pub struct DiagnosticResult {
     /// иначе техника молча выродилась бы в обычный сплит и дала бы
     /// бессмысленный результат.
     pub fake: SplitScore,
+    /// Наложение приманки по номеру последовательности. Меряется только под
+    /// активным перехватом пакетов: это единственный режим, где технику вообще
+    /// можно применить. Без перехвата остаётся пустой.
+    pub seqovl: SplitScore,
 }
 
 fn classify_write_error(_e: &std::io::Error) -> ProbeOutcome { ProbeOutcome::ResetOnWrite }
@@ -420,6 +429,11 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
     let packet_mode = crate::bypass::packet_mode::is_active();
     if packet_mode {
         crate::bypass::packet_mode::mark(&stream, crate::bypass::packet_mode::Mark::Probe(strategy.as_strategy()));
+        // На Linux перехват — это очередь NFQUEUE, а её правило исключает
+        // группу прокси, под которой идёт и проба. fwmark проводит пробу в
+        // очередь, чтобы движок применил технику (см. firewall.rs, nfqueue).
+        #[cfg(target_os = "linux")]
+        let _ = crate::nfqueue::set_probe_mark(fd);
     }
 
     let (mut reader, mut writer) = stream.into_split();
@@ -434,6 +448,9 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
         FragStrategy::Disorder => fragment::split_with_disorder(&mut writer, fd, hello, bypass_params.disorder_ttl).await.map(|_| ()),
         FragStrategy::Oob => fragment::split_with_oob(&mut writer, fd, hello).await.map(|_| ()),
         FragStrategy::Fake => fragment::split_with_fake(&mut writer, fd, hello, bypass_params).await.map(|_| ()),
+        // Пакетная: применяется только перехватом (ветка `_ if packet_mode`
+        // выше), а без него мерить нечего — отправляем как есть.
+        FragStrategy::Seqovl => writer.write_all(hello).await,
     };
 
     if let Err(e) = write_result {
@@ -655,6 +672,7 @@ async fn diagnose_with(
             disorder: empty,
             oob: empty,
             fake: empty,
+            seqovl: empty,
         };
     }
 
@@ -675,6 +693,7 @@ async fn diagnose_with(
             disorder: empty,
             oob: empty,
             fake: empty,
+            seqovl: empty,
         };
     }
 
@@ -689,6 +708,7 @@ async fn diagnose_with(
             disorder: empty,
             oob: empty,
             fake: empty,
+            seqovl: empty,
         };
     }
 
@@ -709,6 +729,7 @@ async fn diagnose_with(
             disorder: empty,
             oob,
             fake: empty,
+            seqovl: empty,
         };
     }
 
@@ -738,8 +759,37 @@ async fn diagnose_with(
     // Ступень 6: fake. Последней: как и disorder, платит ретрансмитом. Где
     // приманку отправить нечем, не пробуем: техника молча откатилась бы на
     // обычный сплит, и мы бы измерили не её.
-    let fake = if packet_mode || crate::bypass::socket::fake_supported() {
+    let fake = if packet_mode {
+        // В пакетном режиме приманку ставит перехват (badseq), TTL ни при чём.
         trials(&target, domain, FragStrategy::Fake, bypass_params, trials_count, early_abandon, timing).await
+    } else if crate::bypass::socket::fake_supported() {
+        // Свип TTL от большего к меньшему: первый TTL с живым рукопожатием —
+        // наибольший, при котором приманка не дошла до сервера. Он гарантированно
+        // дальше DPI, поэтому тот увидит приманку и не заморозит соединение.
+        // Меньшие TTL тоже могли бы дать живое рукопожатие, но приманка умерла бы
+        // раньше DPI — и заморозка осталась бы. Найденный TTL кладём в bypass::fake_ttl.
+        let mut chosen = empty;
+        for ttl in [12u32, 10, 8, 6, 5, 4, 3] {
+            let mut probe_params = bypass_params.clone();
+            probe_params.fake_ttl = ttl;
+            let score = trials(&target, domain, FragStrategy::Fake, &probe_params, trials_count, early_abandon, timing).await;
+            if score.is_convincing() {
+                crate::bypass::fake_ttl::note_working(ttl);
+                chosen = score;
+                break;
+            }
+        }
+        chosen
+    } else {
+        empty
+    };
+
+    // Ступень 7: seqovl. Только под перехватом пакетов: сокет не задаёт номер
+    // последовательности, а без перехвата технику вообще нечем применить.
+    // Приманку в бой ставит тот же перехват (env.decoy), так что отдельной
+    // проверки «есть ли чем отправить» не нужно.
+    let seqovl = if packet_mode {
+        trials(&target, domain, FragStrategy::Seqovl, bypass_params, trials_count, early_abandon, timing).await
     } else {
         empty
     };
@@ -753,7 +803,7 @@ async fn diagnose_with(
         probe_quic(domain).await
     };
 
-    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake }
+    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake, seqovl }
 }
 
 #[cfg(test)]

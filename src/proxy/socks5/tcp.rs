@@ -338,6 +338,10 @@ async fn handle_connect(
         strategies, bypass_params, ttl_hours: strategy_ttl_hours, log_tx,
     };
 
+    // Порт клиента: по нему freeze-проба помечает соединение принудительной
+    // техникой (см. engine::probe_force). Для обычных клиентов метки нет.
+    let client_port = stream.peer_addr().ok().map(|a| a.port());
+
     let (mut cr, mut cw) = stream.split();
     let (mut sr, mut sw) = server.split();
 
@@ -409,7 +413,11 @@ async fn handle_connect(
             // стратегий: для x.com это 788 фрагментов, ~секунда задержки и провал,
             // хотя через HTTP-прокси тот же домен открывался с tls_record.
             // Теперь все пути выбирают стратегию в одном месте.
-            if wants_bypass {
+            // Принудительная техника freeze-пробы важнее автоподбора: проба
+            // меряет именно её. Для обычных клиентов метки нет — идёт автоподбор.
+            if let Some(forced) = client_port.and_then(crate::engine::probe_force::take) {
+                selected = crate::proxy::adaptive::Selected { strategy: forced, source: None };
+            } else if wants_bypass {
                 selected = crate::proxy::adaptive::select(&adaptive_ctx, &domain, initial.len());
             }
 

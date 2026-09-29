@@ -63,7 +63,16 @@ async fn main() {
     #[cfg(target_os = "linux")]
     if std::env::args().any(|a| a == "--firewall") {
         let cfg = &startup.config;
-        match net_surgeon::firewall::install(cfg.transparent_port, cfg.udp_port, cfg.enabled && cfg.socks5_junk.calls) {
+        // Установка правил синхронная и ждёт применения nft со `sleep` (до ~1с).
+        // На async-рантайме это блокировало бы воркер, поэтому — spawn_blocking.
+        let (tp, udp, calls, packet) =
+            (cfg.transparent_port, cfg.udp_port, cfg.enabled && cfg.socks5_junk.calls, cfg.packet_mode);
+        let installed = tokio::task::spawn_blocking(move || {
+            net_surgeon::firewall::install(tp, udp, calls, packet)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        match installed {
             Ok(msg) => eprintln!("[{}] {}", glyph::OK, msg),
             Err(e) => {
                 eprintln!("[{}] {}", glyph::ERROR, tr("startup.transparent_failed", &[("error", e)]));

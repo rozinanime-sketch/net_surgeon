@@ -178,6 +178,21 @@ pub enum Technique {
     /// следом настоящие данные двумя сегментами. DPI разбирает подделку,
     /// сервер её отбрасывает: номер вне его окна.
     Fake { pos: usize, decoy: Vec<u8> },
+    /// Наложение по номеру последовательности (zapret
+    /// `--dpi-desync-split-seqovl`).
+    ///
+    /// Первый сегмент уходит со сдвигом номера назад на `overlap` байт: перед
+    /// первой половиной настоящих данных идут `overlap` байт приманки. Эти
+    /// байты попадают на номера до начала данных — в пространство рукопожатия,
+    /// которое сервер уже прошёл, — поэтому он отбрасывает их как повтор и
+    /// оставляет поток без изменений. DPI же складывает приманку с началом
+    /// ClientHello и разбирает искажённую запись: SNI в ней смещён, границы
+    /// TLS-записи не там, где он их ищет.
+    ///
+    /// В отличие от `Fake`, приманка не отдельным пакетом вне окна, а сшита
+    /// с настоящими данными в один сегмент, так что настоящие байты доходят
+    /// сразу и ретрансмита ждать не нужно.
+    Seqovl { pos: usize, overlap: usize, decoy: Vec<u8> },
 }
 
 /// Где резать данные: посередине имени, если оно целиком в сегменте,
@@ -225,6 +240,25 @@ pub fn apply(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
             let fake = with_payload(pkt, t, decoy, t.seq.wrapping_sub(BADSEQ_SHIFT), t.flags);
             let (a, b) = halves(*pos);
             [vec![fake], a, b].concat()
+        }
+        Technique::Seqovl { pos, overlap, decoy } => {
+            let pos = (*pos).clamp(1, payload.len());
+            // Приманка занимает номера до начала данных, а вместе с первой
+            // половиной должна уместиться в один сегмент: только его начало
+            // и видит DPI. Иначе накладывать нечего — обычный сплит.
+            let overlap = (*overlap).min(MAX_SEGMENT.saturating_sub(pos));
+            if overlap == 0 {
+                let (a, b) = halves(pos);
+                return [a, b].concat();
+            }
+            // Первые `overlap` байт — из приманки; если её не хватило, добор
+            // нулями. Следом — настоящая первая половина.
+            let mut first = Vec::with_capacity(overlap + pos);
+            first.extend_from_slice(&decoy[..overlap.min(decoy.len())]);
+            first.resize(overlap, 0);
+            first.extend_from_slice(&payload[..pos]);
+            let ovl = with_payload(pkt, t, &first, t.seq.wrapping_sub(overlap as u32), t.flags & !TCP_PSH);
+            [vec![ovl], segments(pos, payload.len())].concat()
         }
     }
 }
@@ -289,6 +323,94 @@ mod tests {
             out.extend_from_slice(&data);
         }
         out
+    }
+
+    /// Что соберёт обычный получатель. Байты с номером до начала данных
+    /// (пространство рукопожатия) отбрасываются; сегмент целиком левее
+    /// окна пропадает; при пересечении выигрывает пришедший первым. Так
+    /// проверяется, что наложение и подделка не меняют настоящий поток.
+    fn deliver(parts: &[Vec<u8>], base_seq: u32) -> Vec<u8> {
+        let mut buf: Vec<Option<u8>> = Vec::new();
+        for p in parts {
+            let t = parse(p).expect("часть разбирается");
+            let off = t.seq.wrapping_sub(base_seq) as i32 as i64;
+            let data = t.payload(p);
+            if off + data.len() as i64 <= 0 {
+                continue; // целиком до начала данных — старьё, отброшено
+            }
+            for (i, &b) in data.iter().enumerate() {
+                let pos = off + i as i64;
+                if pos < 0 {
+                    continue;
+                }
+                let pos = pos as usize;
+                if pos >= buf.len() {
+                    buf.resize(pos + 1, None);
+                }
+                buf[pos].get_or_insert(b);
+            }
+        }
+        buf.into_iter().map(|b| b.expect("поток без дыр")).collect()
+    }
+
+    #[test]
+    fn seqovl_overlaps_the_start_and_keeps_the_stream() {
+        let pkt = v4(b"0123456789", TCP_ACK | TCP_PSH);
+        let t = parse(&pkt).unwrap();
+        let parts = apply(&pkt, &t, &Technique::Seqovl { pos: 4, overlap: 3, decoy: b"ABCDEF".to_vec() });
+        assert_eq!(parts.len(), 2);
+        let first = parse(&parts[0]).unwrap();
+        // Первый сегмент сдвинут назад на overlap и начат приманкой.
+        assert_eq!(first.seq, 1000u32.wrapping_sub(3));
+        assert_eq!(&first.payload(&parts[0])[..3], b"ABC");
+        assert_eq!(&first.payload(&parts[0])[3..], b"0123");
+        assert_eq!(first.flags & TCP_PSH, 0, "PSH не у первого сегмента");
+        assert_eq!(parse(&parts[1]).unwrap().seq, 1004, "хвост на своём номере");
+        // Получатель отбрасывает приманку и собирает исходный поток.
+        assert_eq!(deliver(&parts, 1000), b"0123456789");
+    }
+
+    #[test]
+    fn seqovl_pads_when_decoy_is_shorter_than_overlap() {
+        let pkt = v4(b"0123456789", TCP_ACK | TCP_PSH);
+        let t = parse(&pkt).unwrap();
+        let parts = apply(&pkt, &t, &Technique::Seqovl { pos: 2, overlap: 4, decoy: b"Z".to_vec() });
+        assert_eq!(&parse(&parts[0]).unwrap().payload(&parts[0])[..4], b"Z\0\0\0");
+        assert_eq!(deliver(&parts, 1000), b"0123456789");
+    }
+
+    #[test]
+    fn seqovl_preserves_real_client_hello() {
+        let hello = crate::bypass::tls::build_client_hello_sized("discord.com", 517);
+        let pkt = v4(&hello, TCP_ACK | TCP_PSH);
+        let t = parse(&pkt).unwrap();
+        let pos = split_pos(t.payload(&pkt));
+        let decoy = crate::bypass::tls::build_client_hello_sized("www.google.com", 517);
+        let parts = apply(&pkt, &t, &Technique::Seqovl { pos, overlap: 8, decoy });
+        // До DPI начало потока — приманка, но сервер видит настоящий ClientHello.
+        assert_eq!(deliver(&parts, 1000), hello);
+    }
+
+    /// Даже при чрезмерном запросе overlap первый сегмент вместе с приманкой
+    /// не длиннее MAX_SEGMENT, а хвост режется как обычно.
+    #[test]
+    fn seqovl_first_segment_never_exceeds_mtu() {
+        let hello = crate::bypass::tls::build_client_hello_sized("discord.com", 1800);
+        let pkt = v4(&hello, TCP_ACK | TCP_PSH);
+        let t = parse(&pkt).unwrap();
+        let decoy = crate::bypass::tls::build_client_hello_sized("www.google.com", 1800);
+        let parts = apply(&pkt, &t, &Technique::Seqovl { pos: 130, overlap: 5000, decoy });
+        assert!(parts.iter().all(|p| parse(p).unwrap().payload(p).len() <= MAX_SEGMENT));
+        assert_eq!(deliver(&parts, 1000), hello);
+    }
+
+    /// На данных короче двух байт резать нечего: уходит исходный пакет.
+    #[test]
+    fn seqovl_leaves_tiny_payload_untouched() {
+        let pkt = v4(b"x", TCP_ACK);
+        let t = parse(&pkt).unwrap();
+        let parts = apply(&pkt, &t, &Technique::Seqovl { pos: 1, overlap: 2, decoy: b"AB".to_vec() });
+        assert_eq!(parts, vec![pkt]);
     }
 
     #[test]

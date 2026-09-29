@@ -1,4 +1,5 @@
 pub mod adaptive;
+
 mod tcp;
 mod handshake;
 mod http;
@@ -104,6 +105,17 @@ pub async fn run_all(
     ip_cache: Arc<IpDomainCache>,
     strategies: Arc<StrategyStore>,
 ) {
+    // Порт SOCKS5 для freeze-проб диагностики (engine::freeze): через него
+    // проба гоняет технику по-настоящему. Здесь же, потому что порт берётся
+    // из этого конфига и может смениться при перезапуске прокси.
+    crate::engine::freeze::set_socks_port(config.socks5_port);
+
+    // Идентичность сети для стратегий (engine::net_id): на Linux-десктопе — по
+    // шлюзу. На Android маршрут по умолчанию ведёт в TUN, поэтому там id
+    // приходит из Kotlin по колбэку смены сети, а здесь не трогается.
+    #[cfg(target_os = "linux")]
+    crate::engine::net_id::set(crate::engine::net_id::detect());
+
     let host = config.listen_host.clone();
     let listen_address = format!("{}:{}", host, config.port);
     let udp_address = format!("{}:{}", host, config.udp_port);
@@ -215,6 +227,7 @@ pub async fn run_all(
                     config.strategy_ttl_hours,
                     config.socks5_junk.clone(),
                     dns_relay_for_divert(&config),
+                    config.packet_mode,
                     log_tx,
                     metrics,
                     token,

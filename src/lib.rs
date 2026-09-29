@@ -62,13 +62,32 @@ pub mod headless;
 /// нужны прозрачному режиму.
 #[cfg(windows)]
 pub mod system_proxy;
-/// Прозрачный режим Windows (драйвер WinDivert). Логика перезаписи
-/// пакетов собирается и в тестах на других системах.
-#[cfg(any(windows, test))]
-pub mod windivert;
+/// Прозрачный режим Windows (драйвер WinDivert). Логика перезаписи пакетов
+/// собирается и на Linux (её использует пакетный режим `nfqueue`) и в тестах
+/// на любой системе.
+#[cfg(any(windows, test, target_os = "linux"))]
+pub mod packet;
+/// Пакетный обход на Linux через NFQUEUE — аналог nfqws из zapret. Кормит
+/// общий движок (`packet::desync`, `packet::tcp`) пакетами из очереди
+/// и переотправляет их через raw-сокет.
+#[cfg(target_os = "linux")]
+pub mod nfqueue;
 pub mod observability;
 pub mod protocol;
 pub mod proxy;
+
+/// Сбрасывает подобранное под конкретную сеть состояние: вывод «сеть морозит»
+/// (`engine::freeze`) и подобранный TTL приманки (`bypass::fake_ttl`). Звать при
+/// смене сети (на Android — из VpnService по колбэку ConnectivityManager): число
+/// хопов до DPI и серверов меняется, и старые значения ломали бы обход.
+///
+/// Записи стратегий (`strategies.txt`) не трогаем: у них свой TTL, а полный
+/// сброс вызвал бы шторм передиагностики (и лишний трафик) при каждом
+/// переключении Wi-Fi/мобильной сети.
+pub fn reset_network_tuning() {
+    crate::engine::freeze::reset();
+    crate::bypass::fake_ttl::reset();
+}
 
 /// Терминальный интерфейс. Отключается сборкой без feature `tui` — вместе
 /// с ним уходят ratatui и crossterm, которые на сервере и на Android

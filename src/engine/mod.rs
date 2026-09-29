@@ -6,4 +6,7 @@
 //! ссылки нет.
 
 pub mod diagnostics;
+pub mod freeze;
+pub mod net_id;
+pub mod probe_force;
 pub mod strategy;

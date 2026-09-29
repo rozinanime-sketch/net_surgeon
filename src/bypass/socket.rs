@@ -18,8 +18,8 @@
 //! `IPV6_UNICAST_HOPS` и `MSG_OOB` в Winsock есть. `SO_DOMAIN` там нет,
 //! поэтому семейство берётся из локального адреса сокета. `SO_ORIGINAL_DST`
 //! и приманка fake остаются заглушками: в Windows исходный адрес прозрачного
-//! режима даёт сам перехват (`windivert::original_dst`), он же вставляет
-//! приманку (`windivert::desync`).
+//! режима даёт сам перехват (`packet::original_dst`), он же вставляет
+//! приманку (`packet::desync`).
 
 /// Сокет в том виде, в каком его знает система: номер файла в Unix,
 /// `SOCKET` в Windows. Техники получают его до разделения потока на половины,
@@ -542,7 +542,7 @@ async fn splice_page(fd: RawSock, page: &FakePage) -> std::io::Result<()> {
 /// Может ли техника fake сработать на сокете прокси.
 ///
 /// В Linux и Android — да, см. [`send_fake`]. В Windows сокетом так не
-/// сделать, там приманку вставляет перехват пакетов (`windivert::desync`).
+/// сделать, там приманку вставляет перехват пакетов (`packet::desync`).
 pub const fn fake_supported() -> bool {
     cfg!(any(target_os = "linux", target_os = "android"))
 }

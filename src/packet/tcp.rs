@@ -250,6 +250,13 @@ fn technique_for(strategy: Strategy, payload: &[u8], env: &impl Env) -> Techniqu
         Strategy::SniSplit | Strategy::TlsRecord | Strategy::Oob => Technique::Split { pos },
         Strategy::Disorder => Technique::Disorder { pos },
         Strategy::Fake => Technique::Fake { pos, decoy: env.decoy(payload.len()) },
+        Strategy::Seqovl => {
+            // Приманка — полный ClientHello с именем из белого списка; overlap
+            // в её размер, чтобы она целиком легла перед настоящими данными на
+            // номерах до начала потока (сервер их отбросит как уже принятое).
+            let decoy = env.decoy(payload.len());
+            Technique::Seqovl { pos, overlap: decoy.len(), decoy }
+        }
     }
 }
 
@@ -260,6 +267,7 @@ fn describe(technique: &Technique, len: usize) -> Option<String> {
         Technique::Split { pos } => Some(format!("split {}+{}", pos, len - pos)),
         Technique::Disorder { pos } => Some(format!("disorder {}+{}", pos, len - pos)),
         Technique::Fake { pos, decoy } => Some(format!("fake {}+{}+{}", decoy.len(), pos, len - pos)),
+        Technique::Seqovl { pos, overlap, .. } => Some(format!("seqovl {}:{}+{}", overlap, pos, len - pos)),
     }
 }
 
@@ -407,6 +415,20 @@ mod tests {
         assert_eq!(sent(engine.outbound(&hello(50006), now, &env)).len(), 3, "fake: подделка и две части");
         engine.inbound(&reply(50006, 0x18, &[0x16, 0x03, 0x03, 0x00, 0x7a, 0x02]), now, &env);
         assert!(env.records.borrow().is_empty(), "пробы в бой не засчитываются");
+    }
+
+    #[test]
+    fn seqovl_strategy_maps_to_seqovl_technique_with_full_decoy() {
+        let env = FakeEnv::default();
+        let payload = crate::bypass::tls::build_client_hello_sized("discord.com", 517);
+        match technique_for(Strategy::Seqovl, &payload, &env) {
+            Technique::Seqovl { overlap, decoy, pos } => {
+                assert_eq!(overlap, decoy.len(), "приманка целиком ложится перед данными");
+                assert!(!decoy.is_empty(), "приманка построена");
+                assert!(pos >= 1 && pos < payload.len(), "разрез внутри данных");
+            }
+            other => panic!("ожидался seqovl, а не {other:?}"),
+        }
     }
 
     #[test]

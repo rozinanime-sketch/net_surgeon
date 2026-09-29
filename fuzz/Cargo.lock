@@ -939,11 +939,12 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "net_surgeon"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "libc",
+ "nfq",
  "rand",
  "reqwest",
  "rust-i18n",
@@ -965,6 +966,15 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "net_surgeon",
+]
+
+[[package]]
+name = "nfq"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9c8f4c88952507d9df9400a6a2e48640fb460e21dcb2b4716eb3ff156d6db9e"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

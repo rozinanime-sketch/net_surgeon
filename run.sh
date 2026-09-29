@@ -7,6 +7,7 @@
 #   ./run.sh --diagnose   — только диагностика, трафик не меняется
 #   ./run.sh off          — аварийно снять перехват и вернуть сеть
 #   ./run.sh status       — показать, есть ли сейчас правила перехвата
+#   ./run.sh seqovl [N]   — стенд seqovl через NFQUEUE (очередь N, по умолч. 0)
 #
 # Перехватывается TCP/443 (через nat/REDIRECT), UDP/443 — то есть QUIC —
 # через TPROXY, и UDP/53, то есть DNS: запросы уходят встроенному DoH-релею,
@@ -433,6 +434,55 @@ if [[ $MODE == status || $MODE == --status ]]; then
     else
         say "Перехвата нет, сеть в обычном режиме."
     fi
+    exit 0
+fi
+
+# --- проба seqovl через NFQUEUE (пакетный обход, как nfqws в zapret) --------
+#
+# Стенд, а не продукт: проверить на живом трафике, снимает ли seqovl заморозку
+# после ~16 КБ. Правило заворачивает исходящие ClientHello на 443 в очередь,
+# кроме наших же переотправленных пакетов (их метит SO_MARK). Тестер сам шлёт
+# сегменты и дропает оригинал (examples/nfqws_seqovl.rs). IPv4, локальный трафик.
+if [[ $MODE == seqovl ]]; then
+    QNUM="${2:-0}"
+    NFQ_MARK=0x73  # совпадает с меткой в examples/nfqws_seqovl.rs
+    EX=./target/release/examples/nfqws_seqovl
+    NFQ_RULE=(OUTPUT -p tcp --dport 443
+        --tcp-flags FIN,SYN,RST,PSH,ACK PSH,ACK
+        -m mark ! --mark "$NFQ_MARK" -j NFQUEUE --queue-num "$QNUM")
+
+    command -v iptables >/dev/null || die "Нужен iptables, чтобы направить трафик в очередь."
+    say "Собираю тестер seqovl…"
+    RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~" \
+        cargo build --release --example nfqws_seqovl || die "Сборка не удалась."
+
+    say "Нужны права root: очередь NFQUEUE и raw-сокет."
+    sudo -v || die "Без sudo стенд не поднять."
+
+    # Свой trap: снять только правило очереди. Глобальный cleanup рассчитан на
+    # правила прозрачного режима, которых здесь нет.
+    NFQ_ADDED=0
+    seqovl_cleanup() {
+        [[ $NFQ_ADDED -eq 1 ]] || return 0
+        NFQ_ADDED=0
+        # Снимаем все копии правила: -D по одной, пока находятся.
+        while sudo iptables -C "${NFQ_RULE[@]}" 2>/dev/null; do
+            sudo iptables -D "${NFQ_RULE[@]}" 2>/dev/null || break
+        done
+        say "Правило очереди снято."
+    }
+    trap seqovl_cleanup EXIT INT TERM HUP QUIT
+
+    # Чужих копий быть не должно, но на всякий случай подчистим перед добавлением.
+    while sudo iptables -C "${NFQ_RULE[@]}" 2>/dev/null; do
+        sudo iptables -D "${NFQ_RULE[@]}" 2>/dev/null || break
+    done
+    sudo iptables -A "${NFQ_RULE[@]}" || die "Не удалось добавить правило NFQUEUE."
+    NFQ_ADDED=1
+    say "Очередь $QNUM подключена. Открывай Discord/YouTube — строки '→ имя: seqovl …' в консоли."
+    say "Ctrl-C — выход, правило снимется само."
+
+    sudo "$EX" "$QNUM"
     exit 0
 fi
 

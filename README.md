@@ -75,9 +75,9 @@ YouTube, Discord, нейросети, закрытые для России, Tele
 ### Linux
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.6.4/net_surgeon-0.6.4-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.6.4-x86_64-linux.tar.gz
-cd net_surgeon-0.6.4
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.7.0/net_surgeon-0.7.0-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.7.0-x86_64-linux.tar.gz
+cd net_surgeon-0.7.0
 ./run.sh
 ```
 
@@ -176,7 +176,7 @@ cd net_surgeon-0.6.4
 Нужен Rust 1.88 или новее (проще всего через [rustup](https://rustup.rs)).
 
 ```sh
-git clone --branch v0.6.4 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.7.0 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```

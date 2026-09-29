@@ -37,6 +37,7 @@ fn reward_table(
         (Strategy::Oob, &result.oob),
         (Strategy::Disorder, &result.disorder),
         (Strategy::Fake, &result.fake),
+        (Strategy::Seqovl, &result.seqovl),
     ]
     .into_iter()
     .filter(|(_, s)| s.attempts > 0)

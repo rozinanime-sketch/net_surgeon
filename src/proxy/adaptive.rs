@@ -85,7 +85,13 @@ pub fn select_packet(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selec
 }
 
 fn select_with(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) -> Selected {
-    let usable = |s: Strategy| !packet || crate::bypass::packet_mode::supports(s);
+    // Seqovl — только под перехватом пакетов (сокету номер последовательности
+    // не задать); прочие пакетные техники — как раньше: под перехватом лишь
+    // те, что он умеет применить.
+    let usable = |s: Strategy| match s {
+        Strategy::Seqovl => packet,
+        _ => !packet || crate::bypass::packet_mode::supports(s),
+    };
     let class = HelloClass::of(hello_len);
     // Ручная и массовая диагностика мерят пакетом того же размера, что
     // шлёт браузер: все три боевых пути проходят здесь.
@@ -130,7 +136,10 @@ fn select_with(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) 
         return Selected { strategy: other, source: None };
     }
 
-    let fallback = if packet { Strategy::Fake } else { unmeasured_default(class) };
+    // Под перехватом пакетов до конца диагностики берём seqovl: он подставляет
+    // разрешённое имя и снимает заморозку после ~16 КБ там, где спрятать имя
+    // мало, — самый надёжный первый выбор именно на пакетном пути.
+    let fallback = if packet { Strategy::Seqovl } else { unmeasured_default(class) };
     Selected { strategy: fallback, source: None }
 }
 
@@ -189,7 +198,7 @@ fn spawn_diagnosis(ctx: &Context<'_>, domain: &str, class: HelloClass, hello_len
     let log_tx = ctx.log_tx.clone();
 
     tokio::spawn(async move {
-        let Ok(_slot) = auto_diagnosis_slots().acquire().await else { return };
+        let Ok(slot) = auto_diagnosis_slots().acquire().await else { return };
 
         log_t(&log_tx, LogLevel::Info, "log.auto_diag_started", vec![
             ("domain", domain.clone()),
@@ -200,7 +209,17 @@ fn spawn_diagnosis(ctx: &Context<'_>, domain: &str, class: HelloClass, hello_len
         let timing = ProbeTiming { hello_size: hello_len, ..ProbeTiming::default() };
         let result = diagnostics::diagnose(&domain, &params, timing).await;
 
-        match strategy::choose_from_diagnostics(&result) {
+        // Слот освобождаем до freeze-проб: они идут через прокси и не должны
+        // держать лимит одновременных диагностик (проба может ждать до ~30с).
+        drop(slot);
+
+        // Эскалация на decoy при заморозке: дешёвая техника может пройти
+        // рукопожатие, но замёрзнуть после 16 КБ. freeze-проба это ловит и
+        // переключает на fake (сокетный путь; в пакетном seqovl уже подобран).
+        let chosen = strategy::choose_from_diagnostics(&result);
+        let chosen = crate::engine::freeze::escalate_on_freeze(&domain, chosen, &result, &log_tx).await;
+
+        match chosen {
             Some(chosen) => {
                 store.set(&domain, class, chosen, strategy::confidence_of(&result, chosen));
                 log_nested_t(&log_tx, LogLevel::Success, "log.auto_diag_chosen", "strategy", chosen.label_key(), vec![

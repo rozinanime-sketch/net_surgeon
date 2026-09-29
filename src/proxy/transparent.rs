@@ -87,12 +87,27 @@ pub async fn run_transparent_proxy(
     strategy_ttl_hours: u64,
     junk: crate::config::Socks5JunkParams,
     dns_relay: Option<std::net::SocketAddr>,
+    packet_mode: bool,
     log_tx: LogSender,
     metrics: Arc<Metrics>,
     token: CancellationToken,
     ip_cache: Arc<IpDomainCache>,
     strategies: Arc<StrategyStore>,
 ) {
+    // Пакетный режим на Linux: TCP/443 обходится прямо на пакетах через
+    // NFQUEUE (crate::nfqueue), сокетный слушатель для него не нужен. QUIC и
+    // DNS по-прежнему идут своими путями (transparent_udp, правило nftables).
+    #[cfg(target_os = "linux")]
+    if packet_mode {
+        run_packet_mode(
+            is_enabled, bypass_domains, bypass_params, strategy_ttl_hours,
+            log_tx, metrics, token, ip_cache, strategies,
+        );
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = packet_mode;
+
     // Мусор и DNS нужны только перехвату Windows: в Linux UDP идёт своим
     // слушателем (transparent_udp), а DNS заворачивает правило nftables.
     #[cfg(not(windows))]
@@ -101,7 +116,7 @@ pub async fn run_transparent_proxy(
     // В Windows развёрнутый перехватом пакет приходит на адрес сетевой
     // карты, а не на 127.0.0.1, и слушатель на петле его не принял бы.
     // Подключиться из сети он при этом не даёт: такие пакеты выбрасывает
-    // тот же перехват (см. windivert::nat).
+    // тот же перехват (см. packet::nat).
     let listen_host = if cfg!(windows) { "0.0.0.0" } else { listen_host };
 
     let addr = format!("{}:{}", listen_host, port);
@@ -145,7 +160,7 @@ pub async fn run_transparent_proxy(
     // соединения упёрлись бы в закрытый порт. Не включился — слушатели
     // не нужны: без перехвата к ним никто не придёт.
     #[cfg(windows)]
-    let udp = crate::windivert::UdpContext {
+    let udp = crate::packet::UdpContext {
         policy: crate::proxy::socks5::udp::UdpPolicy {
             is_enabled,
             bypass_domains: Arc::clone(&bypass_domains),
@@ -159,13 +174,13 @@ pub async fn run_transparent_proxy(
     #[cfg(windows)]
     let rules = udp.describe();
     #[cfg(windows)]
-    let tcp = crate::windivert::TcpContext {
+    let tcp = crate::packet::TcpContext {
         strategies: Arc::clone(&strategies),
         bypass_params: bypass_params.clone(),
         ttl_hours: strategy_ttl_hours,
     };
     #[cfg(windows)]
-    let _diverter = match crate::windivert::Diverter::start(port, tcp, udp, &log_tx) {
+    let _diverter = match crate::packet::Diverter::start(port, tcp, udp, &log_tx) {
         Ok(d) => {
             log_t(&log_tx, LogLevel::Success, "log.windivert_on", vec![("rules", rules)]);
             // QUIC перехватывается тем же драйвером, что и TCP, так что
@@ -227,6 +242,63 @@ pub async fn run_transparent_proxy(
     metrics.set_transparent_udp_listening(false);
 }
 
+/// Пакетный режим Linux: гоняет общий движок на очереди NFQUEUE отдельным
+/// потоком. Слушатель не нужен — TCP/443 обходится прямо на пакетах.
+///
+/// Поток живёт до конца процесса: у NFQUEUE-цикла нет чистой отмены, а
+/// `nfqueue::run` защищён от повторного старта, так что перезапуск прокси из
+/// интерфейса очередь не пере-биндит. Диагностика выбора стратегии крутится на
+/// tokio, поэтому поток входит в рантайм (`Handle::enter`).
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_packet_mode(
+    is_enabled: bool,
+    bypass_domains: Arc<HashSet<String>>,
+    bypass_params: BypassParams,
+    strategy_ttl_hours: u64,
+    log_tx: LogSender,
+    metrics: Arc<Metrics>,
+    _token: CancellationToken,
+    ip_cache: Arc<IpDomainCache>,
+    strategies: Arc<StrategyStore>,
+) {
+    use crate::nfqueue::{self, LinuxEnv, QUEUE_NUM};
+
+    let env = LinuxEnv {
+        strategies,
+        bypass_params,
+        ttl_hours: strategy_ttl_hours,
+        is_enabled,
+        bypass_domains,
+        ip_cache,
+        log_tx: log_tx.clone(),
+    };
+    let handle = tokio::runtime::Handle::current();
+    metrics.set_transparent_listening(true);
+    log_t(&log_tx, LogLevel::Success, "log.transparent_listening", vec![
+        ("addr", format!("nfqueue:{QUEUE_NUM}")),
+    ]);
+
+    let log = log_tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("nfqueue-tcp".into())
+        .spawn(move || {
+            let _rt = handle.enter();
+            if let Err(e) = nfqueue::run(QUEUE_NUM, env) {
+                log_t(&log, LogLevel::Error, "log.bind_error", vec![
+                    ("addr", format!("nfqueue:{QUEUE_NUM}")),
+                    ("error", e.to_string()),
+                ]);
+            }
+        });
+    if let Err(e) = spawned {
+        log_t(&log_tx, LogLevel::Error, "log.bind_error", vec![
+            ("addr", format!("nfqueue:{QUEUE_NUM}")),
+            ("error", e.to_string()),
+        ]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     mut client: TcpStream,
@@ -244,7 +316,7 @@ async fn handle(
     #[cfg(not(windows))]
     let target_addr = socket::original_dst(socket::raw_sock(&client));
     #[cfg(windows)]
-    let target_addr = client.peer_addr().ok().and_then(crate::windivert::original_dst);
+    let target_addr = client.peer_addr().ok().and_then(crate::packet::original_dst);
     let Some(target_addr) = target_addr else {
         log_t(log_tx, LogLevel::Warning, "log.transparent_no_dst", vec![]);
         return;

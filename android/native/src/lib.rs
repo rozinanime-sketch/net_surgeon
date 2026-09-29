@@ -287,6 +287,19 @@ pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_stop<'l>(_env: JNI
     stop();
 }
 
+/// Сеть сменилась: задаём её id (для ключей стратегий) и сбрасываем подобранное
+/// под прежнюю сеть состояние (см. `net_surgeon::reset_network_tuning`).
+/// Соединения не рвём — новые сами перемеряются под новую сеть.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_onNetworkChanged<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    net_id: JString<'l>,
+) {
+    net_surgeon::engine::net_id::set(java_string(&mut env, &net_id));
+    net_surgeon::reset_network_tuning();
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_isRunning<'l>(
     _env: JNIEnv<'l>,

@@ -36,7 +36,12 @@ const STORE_PATH: &str = "strategies.txt";
 /// Методика отвечает на «сопоставимы ли измерения», формат — на «как
 /// разобрать строку». Раньше версионировалось только первое, и добавление
 /// нового поля пришлось бы угадывать по числу колонок.
-const STORE_FORMAT: u32 = 5;
+const STORE_FORMAT: u32 = 6;
+
+/// Формат без колонки `net`: записи не привязаны к сети (снятые на одной
+/// сети применялись на любой). При чтении получают пустой id сети и потому
+/// не совпадают с записями конкретной сети — домен перемеряется под неё.
+const STORE_FORMAT_WITHOUT_NET: u32 = 5;
 
 /// Формат, где вывод «ничего не помогло» писался как `none` с нулевой
 /// уверенностью, а не отдельным словом `resigned`. Колонки те же, что
@@ -89,7 +94,14 @@ impl HelloClass {
     }
 }
 
-type Key = (String, HelloClass);
+/// Ключ записи стратегии: сеть + домен + класс ClientHello. Сеть в ключе —
+/// чтобы записи разных сетей не перепутались (см. `engine::net_id`).
+type Key = (String, String, HelloClass);
+
+/// Строит ключ для текущей сети.
+fn key_for(domain: &str, class: HelloClass) -> Key {
+    (crate::engine::net_id::current(), normalize_domain(domain), class)
+}
 
 /// Стратегия обхода для TCP/TLS-пути (HTTPS-туннель).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +129,16 @@ pub enum Strategy {
     /// Настоящий ClientHello уходит повтором на тех же номерах, поэтому,
     /// как и disorder, техника платит временем ретрансмита.
     Fake,
+    /// Наложение по номеру последовательности: перед настоящим ClientHello в
+    /// тот же поток кладётся поддельный ClientHello с именем из белого списка,
+    /// но на номерах до начала данных. Сервер отбрасывает приманку как уже
+    /// принятое и получает настоящий поток, а DPI видит в начале разрешённое
+    /// имя. В отличие от fake, приманка сшита с данными в один сегмент — ждать
+    /// ретрансмита не нужно.
+    ///
+    /// Пакетная техника: обычному сокету номер последовательности не задать,
+    /// поэтому доступна только под перехватом пакетов (Windows, Linux/nfqueue).
+    Seqovl,
 }
 
 impl Strategy {
@@ -128,6 +150,7 @@ impl Strategy {
             Strategy::Disorder => "disorder",
             Strategy::Oob => "oob",
             Strategy::Fake => "fake",
+            Strategy::Seqovl => "seqovl",
         }
     }
 
@@ -149,6 +172,7 @@ impl Strategy {
             "disorder" => Some(Strategy::Disorder),
             "oob" => Some(Strategy::Oob),
             "fake" => Some(Strategy::Fake),
+            "seqovl" => Some(Strategy::Seqovl),
             // Техника убрана как нерабочая; записи из старых strategies.txt
             // не распознаются, и домен просто продиагностируется заново.
             "tiny_chunks" | "socks5_style" => None,
@@ -170,6 +194,7 @@ impl Strategy {
             Strategy::Disorder => "strategy.disorder",
             Strategy::Oob => "strategy.oob",
             Strategy::Fake => "strategy.fake",
+            Strategy::Seqovl => "strategy.seqovl",
         }
     }
 }
@@ -242,6 +267,7 @@ pub fn choose_best(
         (Strategy::Oob, &result.oob),
         (Strategy::Disorder, &result.disorder),
         (Strategy::Fake, &result.fake),
+        (Strategy::Seqovl, &result.seqovl),
     ];
 
     candidates
@@ -256,6 +282,17 @@ pub fn choose_best(
 pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
     if result.direct == ProbeOutcome::Success {
         return Some(Strategy::None);
+    }
+    // Сеть уже уличена в заморозке незабелённого TLS (см. engine::freeze): имя
+    // прятать бесполезно, сразу предпочитаем decoy, если он проходит рукопожатие.
+    // seqovl доступен только под перехватом пакетов, иначе — fake.
+    if crate::engine::freeze::prefer_decoy() {
+        if result.seqovl.is_convincing() {
+            return Some(Strategy::Seqovl);
+        }
+        if result.fake.is_convincing() {
+            return Some(Strategy::Fake);
+        }
     }
     // TLS-record split — первым после direct: он единственный не боится
     // пересборки TCP, поэтому если работает, остальное можно не пробовать.
@@ -283,6 +320,12 @@ pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
     if result.fake.is_convincing() {
         return Some(Strategy::Fake);
     }
+    // Seqovl — тоже последней надеждой (пакетный режим): как и fake, подставляет
+    // разрешённое имя, но вдобавок снимает заморозку после ~16 КБ там, где имя
+    // спрятать мало. Проверяется, только когда перехват пакетов активен.
+    if result.seqovl.is_convincing() {
+        return Some(Strategy::Seqovl);
+    }
     None
 }
 
@@ -295,15 +338,18 @@ fn parse_entries(text: &str) -> HashMap<Key, Entry> {
     let format = parse_store_format(text);
     if let Some(found) = format
         && found != STORE_FORMAT
+        && found != STORE_FORMAT_WITHOUT_NET
         && found != STORE_FORMAT_IMPLICIT_RESIGNED
         && found != STORE_FORMAT_WITHOUT_HELLO
     {
         return HashMap::new();
     }
-    let has_hello_column = matches!(format, Some(STORE_FORMAT | STORE_FORMAT_IMPLICIT_RESIGNED));
+    // Колонка `net` появилась в шестом формате; `hello` — в четвёртом.
+    let has_net_column = format == Some(STORE_FORMAT);
+    let has_hello_column = matches!(format, Some(STORE_FORMAT | STORE_FORMAT_WITHOUT_NET | STORE_FORMAT_IMPLICIT_RESIGNED));
     // В файлах до пятого формата признак отказа выражался нулевой уверенностью
     // у `none`. Прямой успех всегда писался с 1.0, так что перевод однозначен.
-    let implicit_resigned = format != Some(STORE_FORMAT);
+    let implicit_resigned = !matches!(format, Some(STORE_FORMAT | STORE_FORMAT_WITHOUT_NET));
 
     let mut map = HashMap::new();
     for line in text.lines() {
@@ -311,6 +357,15 @@ fn parse_entries(text: &str) -> HashMap<Key, Entry> {
             continue;
         }
         let mut parts = line.split('\t');
+        // В шестом формате первым идёт id сети; в старых его нет — пустой.
+        let net = if has_net_column {
+            match parts.next() {
+                Some(n) => n,
+                None => continue,
+            }
+        } else {
+            ""
+        };
         let (Some(domain), Some(strategy), Some(ts)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
@@ -345,7 +400,7 @@ fn parse_entries(text: &str) -> HashMap<Key, Entry> {
             HelloClass::Large
         };
 
-        map.insert((normalize_domain(domain), class), Entry {
+        map.insert((net.to_string(), normalize_domain(domain), class), Entry {
             strategy, decided_at, confidence, version,
             resigned,
             failures: 0,
@@ -529,6 +584,7 @@ impl StrategyStore {
     /// (`api.` и `cdn.` живут на разных адресах), поэтому наследование —
     /// разумный запасной вариант, а не равноценная замена точному измерению.
     pub fn lookup_detailed(&self, domain: &str, class: HelloClass, ttl_hours: u64) -> Option<(Strategy, MatchKind)> {
+        let net = crate::engine::net_id::current();
         let key = normalize_domain(domain);
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let usable = usable_at(ttl_hours, now_secs());
@@ -538,7 +594,7 @@ impl StrategyStore {
         // (см. `adaptive::select`), и поддомен с протухшей записью навсегда
         // застрял бы на родительской стратегии, ни разу не перепроверившись.
         // Лучше дефолт на несколько секунд и честная диагностика.
-        if let Some(entry) = guard.get(&(key.clone(), class)) {
+        if let Some(entry) = guard.get(&(net.clone(), key.clone(), class)) {
             return usable(entry).then_some((entry.strategy, MatchKind::Exact));
         }
 
@@ -553,7 +609,7 @@ impl StrategyStore {
         // выше по дереву могла лежать свежая запись. Теперь перебор идёт
         // дальше, до первого предка, который годится.
         for parent in crate::bypass::parent_domains(&key) {
-            if let Some(entry) = guard.get(&(parent.to_string(), class))
+            if let Some(entry) = guard.get(&(net.clone(), parent.to_string(), class))
                 && entry.strategy != Strategy::None
                 && usable(entry)
             {
@@ -567,7 +623,7 @@ impl StrategyStore {
     /// Убирает запись — вызывается, когда диагностика больше не находит
     /// рабочую стратегию. Без этого одна случайная удача жила бы до конца TTL.
     pub fn remove(&self, domain: &str, class: HelloClass) {
-        self.inner.write().unwrap_or_else(|e| e.into_inner()).remove(&(normalize_domain(domain), class));
+        self.inner.write().unwrap_or_else(|e| e.into_inner()).remove(&key_for(domain, class));
         self.mark_dirty();
     }
 
@@ -612,13 +668,13 @@ impl StrategyStore {
     /// помогло». Нужен `adaptive::select`: такой вывод не одалживается
     /// ClientHello другого размера.
     pub fn is_resigned(&self, domain: &str, class: HelloClass, ttl_hours: u64) -> bool {
-        let key = (normalize_domain(domain), class);
+        let key = key_for(domain, class);
         let resigned = self.inner.read().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|e| e.resigned);
         resigned && self.lookup_detailed(domain, class, ttl_hours).is_some()
     }
 
     fn insert(&self, domain: &str, class: HelloClass, strategy: Strategy, confidence: f64, resigned: bool) {
-        let key = (normalize_domain(domain), class);
+        let key = key_for(domain, class);
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
 
         // Накопленные исходы переживают переизмерение, если техника та же:
@@ -658,7 +714,8 @@ impl StrategyStore {
     pub fn record_outcome(&self, domain: &str, class: HelloClass, succeeded: bool, ttl_hours: u64) -> bool {
         use std::sync::atomic::Ordering;
 
-        let exact = (normalize_domain(domain), class);
+        let exact = key_for(domain, class);
+        let net = exact.0.clone();
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let usable = usable_at(ttl_hours, now_secs());
 
@@ -685,13 +742,13 @@ impl StrategyStore {
             // стратегию дал предок выше. Раньше исход доставался ближайшей
             // протухшей записи, а нерабочая стратегия настоящего владельца
             // не набирала неудач и не сбрасывалась.
-            let owner = crate::bypass::parent_domains(&exact.0).find(|p| {
+            let owner = crate::bypass::parent_domains(&exact.1).find(|p| {
                 guard
-                    .get(&(p.to_string(), class))
+                    .get(&(net.clone(), p.to_string(), class))
                     .is_some_and(|e| e.strategy != Strategy::None && usable(e))
             });
             match owner {
-                Some(parent) => (parent.to_string(), class),
+                Some(parent) => (net.clone(), parent.to_string(), class),
                 None => return false,
             }
         };
@@ -747,7 +804,7 @@ impl StrategyStore {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let mut rows: Vec<(String, Strategy, f64, f64)> = guard
             .iter()
-            .filter_map(|((domain, class), e)| {
+            .filter_map(|((_net, domain, class), e)| {
                 let total = e.live_ok + e.live_fail;
                 (total >= min_samples).then(|| {
                     let live_rate = e.live_fail as f64 / total as f64;
@@ -792,8 +849,9 @@ impl StrategyStore {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let mut lines: Vec<String> = guard
             .iter()
-            .map(|((domain, class), e)| format!(
-                "{}\t{}\t{}\t{:.2}\t{}\t{}\t{}\t{}",
+            .map(|((net, domain, class), e)| format!(
+                "{}\t{}\t{}\t{}\t{:.2}\t{}\t{}\t{}\t{}",
+                net,
                 domain,
                 if e.resigned { RESIGNED_STORE_STRING.to_string() } else { e.strategy.to_store_string() },
                 e.decided_at,
@@ -807,7 +865,7 @@ impl StrategyStore {
         lines.sort();
 
         let header = format!(
-            "# format={} columns=domain,strategy,decided_at,confidence,version,live_ok,live_fail,hello\n",
+            "# format={} columns=net,domain,strategy,decided_at,confidence,version,live_ok,live_fail,hello\n",
             STORE_FORMAT
         );
         let written = crate::config::paths::write_atomic(STORE_PATH, &(header + &lines.join("\n") + "\n"));
@@ -844,7 +902,7 @@ impl StrategyStore {
     /// не должны запускать десятки прогонов), и неудачную: если не сработало
     /// ничего, повторять прогон на каждое соединение бессмысленно.
     pub fn claim_auto_diagnosis(&self, domain: &str, class: HelloClass, cooldown: std::time::Duration) -> bool {
-        let key = (normalize_domain(domain), class);
+        let key = key_for(domain, class);
         let now = std::time::Instant::now();
         let mut guard = self.auto_diagnosis.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get(&key) {
@@ -865,6 +923,7 @@ pub fn confidence_of(result: &DiagnosticResult, chosen: Strategy) -> f64 {
         Strategy::Disorder => result.disorder.confidence,
         Strategy::Oob => result.oob.confidence,
         Strategy::Fake => result.fake.confidence,
+        Strategy::Seqovl => result.seqovl.confidence,
         Strategy::None => 1.0,
     }
 }
@@ -889,6 +948,7 @@ mod tests {
             disorder: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             oob: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             fake: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
+            seqovl: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
         }
     }
 
@@ -942,9 +1002,19 @@ mod tests {
         assert_eq!(Strategy::parse("none"), Some(Strategy::None));
         assert_eq!(Strategy::parse("sni_split"), Some(Strategy::SniSplit));
         assert_eq!(Strategy::parse("tls_record"), Some(Strategy::TlsRecord));
+        assert_eq!(Strategy::parse("seqovl"), Some(Strategy::Seqovl));
         // Убранная техника не распознаётся — домен продиагностируется заново
         assert_eq!(Strategy::parse("tiny_chunks"), None);
         assert_eq!(Strategy::parse("socks5_style"), None);
+    }
+
+    #[test]
+    fn seqovl_is_chosen_when_only_it_works() {
+        let mut r = result(ProbeOutcome::SilentDrop, false);
+        r.seqovl = SplitScore { successes: 3, attempts: 3, confidence: 0.44, median_ms: Some(90.0) };
+        assert_eq!(choose_from_diagnostics(&r), Some(Strategy::Seqovl));
+        assert_eq!(choose_best(&r, RewardWeights::default()).map(|(s, _)| s), Some(Strategy::Seqovl));
+        assert_eq!(confidence_of(&r, Strategy::Seqovl), 0.44);
     }
 
     #[test]
@@ -1195,12 +1265,34 @@ mod tests {
         let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
         let old = format!("# format=3 columns=domain,strategy,decided_at,confidence,version,live_ok,live_fail\nexample.com\ttls_record\t1\t0.44\t{v}\t0\t0\n");
         let map = parse_entries(&old);
-        assert!(map.contains_key(&("example.com".to_string(), HelloClass::Large)));
+        assert!(map.contains_key(&(String::new(), "example.com".to_string(), HelloClass::Large)));
 
         let new = format!("# format=4 columns=domain,strategy,decided_at,confidence,version,live_ok,live_fail,hello\nexample.com\toob\t1\t0.44\t{v}\t0\t0\tsmall\n");
         let map = parse_entries(&new);
-        assert_eq!(map.get(&("example.com".to_string(), HelloClass::Small)).map(|e| e.strategy), Some(Strategy::Oob));
-        assert!(!map.contains_key(&("example.com".to_string(), HelloClass::Large)));
+        assert_eq!(map.get(&(String::new(), "example.com".to_string(), HelloClass::Small)).map(|e| e.strategy), Some(Strategy::Oob));
+        assert!(!map.contains_key(&(String::new(), "example.com".to_string(), HelloClass::Large)));
+    }
+
+    /// Один домен, снятый в двух сетях, — две отдельные записи: стратегия с
+    /// одной сети не применяется на другой.
+    #[test]
+    fn entries_are_kept_per_network() {
+        let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
+        let text = format!(
+            "# format=6 columns=net,domain,strategy,decided_at,confidence,version,live_ok,live_fail,hello\n\
+             gw:A\tdiscord.com\tfake\t1\t0.44\t{v}\t0\t0\tlarge\n\
+             gw:B\tdiscord.com\ttls_record\t1\t0.44\t{v}\t0\t0\tlarge\n"
+        );
+        let map = parse_entries(&text);
+        assert_eq!(map.len(), 2, "один домен в двух сетях — две записи");
+        assert_eq!(
+            map.get(&("gw:A".to_string(), "discord.com".to_string(), HelloClass::Large)).map(|e| e.strategy),
+            Some(Strategy::Fake)
+        );
+        assert_eq!(
+            map.get(&("gw:B".to_string(), "discord.com".to_string(), HelloClass::Large)).map(|e| e.strategy),
+            Some(Strategy::TlsRecord)
+        );
     }
 
     #[test]
@@ -1511,9 +1603,28 @@ pub mod apply {
                 }
             }
             Strategy::Fake => {
-                match fragment::split_with_fake(writer, fd, data, bypass).await? {
+                // TTL приманки — подобранный сетью, а не из конфига: он должен
+                // умереть дальше DPI, но ближе сервера (см. bypass::fake_ttl).
+                let mut tuned = bypass.clone();
+                tuned.fake_ttl = crate::bypass::fake_ttl::effective(bypass.fake_ttl);
+                match fragment::split_with_fake(writer, fd, data, &tuned).await? {
                     Some(info) => Ok(Applied::Fake { decoy: info.decoy, real: info.real }),
                     // Приманку не собрать или не отправить — откат на обычный сплит, как у прочих.
+                    None => {
+                        let info = fragment::split_client_hello(writer, data, bypass).await?;
+                        Ok(Applied::Split { first: info.first, second: info.second })
+                    }
+                }
+            }
+            // Seqovl — пакетная техника: сокету номер последовательности не
+            // задать. Сюда она попадать не должна (adaptive не выбирает её вне
+            // перехвата пакетов), но на случай устаревшей записи откатываемся
+            // на fake — ближайшую по смыслу (та же приманка с чужим именем).
+            Strategy::Seqovl => {
+                let mut tuned = bypass.clone();
+                tuned.fake_ttl = crate::bypass::fake_ttl::effective(bypass.fake_ttl);
+                match fragment::split_with_fake(writer, fd, data, &tuned).await? {
+                    Some(info) => Ok(Applied::Fake { decoy: info.decoy, real: info.real }),
                     None => {
                         let info = fragment::split_client_hello(writer, data, bypass).await?;
                         Ok(Applied::Split { first: info.first, second: info.second })

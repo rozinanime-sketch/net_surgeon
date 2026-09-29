@@ -1,6 +1,6 @@
 [package]
 name = "net_surgeon"
-version = "0.6.4"
+version = "0.7.0"
 edition = "2024"
 # Минимальная версия: let-chains (`if let … && let …`) стабильны с 1.88.
 rust-version = "1.88"
@@ -18,6 +18,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "net_surgeon"
 path = "src/main.rs"
+
+# Пробный пакетный обход на Linux через NFQUEUE — аналог nfqws из zapret.
+# Тонкая обёртка над crate::nfqueue для проверки seqovl на живом трафике.
+# Собирается только под Linux (на других системах — заглушка).
+[[example]]
+name = "nfqws_seqovl"
 
 [features]
 default = ["tui"]
@@ -47,6 +53,12 @@ base64 = "0.22"
 
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
+
+# Пакетный обход на Linux (src/nfqueue.rs): чтение NFQUEUE через netlink,
+# без C-зависимостей. Только под Linux (не Android): там нет ни root, ни
+# очереди, и режим не включается.
+[target.'cfg(target_os = "linux")'.dependencies]
+nfq = "0.2.5"
 
 # Техники обхода на Windows (src/bypass/socket.rs): TTL и OOB через Winsock.
 # Обе библиотеки уже приходят с tokio, так что сборка от них не растёт.

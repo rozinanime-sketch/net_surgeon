@@ -7,6 +7,9 @@ import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.service.quicksettings.TileService
@@ -67,10 +70,50 @@ class SurgeonVpnService : VpnService() {
             shutdown()
             return
         }
+        watchNetwork()
         refreshTile(this)
     }
 
+    /**
+     * Смена сети (Wi-Fi ↔ мобильная) меняет число хопов до DPI и серверов,
+     * поэтому подобранное под прежнюю сеть состояние ядра надо сбросить —
+     * иначе, например, TTL приманки окажется неверным. Соединения не рвём:
+     * новые перемеряются сами.
+     */
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+
+    /** Стабильный отпечаток сети без разрешений: интерфейс + отсортированные DNS. */
+    private fun networkId(lp: LinkProperties): String {
+        val iface = lp.interfaceName ?: ""
+        val dns = lp.dnsServers.mapNotNull { it.hostAddress }.sorted().joinToString(",")
+        return "$iface|$dns"
+    }
+
+    private fun watchNetwork() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            // onLinkPropertiesChanged, а не onAvailable: здесь уже есть DNS/интерфейс
+            // для id, и он приходит и при появлении сети, и при её смене.
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                if (NativeBridge.isRunning()) NativeBridge.onNetworkChanged(networkId(lp))
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            netCallback = cb
+        } catch (_: Exception) {
+            // Регистрация может не удаться на редких прошивках — не критично.
+        }
+    }
+
+    private fun unwatchNetwork() {
+        val cb = netCallback ?: return
+        netCallback = null
+        runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }
+    }
+
     private fun shutdown() {
+        unwatchNetwork()
         NativeBridge.stop()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -83,6 +126,7 @@ class SurgeonVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        unwatchNetwork()
         NativeBridge.stop()
         refreshTile(this)
         super.onDestroy()
