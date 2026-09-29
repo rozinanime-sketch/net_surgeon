@@ -296,7 +296,9 @@ pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_onNetworkChanged<'
     _class: JClass<'l>,
     net_id: JString<'l>,
 ) {
-    net_surgeon::engine::net_id::set(java_string(&mut env, &net_id));
+    let id = java_string(&mut env, &net_id);
+    push_line(format!("· сеть: {id}"));
+    net_surgeon::engine::net_id::set(id);
     net_surgeon::reset_network_tuning();
 }
 

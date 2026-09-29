@@ -220,6 +220,47 @@ pub async fn resolve_all(target: &str) -> Vec<SocketAddr> {
 /// Сколько ждать одного адреса, прежде чем перейти к следующему.
 const PER_ADDRESS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// Кэш «мёртвых адресов» (negative-cache / circuit breaker).
+///
+/// IP, который только что не ответил, помечается на короткий срок: следующие
+/// подключения к нему отклоняются мгновенно, а не ждут по 4 с таймаута каждое.
+/// Ровно это лечит «зависший поиск», когда приложение долбит недостижимый IP,
+/// и снимает нагрузку от приложений, веером бьющих по мёртвым адресам.
+///
+/// Кэш ограничен и самоочищается, чтобы не разрастаться: протухшие записи
+/// выбрасываются при каждом обращении (TTL), а при переполнении вытесняется
+/// самая старая (жёсткий предел). Так даже поток из тысяч разных мёртвых IP
+/// не раздувает память.
+const DEAD_ADDR_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const DEAD_ADDR_MAX: usize = 512;
+
+static DEAD_ADDRS: std::sync::Mutex<Option<std::collections::HashMap<std::net::IpAddr, std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// Помечен ли адрес недавно не ответившим. Заодно чистит протухшие записи.
+fn addr_is_dead(ip: std::net::IpAddr) -> bool {
+    let mut guard = DEAD_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    let now = std::time::Instant::now();
+    map.retain(|_, until| *until > now);
+    map.contains_key(&ip)
+}
+
+/// Запоминает адрес как не ответивший на `DEAD_ADDR_TTL`.
+fn mark_addr_dead(ip: std::net::IpAddr) {
+    let mut guard = DEAD_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    let now = std::time::Instant::now();
+    map.retain(|_, until| *until > now);
+    // Предел размера: при переполнении вытесняем ближайшую к протуханию запись.
+    if map.len() >= DEAD_ADDR_MAX
+        && let Some(oldest) = map.iter().min_by_key(|(_, until)| **until).map(|(ip, _)| *ip)
+    {
+        map.remove(&oldest);
+    }
+    map.insert(ip, now + DEAD_ADDR_TTL);
+}
+
 /// Сколько ждать запасного подключения через системный резолвер, когда ни
 /// один адрес от DoH не ответил. Больше, чем на один адрес: системный
 /// резолвер может вернуть несколько, и они перебираются по очереди.
@@ -269,6 +310,14 @@ pub async fn connect(target: &str) -> std::io::Result<TcpStream> {
 ///
 /// Для прозрачного режима, где адрес уже известен из conntrack.
 pub async fn connect_addr(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    // Быстрый отказ по negative-кэшу: если адрес только что не ответил, не ждём
+    // снова 4 с — приложение сразу получит отказ и перейдёт к другому адресу.
+    if addr_is_dead(addr.ip()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            rust_i18n::t!("err.connect_timeout", addr = addr, secs = 0).into_owned(),
+        ));
+    }
     match tokio::time::timeout(PER_ADDRESS_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         // Все подключения прокси проходят здесь. Метка — чтобы перехват
         // пакетов в Windows не обходил их второй раз (см. packet_mode).
@@ -276,11 +325,20 @@ pub async fn connect_addr(addr: SocketAddr) -> std::io::Result<TcpStream> {
             crate::bypass::packet_mode::mark(&stream, crate::bypass::packet_mode::Mark::Own);
             Ok(stream)
         }
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            rust_i18n::t!("err.connect_timeout", addr = addr, secs = PER_ADDRESS_CONNECT_TIMEOUT.as_secs()).into_owned(),
-        )),
+        // Отказ/сброс на коннекте (refused, RST) НЕ кэшируем: он и так
+        // мгновенный (задержки не даёт), а у заблокированного по SNI домена
+        // DPI может сбрасывать коннект точечно — пометить его IP мёртвым на
+        // минуту значило бы закрыть домен целиком, хотя другой попыткой или
+        // техникой он открылся бы. Кэшируем только ТАЙМАУТ — источник тех
+        // самых 4-секундных зависаний.
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            mark_addr_dead(addr.ip());
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                rust_i18n::t!("err.connect_timeout", addr = addr, secs = PER_ADDRESS_CONNECT_TIMEOUT.as_secs()).into_owned(),
+            ))
+        }
     }
 }
 
@@ -581,6 +639,28 @@ fn build_dns_query(host: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Кэш мёртвых адресов помечает и не растёт сверх предела: при потоке из
+    /// множества разных IP размер держится в границах (защита от разрастания).
+    #[test]
+    fn dead_addr_cache_marks_and_stays_bounded() {
+        use std::net::{IpAddr, Ipv4Addr};
+        DEAD_ADDRS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).clear();
+
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        assert!(!addr_is_dead(ip), "изначально не мёртв");
+        mark_addr_dead(ip);
+        assert!(addr_is_dead(ip), "помечен мёртвым");
+        assert!(!addr_is_dead(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8))), "другой адрес не задет");
+
+        // Поток из большего числа разных IP, чем предел, — кэш не разрастается.
+        for i in 0..(DEAD_ADDR_MAX as u32 + 200) {
+            mark_addr_dead(IpAddr::V4(Ipv4Addr::from(i.wrapping_add(1))));
+        }
+        let size = DEAD_ADDRS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.len()).unwrap_or(0);
+        assert!(size <= DEAD_ADDR_MAX, "кэш ограничен: {size} <= {DEAD_ADDR_MAX}");
+        DEAD_ADDRS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).clear();
+    }
 
     #[test]
     fn splits_host_and_port() {

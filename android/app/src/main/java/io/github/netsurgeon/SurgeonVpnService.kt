@@ -92,10 +92,15 @@ class SurgeonVpnService : VpnService() {
     private fun watchNetwork() {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
         val cb = object : ConnectivityManager.NetworkCallback() {
-            // onLinkPropertiesChanged, а не onAvailable: здесь уже есть DNS/интерфейс
-            // для id, и он приходит и при появлении сети, и при её смене.
+            // Активно берём свойства при появлении сети: onLinkPropertiesChanged
+            // при регистрации приходит не на всех прошивках, а без id стратегии
+            // не привязываются к сети.
+            override fun onAvailable(network: Network) {
+                cm.getLinkProperties(network)?.let { NativeBridge.onNetworkChanged(networkId(it)) }
+            }
+            // И при смене свойств (новая сеть, другой DNS) — обновляем id.
             override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
-                if (NativeBridge.isRunning()) NativeBridge.onNetworkChanged(networkId(lp))
+                NativeBridge.onNetworkChanged(networkId(lp))
             }
         }
         try {
