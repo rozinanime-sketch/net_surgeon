@@ -516,7 +516,9 @@ build
 #   группа nsproxy + setgid  — прокси сразу стартует в своей группе, и его
 #                              трафик не попадает обратно в перехват;
 #   cap_net_admin            — ставить правила и маршруты;
-#   cap_net_bind_service     — обратный сокет QUIC привязывается к порту 443.
+#   cap_net_bind_service     — обратный сокет QUIC привязывается к порту 443;
+#   cap_net_raw              — raw-сокет переотправки пакетов в пакетном режиме
+#                              (NFQUEUE), без него nfqueue стартовать не может.
 #
 # Пересборка заменяет файл, и всё это с него слетает — тогда спросим снова.
 # Без nft (или с NET_SURGEON_LEGACY=1) — старый путь через iptables ниже.
@@ -539,7 +541,7 @@ ensure_config_port() {
 bin_privileged() {
     [[ $(stat -c %G "$BIN" 2>/dev/null) == "$GROUP" ]] || return 1
     [[ -g $BIN ]] || return 1
-    getcap "$BIN" 2>/dev/null | grep -q cap_net_admin || return 1
+    getcap "$BIN" 2>/dev/null | grep -q cap_net_raw || return 1
 }
 
 if command -v nft >/dev/null && command -v getcap >/dev/null && [[ -z ${NET_SURGEON_LEGACY:-} ]]; then
@@ -552,7 +554,7 @@ if command -v nft >/dev/null && command -v getcap >/dev/null && [[ -z ${NET_SURG
         # Порядок важен: chgrp сбрасывает и бит setgid, и полномочия файла.
         sudo chgrp "$GROUP" "$BIN"
         sudo chmod 2755 "$BIN"
-        sudo setcap cap_net_admin,cap_net_bind_service+ep "$BIN"
+        sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw+ep "$BIN"
         bin_privileged || die "Права выдать не удалось. Каталог на разделе с nosuid? Тогда: NET_SURGEON_LEGACY=1 ./run.sh"
     fi
 
@@ -619,11 +621,11 @@ if enable_udp; then
     # СЕРВЕРА, то есть к порту 443, а порты ниже 1024 без этого полномочия
     # закрыты. Без него каждый QUIC-поток падал с Permission denied, и
     # приложения на QUIC (Discord, браузер) висели до отката на TCP.
-    if sudo setcap cap_net_admin,cap_net_bind_service+ep "$BIN" 2>/dev/null; then
+    if sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw+ep "$BIN" 2>/dev/null; then
         say "Выдал бинарю cap_net_admin и cap_net_bind_service (нужны для TPROXY)."
     else
         warn "Не удалось выдать полномочия — QUIC пойдёт мимо обхода."
-        warn "Вручную: sudo setcap cap_net_admin,cap_net_bind_service+ep $BIN"
+        warn "Вручную: sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw+ep $BIN"
     fi
 else
     warn "TPROXY недоступен (нет модуля ядра xt_TPROXY?) — QUIC пойдёт мимо обхода."

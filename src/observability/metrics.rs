@@ -1,7 +1,15 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::observability::stats::Percentiles;
+
+/// Сколько доменов помнить в разбивке трафика. При переполнении вытесняется
+/// самый лёгкий — интересны как раз тяжёлые. Обновляется раз на соединение
+/// (не на байт), так что линейный проход при вытеснении дёшев.
+const DOMAIN_TRAFFIC_CAP: usize = 512;
+/// Сколько строк отдавать в снимок для интерфейса.
+const DOMAIN_TRAFFIC_TOP: usize = 20;
 
 pub struct Metrics {
     pub active_connections: AtomicUsize,
@@ -36,6 +44,11 @@ pub struct Metrics {
     /// и берётся раз на соединение, а не на каждый байт.
     connect_latency: Mutex<Percentiles>,
     ttfb_latency: Mutex<Percentiles>,
+
+    /// Трафик по доменам: имя → (rx, tx). Копится раз на закрытие соединения
+    /// суммой за это соединение, а не на каждый байт: домен известен при
+    /// установке, а блокировка карты в горячем пути была бы дорогой.
+    domain_traffic: Mutex<HashMap<String, (u64, u64)>>,
 }
 
 impl Metrics {
@@ -54,6 +67,7 @@ impl Metrics {
             transparent_udp_listening: AtomicBool::new(false),
             connect_latency: Mutex::new(Percentiles::new(512)),
             ttfb_latency: Mutex::new(Percentiles::new(512)),
+            domain_traffic: Mutex::new(HashMap::new()),
         })
     }
 
@@ -77,6 +91,40 @@ impl Metrics {
         if let Ok(mut p) = self.connect_latency.lock() {
             p.push(ms);
         }
+    }
+
+    /// Прибавляет трафик соединения его домену. Зовётся один раз, при закрытии
+    /// соединения, с суммами за это соединение. Пустой домен и нулевой трафик
+    /// пропускаются: они только засоряли бы таблицу.
+    pub fn record_domain_traffic(&self, domain: &str, rx: u64, tx: u64) {
+        if domain.is_empty() || (rx == 0 && tx == 0) {
+            return;
+        }
+        let Ok(mut map) = self.domain_traffic.lock() else { return };
+        let entry = map.entry(domain.to_string()).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(rx);
+        entry.1 = entry.1.saturating_add(tx);
+        // Переполнение: выбрасываем самый лёгкий домен — интересны тяжёлые.
+        if map.len() > DOMAIN_TRAFFIC_CAP
+            && let Some(lightest) = map.iter().min_by_key(|(_, (r, t))| r.saturating_add(*t)).map(|(k, _)| k.clone())
+        {
+            map.remove(&lightest);
+        }
+    }
+
+    /// Топ доменов по суммарному трафику (rx+tx), тяжёлые сверху, и суммарный
+    /// трафик ПО ВСЕМ доменам (не только показанным) — чтобы итог в заголовке
+    /// не занижался, когда доменов больше, чем строк в топе.
+    pub fn top_domains(&self) -> (Vec<DomainTraffic>, u64) {
+        let Ok(map) = self.domain_traffic.lock() else { return (Vec::new(), 0) };
+        let total: u64 = map.values().map(|(rx, tx)| rx.saturating_add(*tx)).sum();
+        let mut rows: Vec<DomainTraffic> = map
+            .iter()
+            .map(|(domain, (rx, tx))| DomainTraffic { domain: domain.clone(), rx: *rx, tx: *tx })
+            .collect();
+        rows.sort_by(|a, b| (b.rx + b.tx).cmp(&(a.rx + a.tx)).then_with(|| a.domain.cmp(&b.domain)));
+        rows.truncate(DOMAIN_TRAFFIC_TOP);
+        (rows, total)
     }
 
     /// Time To First Byte: от начала подключения до первого байта ответа сервера.
@@ -118,6 +166,16 @@ impl Metrics {
     }
 }
 
+/// Трафик одного домена для показа в интерфейсе (экран «Трафик»).
+#[derive(Debug, Clone)]
+pub struct DomainTraffic {
+    pub domain: String,
+    /// Отдано пользователем наружу (запросы, аплоады).
+    pub rx: u64,
+    /// Получено пользователю (страницы, видео, скачивания).
+    pub tx: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     pub active_connections: usize,
@@ -147,4 +205,58 @@ pub fn format_bytes(n: u64) -> String {
         unit_idx += 1;
     }
     if unit_idx == 0 { format!("{} {}", n, UNITS[0]) } else { format!("{:.1} {}", value, UNITS[unit_idx]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_traffic_skips_empty_and_zero_and_accumulates() {
+        let m = Metrics::new();
+        m.record_domain_traffic("", 100, 100); // пустой домен — не пишем
+        m.record_domain_traffic("a.com", 0, 0); // нулевой трафик — не пишем
+        m.record_domain_traffic("a.com", 10, 5);
+        m.record_domain_traffic("a.com", 1, 2); // накапливается к тому же домену
+        let (rows, total) = m.top_domains();
+        assert_eq!(rows.len(), 1, "пустой и нулевой не попали");
+        assert_eq!((rows[0].rx, rows[0].tx), (11, 7));
+        assert_eq!(total, 18);
+    }
+
+    #[test]
+    fn top_domains_sorted_by_total_desc() {
+        let m = Metrics::new();
+        m.record_domain_traffic("small.com", 1, 1);
+        m.record_domain_traffic("big.com", 100, 100);
+        m.record_domain_traffic("mid.com", 50, 0);
+        let (rows, total) = m.top_domains();
+        let names: Vec<&str> = rows.iter().map(|r| r.domain.as_str()).collect();
+        assert_eq!(names, ["big.com", "mid.com", "small.com"], "тяжёлые сверху");
+        assert_eq!(total, 252); // 200 + 50 + 2
+    }
+
+    #[test]
+    fn top_domains_truncates_to_top_but_total_counts_all() {
+        let m = Metrics::new();
+        // Больше строк, чем показывает топ: итог должен учитывать все.
+        for i in 0..(DOMAIN_TRAFFIC_TOP + 5) {
+            m.record_domain_traffic(&format!("d{i:03}"), 10, 0);
+        }
+        let (rows, total) = m.top_domains();
+        assert_eq!(rows.len(), DOMAIN_TRAFFIC_TOP, "показываем только топ");
+        assert_eq!(total, (DOMAIN_TRAFFIC_TOP as u64 + 5) * 10, "итог — по всем доменам");
+    }
+
+    #[test]
+    fn cap_evicts_the_lightest_domain() {
+        let m = Metrics::new();
+        // Самый лёгкий — "d0000" (вес 1); дальше веса растут.
+        for i in 0..=DOMAIN_TRAFFIC_CAP {
+            m.record_domain_traffic(&format!("d{i:05}"), (i as u64) + 1, 0);
+        }
+        let (rows, _) = m.top_domains();
+        // При переполнении карта усечена до CAP, вытеснен самый лёгкий (d00000).
+        assert!(rows.iter().all(|r| r.domain != "d00000"), "самый лёгкий вытеснен");
+    }
 }

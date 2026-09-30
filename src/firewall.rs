@@ -92,6 +92,11 @@ pub fn ruleset(plan: &Plan) -> String {
         // слушатель. Только IPv4 (raw-сокет переотправки отдаёт IP-заголовок
         // сам лишь для v4) и только пакет с данными: по флагам PSH+ACK, но не
         // SYN — иначе SYN занял бы метку/поток раньше самого ClientHello.
+        //
+        // Флаг `bypass` — предохранитель «нет читателя → пропустить»: если
+        // процесс не смог занять очередь (нет CAP_NET_RAW, упал), ядро по
+        // умолчанию ДРОПает попавшие в правило пакеты, и весь HTTPS ложится.
+        // С bypass такой пакет просто идёт дальше без обхода — связь цела.
         let reinject = crate::bypass::packet_mode::REINJECT_FWMARK;
         let probe = crate::bypass::packet_mode::PROBE_FWMARK;
         let hello = "meta nfproto ipv4 tcp dport 443 tcp flags & (fin | syn | rst | psh | ack) == (psh | ack)";
@@ -99,11 +104,11 @@ pub fn ruleset(plan: &Plan) -> String {
         // Свои переотправленные сегменты — мимо очереди.
         add(format!("add rule {t} queue_out meta mark {reinject:#x} return"));
         // Пробы диагностики: в очередь, несмотря на исключение группы прокси ниже.
-        add(format!("add rule {t} queue_out meta mark {probe:#x} {hello} queue num {NFQ_QUEUE}"));
+        add(format!("add rule {t} queue_out meta mark {probe:#x} {hello} queue num {NFQ_QUEUE} bypass"));
         // Остальной трафик самой программы (DoH, ретранслятор) не трогаем.
         add(format!("add rule {t} queue_out meta skgid {gid} return"));
         // ClientHello приложений.
-        add(format!("add rule {t} queue_out {hello} queue num {NFQ_QUEUE}"));
+        add(format!("add rule {t} queue_out {hello} queue num {NFQ_QUEUE} bypass"));
     } else {
         add(format!("add rule {t} nat_out tcp dport 443 redirect to :{port}"));
     }

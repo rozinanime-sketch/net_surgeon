@@ -15,6 +15,9 @@ use ratatui::{
 use rust_i18n::t;
 
 use crate::cli::action::Action;
+use crate::engine::diagnostics::{ProbeOutcome, SplitScore};
+use crate::engine::domain_check::DomainCheck;
+use crate::engine::strategy::Strategy;
 
 use super::StepResult;
 
@@ -67,6 +70,9 @@ pub fn handle_key(state: &mut DiagnosticsState, key: KeyCode) -> StepResult {
     } else {
         match key {
             KeyCode::Char('n') => {
+                // Стираем прошлый вердикт: он относился к другому домену и не
+                // должен выглядеть ответом на новый вопрос.
+                crate::engine::domain_check::clear();
                 state.input_buffer = Some(String::new());
                 StepResult::Stay(Action::None)
             }
@@ -85,7 +91,13 @@ pub fn handle_key(state: &mut DiagnosticsState, key: KeyCode) -> StepResult {
 // в отрисовке его тоже нет, как и в состоянии выше (Шаг 1 плана). ---
 
 pub fn draw(frame: &mut Frame, area: Rect, screen: &DiagnosticsState) {
-    let popup = super::centered_rect(60, 40, area);
+    // Готовый разбор показываем крупнее: строк много (направления + пробы техник).
+    let has_result = screen.input_buffer.is_none()
+        && !screen.running
+        && crate::engine::domain_check::with(|c| c.is_some());
+    let (w, h) = if has_result { (68, 70) } else { (60, 40) };
+
+    let popup = super::centered_rect(w, h, area);
     frame.render_widget(Clear, popup);
 
     let outer = Block::default()
@@ -106,6 +118,9 @@ pub fn draw(frame: &mut Frame, area: Rect, screen: &DiagnosticsState) {
     } else if screen.running {
         let p = Paragraph::new(t!("diagnostics.running").to_string()).style(Style::default().fg(Color::Yellow));
         frame.render_widget(p, inner);
+    } else if has_result {
+        let lines = crate::engine::domain_check::with(|c| c.map(result_lines)).unwrap_or_default();
+        frame.render_widget(Paragraph::new(lines), inner);
     } else {
         let p = Paragraph::new(vec![
             Line::from(t!("diagnostics.result_hint").to_string()),
@@ -114,4 +129,92 @@ pub fn draw(frame: &mut Frame, area: Rect, screen: &DiagnosticsState) {
         ]);
         frame.render_widget(p, inner);
     }
+}
+
+/// Короткая подпись исхода пробы: три смысловых ведра, чтобы не тонуть в
+/// десяти вариантах — «проходит», «подмена/порча», «не проходит».
+fn outcome_label(o: ProbeOutcome) -> (String, Color) {
+    use ProbeOutcome::*;
+    match o {
+        Success | UdpReachable => (t!("check.o_pass").to_string(), Color::LightGreen),
+        Injected | Mangled => (t!("check.o_inject").to_string(), Color::Yellow),
+        NotApplicable => (t!("check.o_na").to_string(), Color::DarkGray),
+        _ => (t!("check.o_fail").to_string(), Color::LightRed),
+    }
+}
+
+/// Строка «метка: значение» с цветным значением.
+fn kv(label: String, value: (String, Color)) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+        Span::styled(value.0, Style::default().fg(value.1).add_modifier(Modifier::BOLD)),
+    ])
+}
+
+/// Разбор проверки домена в строки для панели.
+fn result_lines(c: &DomainCheck) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        c.domain.clone(),
+        Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+    ))];
+
+    if c.blocked {
+        lines.push(Line::from(Span::styled(
+            t!("check.blocked").to_string(),
+            Style::default().fg(Color::LightRed),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(kv(t!("check.direct").to_string(), outcome_label(c.result.direct)));
+    lines.push(kv(t!("check.quic").to_string(), outcome_label(c.result.quic)));
+
+    lines.push(Line::from(""));
+    let (tech_text, tech_color) = match c.chosen {
+        Some(s) => {
+            let color = if matches!(s, Strategy::Fake | Strategy::Seqovl) { Color::LightMagenta } else { Color::LightGreen };
+            (t!(s.label_key()).to_string(), color)
+        }
+        None => (t!("check.nothing").to_string(), Color::LightRed),
+    };
+    lines.push(kv(t!("check.technique").to_string(), (tech_text, tech_color)));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t!("check.techniques").to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+    let probes: [(&str, &SplitScore); 6] = [
+        ("tls_record", &c.result.tls_record),
+        ("sni_split", &c.result.sni_split),
+        ("disorder", &c.result.disorder),
+        ("oob", &c.result.oob),
+        ("fake", &c.result.fake),
+        ("seqovl", &c.result.seqovl),
+    ];
+    for (name, s) in probes {
+        // Не пробовали (напр. seqovl без активного перехвата) — не строка.
+        if s.attempts == 0 {
+            continue;
+        }
+        let color = if s.is_convincing() {
+            Color::LightGreen
+        } else if s.successes > 0 {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        let median = s.median_ms.map(|m| format!("  {m:.0}мс")).unwrap_or_default();
+        lines.push(Line::from(Span::styled(
+            format!("  {name:<11} {}/{}{median}", s.successes, s.attempts),
+            Style::default().fg(color),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t!("diagnostics.back_hint").to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
 }

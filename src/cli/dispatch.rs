@@ -191,6 +191,14 @@ pub fn run(
 
                 report_diagnostics(&log_tx, &domain, &result);
 
+                // Структурный итог — на экран «Диагностика» (последний прогон).
+                crate::engine::domain_check::set(crate::engine::domain_check::DomainCheck {
+                    domain: domain.clone(),
+                    result: result.clone(),
+                    blocked: crate::block::is_blocked(&domain),
+                    chosen: strategy::choose_from_diagnostics(&result),
+                });
+
                 use crate::engine::diagnostics::ProbeOutcome::*;
 
                 // Итог называет КОНКРЕТНУЮ технику. Раньше здесь было общее
@@ -244,6 +252,9 @@ pub fn run(
 
         Action::RunDiagnosticsAll => {
             app.diagnostics_running = true;
+            // Массовый прогон не пишет разбор одного домена — стираем прошлый,
+            // иначе после прогона экран показал бы его как свежий итог.
+            crate::engine::domain_check::clear();
             let log_tx = log_tx.clone();
             let config = Arc::clone(config);
             let domains = Arc::clone(domains);
@@ -476,6 +487,23 @@ pub fn run(
                     Err(e) => log::log_t(&log_tx, LogLevel::Error, "log.save_task_error", vec![("error", e.to_string())]),
                 }
             });
+        }
+
+        Action::RefreshStrategies => {
+            // Снимок хранилища и передача в открытый экран. Дёшево (клон под
+            // короткой блокировкой), поэтому синхронно, без фоновой задачи.
+            let rows = strategies.snapshot(config.strategy_ttl_hours);
+            if let crate::cli::screen::Screen::Strategies(state) = &mut app.screen {
+                state.set_rows(rows);
+            }
+        }
+
+        Action::RefreshTraffic => {
+            // Топ доменов по трафику + честный итог в открытый экран «Трафик».
+            let (rows, total) = metrics.top_domains();
+            if let crate::cli::screen::Screen::Traffic(state) = &mut app.screen {
+                state.set_rows(rows, total);
+            }
         }
 
         Action::StartProxy if app.diagnostics_only => {

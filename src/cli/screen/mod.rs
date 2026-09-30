@@ -13,10 +13,14 @@ pub(crate) mod config_editor;
 pub(crate) mod diagnostics;
 pub(crate) mod domains_editor;
 mod main_screen;
+pub(crate) mod strategies;
+pub(crate) mod traffic;
 
 pub use config_editor::ConfigEditorState;
 pub use diagnostics::DiagnosticsState;
 pub use domains_editor::DomainsEditorState;
+pub use strategies::StrategiesState;
+pub use traffic::TrafficState;
 
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -32,6 +36,8 @@ pub enum Screen {
     ConfigEditor(ConfigEditorState),
     DomainsEditor(DomainsEditorState),
     Diagnostics(DiagnosticsState),
+    Strategies(StrategiesState),
+    Traffic(TrafficState),
 }
 
 /// Результат обработки клавиши одним экраном:
@@ -67,6 +73,8 @@ pub fn handle_key(app: &mut App, key: KeyCode) -> Action {
         Screen::ConfigEditor(state) => config_editor::handle_key(state, key),
         Screen::DomainsEditor(state) => domains_editor::handle_key(state, key),
         Screen::Diagnostics(state) => diagnostics::handle_key(state, key),
+        Screen::Strategies(state) => strategies::handle_key(state, key),
+        Screen::Traffic(state) => traffic::handle_key(state, key),
     };
 
     let action = match step {
@@ -97,6 +105,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::ConfigEditor(state) => config_editor::draw(frame, frame.area(), app, state, app.proxy_started),
         Screen::DomainsEditor(state) => domains_editor::draw(frame, frame.area(), state, app.proxy_started),
         Screen::Diagnostics(state) => diagnostics::draw(frame, frame.area(), state),
+        Screen::Strategies(state) => strategies::draw(frame, frame.area(), state),
+        Screen::Traffic(state) => traffic::draw(frame, frame.area(), state),
     }
 
     // Фон, который никто не задал, иначе берётся у терминала. У PowerShell

@@ -22,7 +22,7 @@
 //!
 //! Вместо стратегии может стоять `resigned` — вывод «ни одна техника не
 //! сработала». Пакет тогда уходит как есть, как и при `none`, но запись
-//! живёт час, а не TTL (см. `RESIGNED_TTL_HOURS`).
+//! живёт короче обычного TTL (см. `RESIGNED_TTL`).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -437,7 +437,7 @@ fn normalize_domain(domain: &str) -> String {
 /// записи, что дала стратегию.
 fn usable_at(ttl_hours: u64, now: u64) -> impl Fn(&Entry) -> bool {
     let ttl_secs = ttl_hours.saturating_mul(3600);
-    let resigned_ttl_secs = RESIGNED_TTL_HOURS.saturating_mul(3600).min(ttl_secs);
+    let resigned_ttl_secs = RESIGNED_TTL.as_secs().min(ttl_secs);
     move |entry: &Entry| {
         let ttl = if entry.resigned { resigned_ttl_secs } else { ttl_secs };
         now.saturating_sub(entry.decided_at) < ttl
@@ -457,14 +457,19 @@ fn now_secs() -> u64 {
 /// закономерность.
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
-/// Сколько часов помнить вывод «ничего не помогло».
+/// Сколько помнить вывод «ничего не помогло».
 ///
 /// Меньше обычного TTL, и намеренно: это не измеренное решение, а признание
 /// поражения. Провайдер мог перенастроить DPI, домен мог переехать — такое
 /// стоит перепроверять скоро. Но не при каждом соединении: диагностика это
-/// десяток проб с паузами, и гонять её на каждый запрос дороже, чем час
-/// походить без обхода.
-const RESIGNED_TTL_HOURS: u64 = 1;
+/// десяток проб с паузами.
+///
+/// 15 минут, а не час: резигн бывает ЛОЖНЫМ (пробы отвалились из-за помех в
+/// сети — как было с wattpad под шквалом соединений), и час «без обхода» на
+/// рабочем сайте — слишком долго. Чаще не нужно: передиагностику всё равно
+/// гейтит кулдаун автодиагностики (10 мин), так что «долбёжки» не будет, а
+/// ложный резигн самоизлечится за ~15 минут вместо часа.
+const RESIGNED_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
@@ -553,6 +558,29 @@ impl VerificationStats {
     pub fn failure_rate(&self) -> Option<f64> {
         (self.total > 0).then(|| self.failures as f64 / self.total as f64)
     }
+}
+
+/// Одна запись стратегии для показа в интерфейсе (экран «Стратегии»).
+///
+/// Плоский снимок под RwLock: интерфейс не держит блокировку и не знает про
+/// внутренний `Entry`. Только для чтения — менять стратегии руками нельзя.
+#[derive(Debug, Clone)]
+pub struct StrategyRow {
+    /// id сети (пусто — единый профиль).
+    pub net_id: String,
+    pub domain: String,
+    pub class: HelloClass,
+    pub strategy: Strategy,
+    pub confidence: f64,
+    /// Вывод «ничего не сработало» (не измеренное решение).
+    pub resigned: bool,
+    /// Исходы применения в бою за всё время жизни записи.
+    pub live_ok: u32,
+    pub live_fail: u32,
+    /// Возраст записи, секунд.
+    pub age_secs: u64,
+    /// Протухла по TTL или снята другой версией методики.
+    pub stale: bool,
 }
 
 impl StrategyStore {
@@ -820,6 +848,35 @@ impl StrategyStore {
         rows
     }
 
+    /// Снимок всех записей для интерфейса — свежие сверху, протухшие в конце.
+    ///
+    /// Копирует под блокировкой и сразу отпускает её: экран рисуется из
+    /// готового вектора, не держа RwLock на горячем пути.
+    pub fn snapshot(&self, ttl_hours: u64) -> Vec<StrategyRow> {
+        let fresh = usable_at(ttl_hours, now_secs());
+        let now = now_secs();
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<StrategyRow> = guard
+            .iter()
+            .map(|((net, domain, class), e)| StrategyRow {
+                net_id: net.clone(),
+                domain: domain.clone(),
+                class: *class,
+                strategy: e.strategy,
+                confidence: e.confidence,
+                resigned: e.resigned,
+                live_ok: e.live_ok,
+                live_fail: e.live_fail,
+                age_secs: now.saturating_sub(e.decided_at),
+                stale: !fresh(e),
+            })
+            .collect();
+        // Свежие сверху; при равном возрасте — по имени, чтобы порядок был
+        // устойчивым между кадрами и список не «прыгал».
+        rows.sort_by(|a, b| a.age_secs.cmp(&b.age_secs).then_with(|| a.domain.cmp(&b.domain)));
+        rows
+    }
+
     /// Снимок накопленной обратной связи.
     pub fn verification_stats(&self) -> VerificationStats {
         use std::sync::atomic::Ordering;
@@ -1079,6 +1136,28 @@ mod tests {
         // 2/3 — уже воспроизводимо
         r.tls_record = SplitScore { successes: 2, attempts: 3, confidence: 0.21, median_ms: Some(120.0) };
         assert_eq!(choose_from_diagnostics(&r), Some(Strategy::TlsRecord));
+    }
+
+    #[test]
+    fn snapshot_lists_entries_fresh_first_and_flags_resigned_and_stale() {
+        let store = StrategyStore::new();
+        store.set("keep.com", HelloClass::Large, Strategy::Fake, 0.9);
+        store.set_resigned("nope.com", HelloClass::Large);
+
+        let rows = store.snapshot(24);
+        assert_eq!(rows.len(), 2, "обе записи в снимке");
+
+        let keep = rows.iter().find(|r| r.domain == "keep.com").expect("keep есть");
+        assert_eq!(keep.strategy, Strategy::Fake);
+        assert!(!keep.resigned);
+        assert!(!keep.stale, "свежая запись не протухла");
+
+        let nope = rows.iter().find(|r| r.domain == "nope.com").expect("nope есть");
+        assert!(nope.resigned, "отказ помечен");
+
+        // Нулевой TTL: всё считается протухшим (кроме версии) — флаг stale встаёт.
+        let stale = store.snapshot(0);
+        assert!(stale.iter().all(|r| r.stale), "при TTL=0 все протухли");
     }
 
     #[test]

@@ -505,6 +505,10 @@ async fn handle_connect(
     // Обратная связь по применённой стратегии — та же, что в HTTPS-туннеле.
     crate::proxy::adaptive::record_outcome(&adaptive_ctx, &client.domain, client.selected, responded.load(Ordering::Relaxed));
 
+    // Трафик соединения — его домену. Итоги уже посчитаны обоими
+    // направлениями (client.sent / received), лишних счётчиков не нужно.
+    metrics.record_domain_traffic(&client.domain, client.sent, received);
+
     // Итог соединения — только для доменов с обходом, иначе лог утонет.
     // Без него обрыв после рукопожатия не виден: стратегия считается
     // сработавшей, как только сервер ответил хоть чем-то, а блокировка,

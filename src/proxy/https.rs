@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpStream;
@@ -117,11 +117,17 @@ pub async fn handle_connect(
     let (mut client_reader, mut client_writer) = client_stream.into_split();
     let (mut server_reader, mut server_writer) = server_stream.into_split();
 
+    // Трафик этого соединения по направлениям — суммируется здесь же, рядом с
+    // общими add_rx/add_tx, и записывается домену один раз после join.
+    let rx_total = Arc::new(AtomicU64::new(0));
+    let tx_total = Arc::new(AtomicU64::new(0));
+
     let log_tx_c2s = log_tx.clone();
     let domain_c2s = domain.clone();
     let metrics_c2s = Arc::clone(&metrics);
     let strategies_c2s = Arc::clone(&strategies);
     let bypass_params_c2s = bypass_params.clone();
+    let rx_total_c2s = Arc::clone(&rx_total);
     let client_to_server = async move {
         // Первый пакет собирается ЦЕЛИКОМ и только потом уходит по стратегии.
         // Часть его могла прийти в одном сегменте с CONNECT (initial_payload),
@@ -160,6 +166,7 @@ pub async fn handle_connect(
         let strategy = selected.strategy;
 
         metrics_c2s.add_rx(first.len() as u64);
+        rx_total_c2s.fetch_add(first.len() as u64, Ordering::Relaxed);
 
         if strategy != Strategy::None {
             // Первый пакет — ClientHello, единственное место, где стратегия
@@ -213,6 +220,7 @@ pub async fn handle_connect(
                 Ok(0) => { let _ = server_writer.shutdown().await; break; }
                 Ok(n) => {
                     metrics_c2s.add_rx(n as u64);
+                    rx_total_c2s.fetch_add(n as u64, Ordering::Relaxed);
                     if server_writer.write_all(&buffer[..n]).await.is_err() { break; }
                 }
                 Err(_) => break,
@@ -227,6 +235,7 @@ pub async fn handle_connect(
 
     let metrics_s2c = Arc::clone(&metrics);
     let responded_s2c = Arc::clone(&responded);
+    let tx_total_s2c = Arc::clone(&tx_total);
     let server_to_client = async move {
         let mut buffer = [0u8; crate::proxy::PUMP_BUF];
         let mut first_byte_seen = false;
@@ -244,6 +253,7 @@ pub async fn handle_connect(
                     }
                     let data = &buffer[..bytes_read];
                     metrics_s2c.add_tx(bytes_read as u64);
+                    tx_total_s2c.fetch_add(bytes_read as u64, Ordering::Relaxed);
                     if client_writer.write_all(data).await.is_err() { break; }
                 }
                 Err(_) => break,
@@ -252,6 +262,9 @@ pub async fn handle_connect(
     };
 
     let (selected, _) = tokio::join!(client_to_server, server_to_client);
+
+    // Трафик соединения — его домену, один раз (см. record_domain_traffic).
+    metrics.record_domain_traffic(&domain, rx_total.load(Ordering::Relaxed), tx_total.load(Ordering::Relaxed));
 
     // Обратная связь по применённой стратегии. Раньше решение принималось
     // по нескольким пробам и дальше жило сутки без единой проверки.

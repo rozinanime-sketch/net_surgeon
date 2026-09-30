@@ -85,8 +85,7 @@ pub mod proxy;
 /// сброс вызвал бы шторм передиагностики (и лишний трафик) при каждом
 /// переключении Wi-Fi/мобильной сети.
 pub fn reset_network_tuning() {
-    crate::engine::freeze::reset();
-    crate::bypass::fake_ttl::reset();
+    crate::engine::net_state::reset_for_network();
 }
 
 /// Терминальный интерфейс. Отключается сборкой без feature `tui` — вместе

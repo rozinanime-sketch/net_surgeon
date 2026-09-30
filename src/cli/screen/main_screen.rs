@@ -65,6 +65,16 @@ fn handle_select(app: &mut App) -> StepResult {
     match app.current() {
         MenuItem::Domains => open_domains(app, DomainList::Bypass),
         MenuItem::Blocklist => open_domains(app, DomainList::Block),
+        // Открываем пустым и тут же просим снимок: снять его отсюда нельзя —
+        // у экрана нет доступа к хранилищу, это делает dispatch по Action.
+        MenuItem::Strategies => StepResult::Switch(
+            Screen::Strategies(super::strategies::StrategiesState::new()),
+            Action::RefreshStrategies,
+        ),
+        MenuItem::Traffic => StepResult::Switch(
+            Screen::Traffic(super::traffic::TrafficState::new()),
+            Action::RefreshTraffic,
+        ),
         MenuItem::Diagnostics => {
             // Прогон мог начаться раньше, и экран закрывали: без этого он
             // открывался бы в режиме «можно запускать», хотя прогон идёт.
@@ -139,6 +149,8 @@ fn menu_label(item: MenuItem) -> String {
     match item {
         MenuItem::Domains => t!("menu.domains").to_string(),
         MenuItem::Blocklist => t!("menu.blocklist").to_string(),
+        MenuItem::Strategies => t!("menu.strategies").to_string(),
+        MenuItem::Traffic => t!("menu.traffic").to_string(),
         MenuItem::Diagnostics => t!("menu.diagnostics").to_string(),
         MenuItem::Config => t!("menu.config").to_string(),
         MenuItem::Start => t!("menu.start").to_string(),
@@ -153,14 +165,18 @@ fn draw_menu(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(i, item)| {
             let selected = i == app.selected;
             let prefix = if selected { glyph::SELECTED } else { "  " };
+            // Цвет по смыслу пункта: действия — зелёное/красное, настройки —
+            // серое, остальное (списки и панели наблюдения) — общий голубой
+            // акцент, чтобы меню читалось группами, а не плоским серым.
             let style = if selected {
-                Style::default().fg(Color::White).bg(Color::Rgb(42, 42, 90))
-            } else if *item == MenuItem::Quit {
-                Style::default().fg(Color::LightRed)
-            } else if *item == MenuItem::Start {
-                Style::default().fg(Color::LightGreen)
+                Style::default().fg(Color::White).bg(Color::Rgb(42, 42, 90)).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                match item {
+                    MenuItem::Quit => Style::default().fg(Color::LightRed),
+                    MenuItem::Start => Style::default().fg(Color::LightGreen),
+                    MenuItem::Config => Style::default().fg(Color::DarkGray),
+                    _ => Style::default().fg(Color::Cyan),
+                }
             };
             ListItem::new(format!("{}{}", prefix, menu_label(*item))).style(style)
         })
@@ -516,6 +532,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 ])
             }
         }
+        Screen::Strategies(_) | Screen::Traffic(_) => Line::from(vec![
+            Span::styled("↑↓", Style::default().fg(Color::LightBlue)),
+            Span::raw(format!(" {}   ", t!("footer.navigation"))),
+            Span::styled("r", Style::default().fg(Color::LightBlue)),
+            Span::raw(format!(" {}   ", t!("footer.refresh"))),
+            Span::styled("Esc/q", Style::default().fg(Color::LightBlue)),
+            Span::raw(format!(" {}", t!("footer.back"))),
+        ]),
         Screen::Main => Line::from(vec![
             Span::styled("Tab", Style::default().fg(Color::LightBlue)),
             Span::raw(format!(" {}   ", t!("footer.focus"))),

@@ -11,6 +11,8 @@ use super::traffic_history::TrafficHistory;
 pub enum MenuItem {
     Domains,
     Blocklist,
+    Strategies,
+    Traffic,
     Diagnostics,
     Config,
     Start,
@@ -18,9 +20,11 @@ pub enum MenuItem {
 }
 
 impl MenuItem {
-    pub const ALL: [MenuItem; 6] = [
+    pub const ALL: [MenuItem; 8] = [
         MenuItem::Domains,
         MenuItem::Blocklist,
+        MenuItem::Strategies,
+        MenuItem::Traffic,
         MenuItem::Diagnostics,
         MenuItem::Config,
         MenuItem::Start,

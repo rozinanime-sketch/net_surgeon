@@ -17,7 +17,6 @@
 //! проверяется у пользователя. Логика порогов и путь «Survived/Inconclusive»
 //! покрыты тестами и локальным сервером.
 
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,37 +24,24 @@ use tokio::net::TcpStream;
 
 use crate::engine::strategy::Strategy;
 
-/// Сеть морозит незабелённый TLS — значит для обхода нужна decoy-техника.
-/// Ставится автоподбором (см. [`spawn_diagnosis`]) или конфигом.
-static PREFER_DECOY: AtomicBool = AtomicBool::new(false);
+// Состояние «сеть морозит» и порт проб живут в net_state (единый дом сетевого
+// состояния); здесь — привычные имена, делегирующие туда.
+use crate::engine::net_state;
 
 pub fn prefer_decoy() -> bool {
-    PREFER_DECOY.load(Ordering::Relaxed)
+    net_state::prefer_decoy()
 }
 
 pub fn set_prefer_decoy(on: bool) {
-    PREFER_DECOY.store(on, Ordering::Relaxed);
+    net_state::set_prefer_decoy(on);
 }
-
-/// Сбрасывает вывод «сеть морозит» — при смене сети его надо переустановить
-/// заново. См. `crate::reset_network_tuning`.
-pub fn reset() {
-    set_prefer_decoy(false);
-}
-
-/// Порт собственного SOCKS5, через который идут freeze-пробы. 0 — не задан
-/// (проксирование ещё не поднято): тогда эскалация не запускается.
-static SOCKS_PORT: AtomicU16 = AtomicU16::new(0);
 
 pub fn set_socks_port(port: u16) {
-    SOCKS_PORT.store(port, Ordering::Relaxed);
+    net_state::set_socks_port(port);
 }
 
 pub fn socks_port() -> Option<u16> {
-    match SOCKS_PORT.load(Ordering::Relaxed) {
-        0 => None,
-        p => Some(p),
-    }
+    net_state::socks_port()
 }
 
 /// Техника, подставляющая разрешённое имя в начало потока. Только она
@@ -114,11 +100,20 @@ async fn probe_inner(socks_port: u16, host: &str, strategy: Strategy) -> Verdict
 
     let name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
         Ok(n) => n,
-        Err(_) => return Verdict::Inconclusive,
+        Err(_) => {
+            crate::engine::probe_force::take(local.port()); // ClientHello не уйдёт — снять метку
+            return Verdict::Inconclusive;
+        }
     };
     let mut tls = match connector().connect(name, tcp).await {
         Ok(s) => s,
-        Err(_) => return Verdict::Inconclusive, // рукопожатие не прошло — не улика о заморозке
+        // Рукопожатие не прошло — не улика о заморозке. Метку снимаем на случай,
+        // если соединение оборвалось до отправки ClientHello (тогда прокси её
+        // не забрал); если ClientHello ушёл, take уже вернул None — вреда нет.
+        Err(_) => {
+            crate::engine::probe_force::take(local.port());
+            return Verdict::Inconclusive;
+        }
     };
 
     // identity, а не gzip: сжатие занизило бы объём и могло увести ниже 16 КБ,
@@ -283,14 +278,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefer_decoy_flag_roundtrips_and_reset_clears_it() {
+    fn prefer_decoy_flag_roundtrips() {
+        let _g = crate::engine::net_state::test_guard();
         set_prefer_decoy(false);
         assert!(!prefer_decoy());
         set_prefer_decoy(true);
         assert!(prefer_decoy());
-        // Смена сети сбрасывает вывод «сеть морозит».
-        reset();
-        assert!(!prefer_decoy());
+        set_prefer_decoy(false);
     }
 
     #[tokio::test]

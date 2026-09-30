@@ -14,5 +14,9 @@ pub enum Action {
     RunDiagnosticsAll,
     SaveConfigField(&'static str, String),
     SaveDomains(DomainList, Vec<String>),
+    /// Перечитать таблицу стратегий и обновить открытый экран «Стратегии».
+    RefreshStrategies,
+    /// Перечитать разбивку трафика и обновить открытый экран «Трафик».
+    RefreshTraffic,
     ToggleBackground,
 }

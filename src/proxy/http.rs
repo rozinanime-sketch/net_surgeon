@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,7 +61,8 @@ pub async fn handle_http(
     // запросы keep-alive соединения, адресованные другим хостам, ушли бы
     // на этот же сервер (см. rewrite_for_origin).
     let head = rewrite_for_origin(request_str);
-    metrics.add_rx((request_str.len() + body_prefix.len()) as u64);
+    let first_rx = (request_str.len() + body_prefix.len()) as u64;
+    metrics.add_rx(first_rx);
     if server_stream.write_all(head.as_bytes()).await.is_err() { return; }
     if !body_prefix.is_empty() && server_stream.write_all(body_prefix).await.is_err() { return; }
     let _ = server_stream.flush().await;
@@ -68,7 +70,12 @@ pub async fn handle_http(
     let (mut client_reader, mut client_writer) = client_stream.into_split();
     let (mut server_reader, mut server_writer) = server_stream.into_split();
 
+    // Трафик соединения по направлениям — домену один раз после пересылки.
+    let rx_total = Arc::new(AtomicU64::new(first_rx));
+    let tx_total = Arc::new(AtomicU64::new(0));
+
     let metrics_c2s = Arc::clone(&metrics);
+    let rx_total_c2s = Arc::clone(&rx_total);
     let client_to_server = async move {
         let mut buffer = [0u8; 4096];
         loop {
@@ -76,6 +83,7 @@ pub async fn handle_http(
                 Ok(0) => { let _ = server_writer.shutdown().await; break; }
                 Ok(bytes_read) => {
                     metrics_c2s.add_rx(bytes_read as u64);
+                    rx_total_c2s.fetch_add(bytes_read as u64, Ordering::Relaxed);
                     if server_writer.write_all(&buffer[..bytes_read]).await.is_err() { break; }
                 }
                 Err(_) => break,
@@ -84,6 +92,7 @@ pub async fn handle_http(
     };
 
     let metrics_s2c = Arc::clone(&metrics);
+    let tx_total_s2c = Arc::clone(&tx_total);
     let server_to_client = async move {
         let mut buffer = [0u8; 4096];
         loop {
@@ -92,6 +101,7 @@ pub async fn handle_http(
                 Ok(bytes_read) => {
                     let data = &buffer[..bytes_read];
                     metrics_s2c.add_tx(bytes_read as u64);
+                    tx_total_s2c.fetch_add(bytes_read as u64, Ordering::Relaxed);
                     if client_writer.write_all(data).await.is_err() { break; }
                 }
                 Err(_) => break,
@@ -108,4 +118,7 @@ pub async fn handle_http(
         _ = &mut server_to_client => {}
         _ = &mut client_to_server => { server_to_client.await; }
     }
+
+    // Трафик соединения — его домену (см. Metrics::record_domain_traffic).
+    metrics.record_domain_traffic(&domain, rx_total.load(Ordering::Relaxed), tx_total.load(Ordering::Relaxed));
 }

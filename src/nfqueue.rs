@@ -421,10 +421,13 @@ pub fn process<E: Env, I: Injector>(
 /// Продуктовый цикл: гоняет полный `Engine` с автоподбором на очереди
 /// `queue_num`. Блокирующий; возвращается только при ошибке очереди.
 ///
-/// Правило должно заворачивать оба направления 443 (кроме пакетов с меткой
-/// [`MARK`]): исходящие — чтобы применить технику, входящие — чтобы засчитать
-/// её исход. Выбор стратегии запускает диагностику на tokio, поэтому цикл
-/// должен работать внутри рантайма (`Handle::enter` у вызывающего).
+/// Правило заворачивает только исходящие 443 (кроме пакетов с меткой [`MARK`]):
+/// этого хватает, чтобы применить технику. Входящие движок обрабатывать умеет
+/// (`process` → `Engine::inbound`), но `LinuxEnv::select` зануляет `source`,
+/// так что поток сразу помечается решённым и ответа сервера не ждёт — учёт
+/// стратегий идёт по сокетным пробам, а не отсюда. Выбор стратегии запускает
+/// диагностику на tokio, поэтому цикл должен работать внутри рантайма
+/// (`Handle::enter` у вызывающего).
 pub fn run(queue_num: u16, env: LinuxEnv) -> io::Result<()> {
     use nfq::{Queue, Verdict};
 
@@ -442,20 +445,29 @@ pub fn run(queue_num: u16, env: LinuxEnv) -> io::Result<()> {
     // ClientHello — как и на Windows перед стартом потоков перехвата.
     crate::bypass::packet_mode::set_active(true);
 
-    loop {
-        let mut msg = queue.recv()?;
-        let now = Instant::now();
-        let verdict = match process(msg.get_payload(), &mut engine, &env, &inj, now) {
-            Ok(Disposition::Drop) => Verdict::Drop,
-            Ok(Disposition::Accept) => Verdict::Accept,
-            Err(e) => {
-                eprintln!("nfqueue: ошибка обработки, пропускаю пакет: {e}");
-                Verdict::Accept
-            }
-        };
-        msg.set_verdict(verdict);
-        queue.verdict(msg)?;
-    }
+    let result = (|| -> io::Result<()> {
+        loop {
+            let mut msg = queue.recv()?;
+            let now = Instant::now();
+            let verdict = match process(msg.get_payload(), &mut engine, &env, &inj, now) {
+                Ok(Disposition::Drop) => Verdict::Drop,
+                Ok(Disposition::Accept) => Verdict::Accept,
+                Err(e) => {
+                    eprintln!("nfqueue: ошибка обработки, пропускаю пакет: {e}");
+                    Verdict::Accept
+                }
+            };
+            msg.set_verdict(verdict);
+            queue.verdict(msg)?;
+        }
+    })();
+
+    // Сюда попадаем только при ошибке очереди. Снимаем флаги, чтобы перезапуск
+    // прокси мог поднять пакетный режим заново, а сокетный путь снова считал
+    // себя главным (is_active → false включает его freeze-эскалацию).
+    RUNNING.store(false, Ordering::SeqCst);
+    crate::bypass::packet_mode::set_active(false);
+    result
 }
 
 #[cfg(test)]

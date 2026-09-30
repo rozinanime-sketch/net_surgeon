@@ -42,7 +42,7 @@
 //! прокси запускается в отдельной группе, и исключение делается по ней.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -477,9 +477,14 @@ async fn handle(
 
     metrics.add_rx(payload.len() as u64);
 
+    // Трафик соединения по направлениям — домену один раз после join.
+    let rx_total = Arc::new(AtomicU64::new(payload.len() as u64));
+    let tx_total = Arc::new(AtomicU64::new(0));
+
     let responded = Arc::new(AtomicBool::new(false));
     let responded_flag = Arc::clone(&responded);
     let metrics_s2c = Arc::clone(metrics);
+    let tx_total_s2c = Arc::clone(&tx_total);
 
     let to_client = async move {
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
@@ -494,6 +499,7 @@ async fn handle(
                         metrics_s2c.record_ttfb_ms(started.elapsed().as_secs_f64() * 1000.0);
                     }
                     metrics_s2c.add_tx(len as u64);
+                    tx_total_s2c.fetch_add(len as u64, Ordering::Relaxed);
                     if client_writer.write_all(&buf[..len]).await.is_err() {
                         break;
                     }
@@ -506,6 +512,7 @@ async fn handle(
     };
 
     let metrics_c2s = Arc::clone(metrics);
+    let rx_total_c2s = Arc::clone(&rx_total);
     let to_server = async move {
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
         loop {
@@ -513,6 +520,7 @@ async fn handle(
                 Ok(0) | Err(_) => break,
                 Ok(len) => {
                     metrics_c2s.add_rx(len as u64);
+                    rx_total_c2s.fetch_add(len as u64, Ordering::Relaxed);
                     if server_writer.write_all(&buf[..len]).await.is_err() {
                         break;
                     }
@@ -523,6 +531,9 @@ async fn handle(
     };
 
     let _ = tokio::join!(to_server, to_client);
+
+    // Трафик соединения — его домену (см. Metrics::record_domain_traffic).
+    metrics.record_domain_traffic(&domain, rx_total.load(Ordering::Relaxed), tx_total.load(Ordering::Relaxed));
 
     // Обратная связь по стратегии — та же, что в остальных режимах.
     crate::proxy::adaptive::record_outcome(&adaptive_ctx, &domain, selected, responded.load(Ordering::Relaxed));

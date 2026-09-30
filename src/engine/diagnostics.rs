@@ -778,6 +778,11 @@ async fn diagnose_with(
                 chosen = score;
                 break;
             }
+            // Не убедил — но попытки были: сохраняем самый информативный счёт,
+            // чтобы в логе не стояло «0/0» (fake гонялся, просто не прошёл).
+            if score.attempts > chosen.attempts {
+                chosen = score;
+            }
         }
         chosen
     } else {
