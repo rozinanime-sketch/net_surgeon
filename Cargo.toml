@@ -1,6 +1,6 @@
 [package]
 name = "net_surgeon"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 # Минимальная версия: let-chains (`if let … && let …`) стабильны с 1.88.
 rust-version = "1.88"
@@ -19,6 +19,14 @@ path = "src/lib.rs"
 name = "net_surgeon"
 path = "src/main.rs"
 
+# Трей-иконка (только Linux-десктоп): вкл/выкл фоновой службы одним кликом.
+# Собирается лишь с feature `tray`, поэтому в обычную сборку, на сервер и на
+# Android не попадает вместе с GUI-зависимостью.
+[[bin]]
+name = "net_surgeon-tray"
+path = "src/bin/tray.rs"
+required-features = ["tray"]
+
 # Пробный пакетный обход на Linux через NFQUEUE — аналог nfqws из zapret.
 # Тонкая обёртка над crate::nfqueue для проверки seqovl на живом трафике.
 # Собирается только под Linux (на других системах — заглушка).
@@ -31,6 +39,10 @@ default = ["tui"]
 # ratatui и crossterm на сервере и на Android не нужны и только удлиняют
 # сборку. Без него работает режим --headless.
 tui = ["dep:ratatui", "dep:crossterm"]
+# Трей-иконка Linux (бинарь net_surgeon-tray): вкл/выкл фоновой службы одним
+# кликом через StatusNotifierItem. ksni — чистый Rust поверх D-Bus, без GTK;
+# тянется только с этим флагом, в ядро и на Android не попадает.
+tray = ["dep:ksni"]
 
 [dependencies]
 rand = "0.10.1"
@@ -53,6 +65,10 @@ base64 = "0.22"
 
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
+
+# Трей через StatusNotifierItem (feature `tray`, бинарь net_surgeon-tray).
+# Только Linux-десктоп; на других системах флаг просто не включают.
+ksni = { version = "0.2", optional = true }
 
 # Пакетный обход на Linux (src/nfqueue.rs): чтение NFQUEUE через netlink,
 # без C-зависимостей. Только под Linux (не Android): там нет ни root, ни

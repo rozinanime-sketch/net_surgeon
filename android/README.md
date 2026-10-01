@@ -1,5 +1,7 @@
 # net_surgeon для Android
 
+[← к общему README](../README.md)
+
 То же ядро, что на компьютере, но трафик перехватывает `VpnService`:
 
 ```

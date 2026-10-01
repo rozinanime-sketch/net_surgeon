@@ -46,6 +46,11 @@ export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~"
 
 say "Linux (musl)"
 cargo build --release --target x86_64-unknown-linux-musl
+# Трей собирается ОТДЕЛЬНО и динамически (host gnu): он тянет C-библиотеку
+# libdbus через ksni, а она не линкуется в статический musl. Для десктопного
+# значка это норма — libdbus и glibc есть на любом рабочем столе.
+say "Трей (Linux, динамический)"
+cargo build --release --features tray --bin net_surgeon-tray
 say "Windows"
 cargo build --release --target x86_64-pc-windows-gnu
 say "Android"
@@ -69,6 +74,7 @@ unzip -oq "$WINDIVERT_ZIP" -d "$WINDIVERT_DIR"
 WINDIVERT_SRC=$WINDIVERT_DIR/WinDivert-$WINDIVERT_V-A
 
 LINUX_BIN=target/x86_64-unknown-linux-musl/release/net_surgeon
+TRAY_BIN=target/release/net_surgeon-tray
 WIN_BIN=target/x86_64-pc-windows-gnu/release/net_surgeon.exe
 APK=android/app/build/outputs/apk/release/app-release.apk
 
@@ -79,7 +85,7 @@ RELAY=""
 if [[ -f telegram_relay.txt ]]; then
     RELAY=$(grep -v '^[[:space:]]*#' telegram_relay.txt | sed 's#^[a-z]*://##; s#/.*##' | grep -m1 . || true)
 fi
-for f in "$LINUX_BIN" "$WIN_BIN" "$APK"; do
+for f in "$LINUX_BIN" "$TRAY_BIN" "$WIN_BIN" "$APK"; do
     if grep -aq "$HOME" "$f"; then die "в $f есть путь $HOME"; fi
     if [[ -n $RELAY ]] && { grep -aqF "$RELAY" "$f" || unzip -p "$f" 2>/dev/null | grep -aqF "$RELAY"; }; then
         die "в $f адрес своего воркера Telegram"
@@ -96,7 +102,7 @@ mkdir -p "$DIST/linux/net_surgeon-$V/target/release" "$DIST/windows/net_surgeon-
 
 COMMON=(LICENSE README.md config.toml bypass_domains.txt block_domains.txt smart_dns_domains.txt)
 cp "${COMMON[@]}" run.sh setup-transparent.sh "$DIST/linux/net_surgeon-$V/"
-cp "$LINUX_BIN" "$DIST/linux/net_surgeon-$V/target/release/"
+cp "$LINUX_BIN" "$TRAY_BIN" "$DIST/linux/net_surgeon-$V/target/release/"
 cp "${COMMON[@]}" "$WIN_BIN" "$DIST/windows/net_surgeon-$V/"
 # WinDivert под LGPL: библиотека кладётся без изменений и с лицензией.
 cp "$WINDIVERT_SRC/x64/WinDivert.dll" "$WINDIVERT_SRC/x64/WinDivert64.sys" "$DIST/windows/net_surgeon-$V/"

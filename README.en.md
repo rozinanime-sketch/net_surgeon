@@ -1,50 +1,63 @@
-# net_surgeon
+<div align="center">
 
-[Русский](README.md) | **English**
+# 🩺 net_surgeon
 
-Bypasses ISP website blocking by deep packet inspection (DPI) on **Windows**,
-**Linux** and **Android**. It picks a working bypass technique for each site
-by itself: it tries several techniques and chooses by statistics, not by a
-single lucky attempt.
+**Bypasses ISP website blocking by deep packet inspection (DPI) on Windows, Linux and Android.**
 
-Built for Russian ISPs (YouTube, Discord, AI services closed to Russia,
-Telegram), but the techniques work against SNI-based DPI in general.
+It picks a working bypass technique for each site by itself: it tries several
+techniques and chooses by statistics, not by a single lucky attempt.
 
-## Download
+[![Release](https://img.shields.io/github/v/release/rozinanime-sketch/net_surgeon?label=release&color=2ea043)](https://github.com/rozinanime-sketch/net_surgeon/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/rozinanime-sketch/net_surgeon/total?label=downloads&color=8957e5)](https://github.com/rozinanime-sketch/net_surgeon/releases)
+![Platforms](https://img.shields.io/badge/platforms-Windows_·_Linux_·_Android-informational)
+![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+[Русский](README.md) · **English**
+
+</div>
+
+> 🎯 **YouTube · Discord · AI services closed to Russia · Telegram**
+
+Built for Russian ISPs, but the techniques work against SNI-based DPI in general.
+
+---
+
+## ⬇️ Download
 
 | System | File | How to run |
 |---|---|---|
-| **Windows** 10/11 | `net_surgeon-…-x86_64-windows.zip` | unpack, run `net_surgeon.exe` |
-| **Linux** x86_64 | `net_surgeon-…-x86_64-linux.tar.gz` | unpack, run `./run.sh` |
-| **Android** 8+ (arm64) | `net_surgeon-…-arm64.apk` | install, tap “Turn on” |
+| 🪟 **Windows** 10/11 | `net_surgeon-…-x86_64-windows.zip` | unpack, run `net_surgeon.exe` |
+| 🐧 **Linux** x86_64 | `net_surgeon-…-x86_64-linux.tar.gz` | unpack, run `./run.sh` |
+| 🤖 **Android** 8+ (arm64) | `net_surgeon-…-arm64.apk` | install, tap “Turn on” |
 
-All files are on the [latest release](https://github.com/rozinanime-sketch/net_surgeon/releases/latest) page.
+📦 All files are on the [latest release](https://github.com/rozinanime-sketch/net_surgeon/releases/latest) page.
 
-## Features
+## ✨ Features
 
-- **Bypasses DPI** that filters by site name: splits the TLS ClientHello into
+- 🧬 **Bypasses DPI** that filters by site name: splits the TLS ClientHello into
   several records, cuts the packet in the middle of the name, reorders the
   pieces (disorder), inserts an out-of-band byte.
-- **Picks the technique itself** for each site, remembers it and re-measures
+- 🧠 **Picks the technique itself** for each site, remembers it and re-measures
   it when it stops working.
-- **No setup needed:** on Linux and on Windows (as administrator) it
+- ⚙️ **No setup needed:** on Linux and on Windows (as administrator) it
   intercepts the whole machine's traffic, without administrator rights on
   Windows it sets the system proxy by itself, on Android it works as a VPN
   without root.
-- **Encrypts DNS** (DoH) so the ISP can't spoof site addresses.
-- **Opens AI services closed to Russia** (ChatGPT, Claude, Gemini, Grok,
+- 🔒 **Encrypts DNS** (DoH) so the ISP can't spoof site addresses.
+- 🤖 **Opens AI services closed to Russia** (ChatGPT, Claude, Gemini, Grok,
   Copilot) through a smart DNS.
-- **Telegram** goes through your own free Cloudflare worker when the ISP
+- ✈️ **Telegram** goes through your own free Cloudflare worker when the ISP
   blocks its addresses entirely ([guide, in Russian](cloudflare/README.md)).
 
-**What it can't do:** change your IP address. If a service itself refuses
-your country, only a VPN helps (except the AI services above).
+> ⚠️ **What it can't do:** change your IP address. If a service itself refuses
+> your country, only a VPN helps (except the AI services above).
 
 The interface is in English and Russian and follows the system language.
 
-## Quick start
+## 🚀 Quick start
 
-### Windows
+### 🪟 Windows
 
 1. Download the Windows archive and unpack it anywhere.
 2. Run `net_surgeon.exe`: right-click → “Run as administrator”. Then all
@@ -77,12 +90,12 @@ window and the proxy settings go back to what they were.
 > An antivirus may complain about WinDivert: it is a packet interception
 > driver, the same one GoodbyeDPI and zapret use.
 
-### Linux
+### 🐧 Linux
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.7.3/net_surgeon-0.7.3-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.7.3-x86_64-linux.tar.gz
-cd net_surgeon-0.7.3
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.7.4/net_surgeon-0.7.4-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.7.4-x86_64-linux.tar.gz
+cd net_surgeon-0.7.4
 ./run.sh
 ```
 
@@ -93,41 +106,47 @@ intercept traffic. Press `q` to quit: interception is removed automatically.
 Requires `nft` (nftables), `iproute2` and `setcap` (package `libcap` on Arch,
 `libcap2-bin` on Debian and Ubuntu).
 
-### Android
+> 💡 To run it **in the background and start on login** — no window open:
+> `./run.sh install` (remove it with `./run.sh uninstall`).
+
+### 🤖 Android
 
 Install the APK, tap “Turn on” and accept the VPN connection. It is not a
 real VPN: traffic doesn't leave the phone. Details (in Russian) are in
 [android/README.md](android/README.md).
 
-### Your own sites
+### ➕ Your own sites
 
 The bypass applies only to sites listed in `bypass_domains.txt`, one per
 line. Subdomains count: `youtube.com` also covers `m.youtube.com`. You can
 also add a site from the program itself, in the “Domains” menu.
 
-## Troubleshooting
+## 🛠️ Troubleshooting
 
 | Problem | What to do |
 |---|---|
-| **Windows:** no internet after quitting | Settings → Network & Internet → Proxy → turn the proxy off. The program was probably killed from Task Manager |
-| **Windows:** the log says “port … does not accept intercepted connections” | A firewall or antivirus blocks connections to the transparent mode port (1083): Telegram goes through it when a relay is set. Allow the port for `net_surgeon.exe` |
-| **Linux:** no internet after quitting | `./run.sh off` |
-| A site doesn't open | Check that it is in `bypass_domains.txt`. If it is, run “Diagnostics” for it or delete `strategies.txt` to re-measure everything |
-| Nothing is bypassed | Turn off your VPN: through it the ISP doesn't see the traffic, so the bypass is useless |
-| The site says it's unavailable in your country | That's the site blocking you, not the ISP. Only a VPN helps |
+| 🪟 **Windows:** no internet after quitting | Settings → Network & Internet → Proxy → turn the proxy off. The program was probably killed from Task Manager |
+| 🪟 **Windows:** the log says “port … does not accept intercepted connections” | A firewall or antivirus blocks connections to the transparent mode port (1083): Telegram goes through it when a relay is set. Allow the port for `net_surgeon.exe` |
+| 🐧 **Linux:** no internet after quitting | `./run.sh off` |
+| 🌐 A site doesn't open | Check that it is in `bypass_domains.txt`. If it is, run “Diagnostics” for it or delete `strategies.txt` to re-measure everything |
+| 🚫 Nothing is bypassed | Turn off your VPN: through it the ISP doesn't see the traffic, so the bypass is useless |
+| 🌍 The site says it's unavailable in your country | That's the site blocking you, not the ISP. Only a VPN helps |
 
 The program has been tested on one network. If it doesn't work for you,
 [describe the problem](https://github.com/rozinanime-sketch/net_surgeon/issues)
 and attach the log from the program window.
 
 <details>
-<summary><b>Linux: other modes and manual proxy</b></summary>
+<summary><b>🐧 Linux: other modes and manual proxy</b></summary>
 
 ```sh
 ./run.sh plain        # proxy ports only, no interception
 ./run.sh --diagnose   # diagnostics only, traffic is not changed
 ./run.sh off          # emergency: remove interception and restore the network
 ./run.sh status       # show whether interception rules are active
+./run.sh install      # install as a background service (autostart on login)
+./run.sh uninstall    # remove the background service (and tray)
+./run.sh tray         # tray icon: toggle the service on/off with one click
 ```
 
 In `plain` mode, point your application at the proxy yourself:
@@ -140,7 +159,7 @@ In `plain` mode, point your application at the proxy yourself:
 </details>
 
 <details>
-<summary><b>Linux: how interception works and why the network shouldn't break</b></summary>
+<summary><b>🐧 Linux: how interception works and why the network shouldn't break</b></summary>
 
 HTTPS (TCP/443), QUIC (UDP/443), DNS (UDP/53) and call UDP (Discord voice on
 ports 50000–65535, STUN, Telegram servers) are intercepted. Junk goes before
@@ -175,12 +194,12 @@ The script's messages on this path are in Russian:
 </details>
 
 <details>
-<summary><b>Building from source</b></summary>
+<summary><b>🔨 Building from source</b></summary>
 
 Requires Rust 1.88 or newer (easiest via [rustup](https://rustup.rs)).
 
 ```sh
-git clone --branch v0.7.3 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.7.4 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```
@@ -193,7 +212,7 @@ Building the Android app is described (in Russian) in
 </details>
 
 <details>
-<summary><b>Files</b></summary>
+<summary><b>📁 Files</b></summary>
 
 - `bypass_domains.txt` — sites the bypass applies to.
 - `smart_dns_domains.txt` — sites resolved through the smart DNS.
@@ -207,6 +226,6 @@ Building the Android app is described (in Russian) in
 
 </details>
 
-## License
+## 📄 License
 
 [MIT](LICENSE).

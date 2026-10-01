@@ -8,6 +8,9 @@
 #   ./run.sh off          — аварийно снять перехват и вернуть сеть
 #   ./run.sh status       — показать, есть ли сейчас правила перехвата
 #   ./run.sh seqovl [N]   — стенд seqovl через NFQUEUE (очередь N, по умолч. 0)
+#   ./run.sh install      — поставить фоновой службой (автозапуск при входе)
+#   ./run.sh uninstall    — убрать фоновую службу (и трей)
+#   ./run.sh tray         — значок в лотке: вкл/выкл службу одним кликом
 #
 # Перехватывается TCP/443 (через nat/REDIRECT), UDP/443 — то есть QUIC —
 # через TPROXY, и UDP/53, то есть DNS: запросы уходят встроенному DoH-релею,
@@ -434,6 +437,144 @@ if [[ $MODE == status || $MODE == --status ]]; then
     else
         say "Перехвата нет, сеть в обычном режиме."
     fi
+    exit 0
+fi
+
+# --- фоновый сервис: «поставил и забыл» ------------------------------------
+#
+# Программа ставится ПОЛЬЗОВАТЕЛЬСКОЙ службой systemd, тихо работает в фоне
+# (--headless), стартует при входе и снимает перехват сама по SIGTERM (его
+# ловит headless.rs). Права те же, что и в обычном запуске: файловые
+# capability на бинаре + setgid-группа, root в рантайме не нужен — nft
+# получает CAP_NET_ADMIN через ambient-набор (см. firewall.rs). Поэтому это
+# именно --user служба, без User=/NoNewPrivileges, иначе файловые caps слетят.
+
+SERVICE_NAME=net_surgeon.service
+SERVICE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME"
+TRAY_BIN="$(pwd)/target/release/net_surgeon-tray"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+TRAY_DESKTOP="$AUTOSTART_DIR/net_surgeon-tray.desktop"
+
+if [[ $MODE == install || $MODE == --install ]]; then
+    command -v systemctl >/dev/null || die "Нет systemd (systemctl) — фоновый сервис не для этой системы. Запускайте ./run.sh как обычно."
+    build
+    [[ -x $BIN ]] || die "Бинарь не собран: $BIN"
+
+    # Права как в обычном запуске (см. раздел выдачи прав ниже): группа +
+    # setgid + file caps. Без них служба не поставит nftables и не привяжет 443.
+    if [[ $(stat -c %G "$BIN" 2>/dev/null) != "$GROUP" ]] || [[ ! -g $BIN ]] \
+        || ! getcap "$BIN" 2>/dev/null | grep -q cap_net_raw; then
+        say "Выдаю программе права (один раз после сборки, нужен sudo)."
+        sudo -v || die "Без sudo права не выдать."
+        getent group "$GROUP" >/dev/null || sudo groupadd --system "$GROUP"
+        sudo chgrp "$GROUP" "$BIN"
+        sudo chmod 2755 "$BIN"
+        sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw+ep "$BIN"
+    fi
+
+    if pgrep -x net_surgeon >/dev/null && ! systemctl --user is-active --quiet "$SERVICE_NAME"; then
+        warn "net_surgeon уже запущен вручную — закройте его, иначе два процесса будут спорить за порты."
+    fi
+
+    mkdir -p "$SERVICE_DIR"
+    BIN_ABS="$(pwd)/${BIN#./}"
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=net_surgeon — обход DPI (фоновый режим)
+
+[Service]
+Type=simple
+WorkingDirectory=$(pwd)
+ExecStart=$BIN_ABS --firewall --headless
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
+EOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$SERVICE_NAME" \
+        || die "Служба не запустилась. Смотрите: systemctl --user status $SERVICE_NAME; journalctl --user -u $SERVICE_NAME -e"
+    say "Готово: служба работает и стартует при входе."
+    say "Статус:     systemctl --user status $SERVICE_NAME"
+    say "Логи:       journalctl --user -u $SERVICE_NAME -f"
+    say "Убрать:     ./run.sh uninstall"
+    # Автозапуск ДО входа (на этапе загрузки) — только с linger.
+    if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q Linger=yes; then
+        say "Чтобы работал и до входа в систему: sudo loginctl enable-linger $(id -un)"
+    fi
+    exit 0
+fi
+
+if [[ $MODE == uninstall || $MODE == --uninstall ]]; then
+    command -v systemctl >/dev/null || die "Нет systemd (systemctl)."
+    if [[ -f $SERVICE_FILE ]]; then
+        # disable --now останавливает (SIGTERM → headless снимает перехват) и
+        # убирает автозапуск.
+        systemctl --user disable --now "$SERVICE_NAME" 2>/dev/null || true
+        rm -f "$SERVICE_FILE"
+        systemctl --user daemon-reload
+        say "Служба остановлена и удалена. Перехват снят вместе с процессом."
+    else
+        warn "Служба не установлена ($SERVICE_FILE нет)."
+    fi
+    # Заодно убираем трей: автозапуск и работающий процесс.
+    if [[ -f $TRAY_DESKTOP ]]; then
+        rm -f "$TRAY_DESKTOP"
+        say "Трей убран из автозапуска."
+    fi
+    pkill -x net_surgeon-tray 2>/dev/null && say "Трей закрыт." || true
+    say "Если перехват где-то всё же остался — снять: ./run.sh off"
+    exit 0
+fi
+
+# --- трей: вкл/выкл службы одним кликом -------------------------------------
+#
+# Значок в системном лотке поверх фоновой службы (см. ./run.sh install): клик
+# — старт/стоп net_surgeon.service, цвет показывает состояние. Отдельный бинарь
+# net_surgeon-tray (feature `tray`, ksni/StatusNotifierItem, только Linux).
+
+if [[ $MODE == tray ]]; then
+    command -v systemctl >/dev/null || die "Нет systemd (systemctl) — трею нечем управлять."
+    # Есть cargo — соберём (трей не входит в обычную сборку, он за feature
+    # `tray`). Нет cargo (распакованный релиз) — используем готовый бинарь.
+    if command -v cargo >/dev/null; then
+        say "Собираю трей (если нужно)…"
+        RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~" \
+            cargo build --release --features tray --bin net_surgeon-tray || die "Сборка трея не удалась."
+    elif [[ ! -x $TRAY_BIN ]]; then
+        die "Нет готового трея и нет cargo для сборки. Соберите на машине с Rust: cargo build --release --features tray --bin net_surgeon-tray"
+    fi
+
+    if [[ ! -f $SERVICE_FILE ]]; then
+        warn "Служба ещё не установлена — поставьте ./run.sh install, иначе трею нечего включать."
+    fi
+
+    # Автозапуск при входе — тот самый «значок сам появляется».
+    mkdir -p "$AUTOSTART_DIR"
+    cat > "$TRAY_DESKTOP" <<EOF
+[Desktop Entry]
+Type=Application
+Name=net_surgeon tray
+Comment=Вкл/выкл обход DPI
+Exec=$TRAY_BIN
+Icon=network-vpn
+Terminal=false
+X-GNOME-Autostart-enabled=true
+EOF
+    say "Трей добавлен в автозапуск при входе."
+
+    if pgrep -x net_surgeon-tray >/dev/null; then
+        say "Трей уже запущен — значок в лотке."
+    else
+        # Отвязываем от терминала, чтобы окно можно было закрыть.
+        setsid "$TRAY_BIN" >/dev/null 2>&1 < /dev/null &
+        say "Трей запущен — значок в системном лотке, клик по нему вкл/выкл обход."
+    fi
+    say "Убрать трей: ./run.sh uninstall (или rm $TRAY_DESKTOP)"
     exit 0
 fi
 
