@@ -98,6 +98,18 @@ const RELAY_FAKE_PORT: u16 = 8443;
 /// Сколько ждать рукопожатия с приманкой, прежде чем идти без неё.
 const FAKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// Ядро без `CONFIG_TCP_MD5SIG` (так на части Android): приманка уходит
+/// без подписи, и TTL уже нельзя брать с запасом — дошедшая до сервера
+/// приманка ломает рукопожатие. Свойство ядра, поэтому не сбрасывается.
+static NO_MD5SIG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// TTL приманки без md5sig, найденный подбором; сбрасывается, когда
+/// перестаёт работать (сменилась сеть).
+static RELAY_TTL: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+/// Кандидаты подбора без md5sig, как autottl в zapret: нужен наибольший
+/// TTL, при котором рукопожатие живо, — приманка умирает перед самым
+/// сервером, то есть заведомо дальше DPI.
+const RELAY_TTL_SWEEP: &[u32] = &[14, 12, 10, 9, 8, 7, 6, 5, 4];
+
 /// Адрес Telegram, к которому воркер нас пустит.
 pub fn is_telegram(ip: IpAddr, port: u16) -> bool {
     PORTS.contains(&port) && is_telegram_network(ip)
@@ -133,6 +145,9 @@ pub fn reload(log_tx: &LogSender, bypass: &crate::config::BypassParams) {
     }
     if let Ok(mut failed) = FAKE_FAILED_AT.lock() {
         *failed = None;
+    }
+    if let Ok(mut ttl) = RELAY_TTL.lock() {
+        *ttl = None;
     }
     let host = paths::read_to_string(CONFIG_FILE).ok().and_then(|text| parse(&text));
     if let Some(h) = &host {
@@ -333,17 +348,84 @@ mod ws {
         if recently_failed {
             return None;
         }
-        let mut params = FAKE_PARAMS.read().ok()?.clone()?;
-        // Свои TTL и md5sig, а не подобранные диагностикой: тот TTL —
-        // бегущий минимум по сайтам сети, и для Cloudflare он оказывался
-        // мал — приманка 3–6 рвала соединение целиком. С md5sig сервер
-        // выбрасывает приманку, даже если она до него дошла, поэтому TTL
-        // можно брать с запасом (как autottl + md5sig в zapret). Замер на
-        // воркере: 12 и 16 с md5sig — 3/3, без md5sig 16 уже ломает
-        // рукопожатие.
-        params.fake_ttl = RELAY_FAKE_TTL;
-        params.fake_md5sig = true;
-        Some(params)
+        FAKE_PARAMS.read().ok()?.clone()
+    }
+
+    fn note_fake_failed() {
+        if let Ok(mut failed) = FAKE_FAILED_AT.lock() {
+            *failed = Some(std::time::Instant::now());
+        }
+    }
+
+    async fn attempt(host: &str, params: &crate::config::BypassParams) -> std::io::Result<Stream> {
+        tokio::time::timeout(FAKE_ATTEMPT_TIMEOUT, handshake(host, Some(params)))
+            .await
+            .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+    }
+
+    /// Рукопожатие с приманкой; `None` — идти без неё.
+    ///
+    /// Свои TTL и md5sig, а не подобранные диагностикой: тот TTL — бегущий
+    /// минимум по сайтам сети, и для Cloudflare он оказывался мал — приманка
+    /// 3–6 рвала соединение целиком. С md5sig сервер выбрасывает приманку,
+    /// даже если она до него дошла, поэтому TTL можно брать с запасом (как
+    /// autottl + md5sig в zapret). Замер на воркере: 12 и 16 с md5sig — 3/3,
+    /// без md5sig 16 уже ломает рукопожатие.
+    async fn fake_handshake(host: &str) -> Option<Stream> {
+        use std::sync::atomic::Ordering;
+        let mut params = fake_params()?;
+        if !NO_MD5SIG.load(Ordering::Relaxed) {
+            params.fake_ttl = RELAY_FAKE_TTL;
+            params.fake_md5sig = true;
+            match attempt(host, &params).await {
+                Ok(stream) => return Some(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => NO_MD5SIG.store(true, Ordering::Relaxed),
+                Err(_) => {
+                    note_fake_failed();
+                    return None;
+                }
+            }
+        }
+
+        params.fake_md5sig = false;
+        let remembered = RELAY_TTL.lock().ok().and_then(|ttl| *ttl);
+        if let Some(ttl) = remembered {
+            params.fake_ttl = ttl;
+            if let Ok(stream) = attempt(host, &params).await {
+                return Some(stream);
+            }
+            // Сеть сменилась: следующее соединение подберёт заново.
+            if let Ok(mut slot) = RELAY_TTL.lock() {
+                *slot = None;
+            }
+            return None;
+        }
+
+        // Подбор разом, а не по очереди: неудачная попытка — это до
+        // FAKE_ATTEMPT_TIMEOUT, а на всё подключение есть CONNECT_TIMEOUT.
+        let mut set = tokio::task::JoinSet::new();
+        for &ttl in RELAY_TTL_SWEEP {
+            let mut p = params.clone();
+            p.fake_ttl = ttl;
+            let host = host.to_string();
+            set.spawn(async move { (ttl, attempt(&host, &p).await) });
+        }
+        let mut best: Option<(u32, Stream)> = None;
+        while let Some(joined) = set.join_next().await {
+            if let Ok((ttl, Ok(stream))) = joined
+                && best.as_ref().is_none_or(|(b, _)| ttl > *b)
+            {
+                best = Some((ttl, stream));
+            }
+        }
+        let Some((ttl, stream)) = best else {
+            note_fake_failed();
+            return None;
+        };
+        if let Ok(mut slot) = RELAY_TTL.lock() {
+            *slot = Some(ttl);
+        }
+        Some(stream)
     }
 
     /// TLS до воркера. С `fake` ClientHello забирается у rustls до начала
@@ -368,32 +450,22 @@ mod ws {
         let pending = tls().connect_with(name, tcp, |conn| taken = conn.write_tls(&mut hello));
         taken?;
         let fd = crate::bypass::socket::raw_sock(&side);
+        // Приманка не ушла (нет md5sig в ядре) — ClientHello не отправлен,
+        // решает вызывающий: молча послать его как есть значило бы получить
+        // замерзающее соединение вместо отката.
         if crate::bypass::fragment::split_with_fake(&mut side, fd, &hello, params).await?.is_none() {
-            side.write_all(&hello).await?;
+            return Err(std::io::ErrorKind::Unsupported.into());
         }
         drop(side);
         pending.await
     }
 
     pub async fn connect(host: &str, path: &str) -> std::io::Result<Stream> {
-        let fake = fake_params();
-        let attempt = match &fake {
-            Some(params) => tokio::time::timeout(FAKE_ATTEMPT_TIMEOUT, handshake(host, Some(params)))
-                .await
-                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into())),
-            None => handshake(host, None).await,
-        };
-        let mut stream = match attempt {
-            Ok(stream) => stream,
-            // Приманка не дала рукопожатия (TTL не тот, порт закрыт): без
-            // неё на 443 соединение хотя бы установится.
-            Err(_) if fake.is_some() => {
-                if let Ok(mut failed) = FAKE_FAILED_AT.lock() {
-                    *failed = Some(std::time::Instant::now());
-                }
-                handshake(host, None).await?
-            }
-            Err(e) => return Err(e),
+        // Приманка не дала рукопожатия (TTL не тот, порт закрыт): без неё
+        // на 443 соединение хотя бы установится.
+        let mut stream = match fake_handshake(host).await {
+            Some(stream) => stream,
+            None => handshake(host, None).await?,
         };
 
         let key = base64::engine::general_purpose::STANDARD.encode(crate::bypass::random::bytes(16));
