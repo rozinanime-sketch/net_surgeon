@@ -224,11 +224,11 @@ pub fn fixup_v4(pkt: &mut [u8]) {
 /// Сумма 16-битных слов без свёртки. Нечётный хвост дополняется нулём.
 fn ones_sum(data: &[u8]) -> u32 {
     let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+    let (words, rest) = data.as_chunks::<2>();
+    for w in words {
+        sum += u32::from(u16::from_be_bytes(*w));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         sum += u32::from(*last) << 8;
     }
     sum

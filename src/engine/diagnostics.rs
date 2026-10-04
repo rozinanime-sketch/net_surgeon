@@ -447,7 +447,12 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
         FragStrategy::TlsRecord => fragment::tls_record_split(&mut writer, hello, bypass_params.split_delay_ms).await.map(|_| ()),
         FragStrategy::Disorder => fragment::split_with_disorder(&mut writer, fd, hello, bypass_params.disorder_ttl).await.map(|_| ()),
         FragStrategy::Oob => fragment::split_with_oob(&mut writer, fd, hello).await.map(|_| ()),
-        FragStrategy::Fake => fragment::split_with_fake(&mut writer, fd, hello, bypass_params).await.map(|_| ()),
+        // Приманку не отправить (Windows) — ClientHello уходит как есть,
+        // иначе проба молча ждала бы ответа на ничего.
+        FragStrategy::Fake => match fragment::split_with_fake(&mut writer, fd, hello, bypass_params).await {
+            Ok(None) => writer.write_all(hello).await,
+            r => r.map(|_| ()),
+        },
         // Пакетная: применяется только перехватом (ветка `_ if packet_mode`
         // выше), а без него мерить нечего — отправляем как есть.
         FragStrategy::Seqovl => writer.write_all(hello).await,

@@ -37,6 +37,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Трей (feature `tray`) идёт через D-Bus: libdbus-sys ищет системную
+      # библиотеку через pkg-config, а на чистом раннере её нет.
+      - name: установить libdbus
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       # -D warnings: любое предупреждение валит сборку. Проект сейчас
       # полностью чистый, и планка держится только так — иначе
       # предупреждения копятся, пока их не перестают читать.
@@ -79,6 +84,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Трей (feature `tray`) идёт через D-Bus: libdbus-sys ищет системную
+      # библиотеку через pkg-config, а на чистом раннере её нет.
+      - name: установить libdbus
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: тесты
         run: cargo test --all-features
 
@@ -101,11 +111,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Не --all-features: трей (feature `tray`) только для Linux-десктопа,
+      # его D-Bus на Windows не собирается.
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features tui -- -D warnings
 
       - name: тесты
-        run: cargo test --all-features
+        run: cargo test --features tui
 
   fuzz:
     name: фаззинг разборщиков
