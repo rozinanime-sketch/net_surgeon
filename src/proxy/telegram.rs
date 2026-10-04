@@ -73,6 +73,31 @@ const PORTS: &[u16] = &[443, 80, 5222];
 
 static RELAY: RwLock<Option<Arc<str>>> = RwLock::new(None);
 
+/// Параметры приманки для TLS до воркера (из `[bypass]` конфига).
+///
+/// Соединение к адресам Cloudflare ТСПУ пропускает, но глушит после
+/// пары килобайт от клиента: сервер перестаёт подтверждать пакеты, и
+/// MTProto встаёт сразу после рукопожатия WebSocket. Приманка перед
+/// ClientHello (как у `fake`) сбивает классификацию потока, и заморозки
+/// нет — проверено на воркере: без неё третий запрос по соединению
+/// не доходит, с ней проходят все.
+static FAKE_PARAMS: RwLock<Option<crate::config::BypassParams>> = RwLock::new(None);
+
+/// Когда приманка последний раз не дала рукопожатия. Минуту после этого
+/// её не пробуем: каждая неудачная попытка — это таймаут, а Telegram
+/// открывает соединения пачками.
+static FAKE_FAILED_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+const FAKE_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// TTL приманки до воркера (см. `ws::fake_params`).
+const RELAY_FAKE_TTL: u32 = 12;
+/// Порт воркера для подключения с приманкой. Cloudflare отдаёт HTTPS и на
+/// 2053/2083/2087/2096/8443, а DPI на них мягче: на 443 любая приманка
+/// убивает соединение сразу (0 байт ответа), без неё оно замерзает; на 8443
+/// приманка проходит 3/3 (замер на воркере, 10 запросов по 1 КБ).
+const RELAY_FAKE_PORT: u16 = 8443;
+/// Сколько ждать рукопожатия с приманкой, прежде чем идти без неё.
+const FAKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// Адрес Telegram, к которому воркер нас пустит.
 pub fn is_telegram(ip: IpAddr, port: u16) -> bool {
     PORTS.contains(&port) && is_telegram_network(ip)
@@ -102,7 +127,13 @@ pub fn relay() -> Option<Arc<str>> {
 
 /// Перечитывает `telegram_relay.txt`. Зовётся из `run_all`, как и список
 /// блокировки: правка файла применяется перезапуском прокси.
-pub fn reload(log_tx: &LogSender) {
+pub fn reload(log_tx: &LogSender, bypass: &crate::config::BypassParams) {
+    if let Ok(mut guard) = FAKE_PARAMS.write() {
+        *guard = Some(bypass.clone());
+    }
+    if let Ok(mut failed) = FAKE_FAILED_AT.lock() {
+        *failed = None;
+    }
     let host = paths::read_to_string(CONFIG_FILE).ok().and_then(|text| parse(&text));
     if let Some(h) = &host {
         log_t(log_tx, LogLevel::Info, "log.telegram_relay_active", vec![("host", masked(h))]);
@@ -289,12 +320,81 @@ mod ws {
         tokio_rustls::TlsConnector::from(Arc::clone(config))
     }
 
-    pub async fn connect(host: &str, path: &str) -> std::io::Result<Stream> {
-        let tcp = crate::dns::resolver::connect(&format!("{host}:443")).await?;
+    /// Параметры приманки, если её сейчас стоит пробовать.
+    fn fake_params() -> Option<crate::config::BypassParams> {
+        if !crate::bypass::socket::fake_supported() {
+            return None;
+        }
+        let recently_failed = FAKE_FAILED_AT
+            .lock()
+            .ok()
+            .and_then(|at| *at)
+            .is_some_and(|at| at.elapsed() < FAKE_RETRY_AFTER);
+        if recently_failed {
+            return None;
+        }
+        let mut params = FAKE_PARAMS.read().ok()?.clone()?;
+        // Свои TTL и md5sig, а не подобранные диагностикой: тот TTL —
+        // бегущий минимум по сайтам сети, и для Cloudflare он оказывался
+        // мал — приманка 3–6 рвала соединение целиком. С md5sig сервер
+        // выбрасывает приманку, даже если она до него дошла, поэтому TTL
+        // можно брать с запасом (как autottl + md5sig в zapret). Замер на
+        // воркере: 12 и 16 с md5sig — 3/3, без md5sig 16 уже ломает
+        // рукопожатие.
+        params.fake_ttl = RELAY_FAKE_TTL;
+        params.fake_md5sig = true;
+        Some(params)
+    }
+
+    /// TLS до воркера. С `fake` ClientHello забирается у rustls до начала
+    /// рукопожатия и уходит через [`crate::bypass::fragment::split_with_fake`]
+    /// по второму дескриптору того же сокета; дальше рукопожатие ведёт
+    /// tokio-rustls как обычно.
+    async fn handshake(host: &str, fake: Option<&crate::config::BypassParams>) -> std::io::Result<Stream> {
+        let port = if fake.is_some() { RELAY_FAKE_PORT } else { 443 };
+        let tcp = crate::dns::resolver::connect(&format!("{host}:{port}")).await?;
         let _ = tcp.set_nodelay(true);
         let name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let mut stream = tls().connect(name, tcp).await?;
+        let Some(params) = fake else {
+            return tls().connect(name, tcp).await;
+        };
+
+        let std_tcp = tcp.into_std()?;
+        let mut side = TcpStream::from_std(std_tcp.try_clone()?)?;
+        let tcp = TcpStream::from_std(std_tcp)?;
+        let mut hello = Vec::new();
+        let mut taken = Ok(0);
+        let pending = tls().connect_with(name, tcp, |conn| taken = conn.write_tls(&mut hello));
+        taken?;
+        let fd = crate::bypass::socket::raw_sock(&side);
+        if crate::bypass::fragment::split_with_fake(&mut side, fd, &hello, params).await?.is_none() {
+            side.write_all(&hello).await?;
+        }
+        drop(side);
+        pending.await
+    }
+
+    pub async fn connect(host: &str, path: &str) -> std::io::Result<Stream> {
+        let fake = fake_params();
+        let attempt = match &fake {
+            Some(params) => tokio::time::timeout(FAKE_ATTEMPT_TIMEOUT, handshake(host, Some(params)))
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into())),
+            None => handshake(host, None).await,
+        };
+        let mut stream = match attempt {
+            Ok(stream) => stream,
+            // Приманка не дала рукопожатия (TTL не тот, порт закрыт): без
+            // неё на 443 соединение хотя бы установится.
+            Err(_) if fake.is_some() => {
+                if let Ok(mut failed) = FAKE_FAILED_AT.lock() {
+                    *failed = Some(std::time::Instant::now());
+                }
+                handshake(host, None).await?
+            }
+            Err(e) => return Err(e),
+        };
 
         let key = base64::engine::general_purpose::STANDARD.encode(crate::bypass::random::bytes(16));
         let request = format!(

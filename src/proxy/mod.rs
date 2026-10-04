@@ -142,7 +142,7 @@ pub async fn run_all(
     // правки config.toml и bypass_domains.txt.
     crate::block::reload(config.block_trackers, &log_tx);
     crate::dns::smart::reload(&config.smart_dns_provider, &log_tx);
-    telegram::reload(&log_tx);
+    telegram::reload(&log_tx, &config.bypass);
 
     let tcp_task = {
         let config = Arc::clone(&config);
