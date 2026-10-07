@@ -257,8 +257,27 @@ pub fn load_config() -> Result<Config, String> {
     let path = paths::resolve("config.toml");
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| rust_i18n::t!("startup.config_read", path = path.display(), error = e).into_owned())?;
-    toml::from_str(&contents)
-        .map_err(|e| rust_i18n::t!("startup.config_parse", error = e).into_owned())
+    let mut config: Config = toml::from_str(&contents)
+        .map_err(|e| rust_i18n::t!("startup.config_parse", error = e).into_owned())?;
+    config.replace_dead_smart_dns();
+    Ok(config)
+}
+
+/// Умный DNS, сменивший закрытый Xbox DNS.
+const COMSS_DNS: &str = "https://dns.comss.one/dns-query";
+const COMSS_DNS_IP: [u8; 4] = [83, 220, 169, 155];
+
+impl Config {
+    /// Xbox DNS (xbox-dns.ru) закрылся осенью 2026 под блокировками, а
+    /// config.toml у уже установленных копий — и на телефонах, где его не
+    /// поправить руками, — не перезаписывается при обновлении. Без подмены
+    /// нейросети из smart_dns_domains.txt молча перестали открываться.
+    fn replace_dead_smart_dns(&mut self) {
+        if crate::dns::provider_endpoint(&self.smart_dns_provider).is_some_and(|(host, _)| host == "xbox-dns.ru") {
+            self.smart_dns_provider = COMSS_DNS.to_string();
+            self.smart_dns_bootstrap_ip = Some(std::net::IpAddr::from(COMSS_DNS_IP));
+        }
+    }
 }
 
 /// Список доменов для обхода.
@@ -292,6 +311,29 @@ mod tests {
     fn shipped_config() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
         std::fs::read_to_string(path).expect("config.toml должен читаться")
+    }
+
+    #[test]
+    fn dead_xbox_dns_is_replaced() {
+        let text = shipped_config()
+            .lines()
+            .map(|l| match l.split('=').next().map(str::trim) {
+                Some("smart_dns_provider") => "smart_dns_provider = \"https://xbox-dns.ru/dns-query\"",
+                Some("smart_dns_bootstrap_ip") => "smart_dns_bootstrap_ip = \"111.88.96.56\"",
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut config: Config = toml::from_str(&text).expect("config.toml должен разбираться");
+        config.replace_dead_smart_dns();
+        assert_eq!(config.smart_dns_provider, COMSS_DNS);
+        assert_eq!(config.smart_dns_bootstrap_ip, Some(std::net::IpAddr::from(COMSS_DNS_IP)));
+
+        // Свой провайдер не трогаем.
+        let mut own: Config = toml::from_str(&shipped_config()).expect("config.toml должен разбираться");
+        own.smart_dns_provider = "https://example.org/dns-query".to_string();
+        own.replace_dead_smart_dns();
+        assert_eq!(own.smart_dns_provider, "https://example.org/dns-query");
     }
 
     /// Конфиг, который лежит в репозитории, обязан разбираться этой же
