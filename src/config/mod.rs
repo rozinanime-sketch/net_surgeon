@@ -279,7 +279,7 @@ impl Config {
     /// поправить руками, — не перезаписывается при обновлении. Без подмены
     /// нейросети из smart_dns_domains.txt молча перестали открываться.
     fn replace_dead_smart_dns(&mut self) {
-        if crate::dns::provider_endpoint(&self.smart_dns_provider).is_some_and(|(host, _)| host == "xbox-dns.ru") {
+        if crate::dns::provider_endpoint(&self.smart_dns_provider).is_some_and(|(host, _)| host.trim_end_matches('.').eq_ignore_ascii_case("xbox-dns.ru")) {
             self.smart_dns_provider = COMSS_DNS.to_string();
             self.smart_dns_bootstrap_ip = Some(std::net::IpAddr::from(COMSS_DNS_IP));
             self.smart_dns_replaced = true;
@@ -325,7 +325,7 @@ mod tests {
         let text = shipped_config()
             .lines()
             .map(|l| match l.split('=').next().map(str::trim) {
-                Some("smart_dns_provider") => "smart_dns_provider = \"https://xbox-dns.ru/dns-query\"",
+                Some("smart_dns_provider") => "smart_dns_provider = \"https://XBOX-DNS.ru./dns-query\"",
                 Some("smart_dns_bootstrap_ip") => "smart_dns_bootstrap_ip = \"111.88.96.56\"",
                 _ => l,
             })

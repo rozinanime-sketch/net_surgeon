@@ -217,6 +217,33 @@ pub async fn resolve_all(target: &str) -> Vec<SocketAddr> {
     lookup_system(target).await.unwrap_or_default()
 }
 
+/// Как [`connect`], но без negative-кэша и со своим таймаутом — для пробных
+/// подключений на нестандартный порт (ретранслятор Telegram на 8443).
+///
+/// Таймаут там значит «порт закрыт», а не «адрес мёртв». Кэш же ведётся по
+/// IP без порта: пометка закрыла бы на минуту и 443 того же адреса, а за
+/// ним — откат ретранслятора и все сайты на этом адресе Cloudflare.
+pub async fn connect_without_dead_cache(target: &str, timeout: std::time::Duration) -> std::io::Result<TcpStream> {
+    let addrs = resolve_all(target).await;
+    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, rust_i18n::t!("err.no_addresses").into_owned());
+    for addr in addrs {
+        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                crate::bypass::packet_mode::mark(&stream, crate::bypass::packet_mode::Mark::Own);
+                return Ok(stream);
+            }
+            Ok(Err(e)) => last = e,
+            Err(_) => {
+                last = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    rust_i18n::t!("err.connect_timeout", addr = addr, secs = timeout.as_secs()).into_owned(),
+                );
+            }
+        }
+    }
+    Err(last)
+}
+
 /// Сколько ждать одного адреса, прежде чем перейти к следующему.
 const PER_ADDRESS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
