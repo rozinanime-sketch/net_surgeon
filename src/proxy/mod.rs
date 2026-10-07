@@ -141,6 +141,9 @@ pub async fn run_all(
     // прокси из интерфейса, и правки списка применяются тогда же, когда
     // правки config.toml и bypass_domains.txt.
     crate::block::reload(config.block_trackers, &log_tx);
+    if config.smart_dns_replaced {
+        log_t(&log_tx, LogLevel::Warning, "log.smart_dns_replaced", vec![("provider", config.smart_dns_provider.clone())]);
+    }
     crate::dns::smart::reload(&config.smart_dns_provider, &log_tx);
     telegram::reload(&log_tx, &config.bypass);
 

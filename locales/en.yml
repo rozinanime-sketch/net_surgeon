@@ -267,6 +267,7 @@ log.blocklist_missing: "Tracker blocking is on, but the list could not be read (
 log.smart_dns_active: "Smart DNS %{provider}: %{count} domains listed"
 log.smart_dns_missing: "Smart DNS is set, but the list could not be read (%{path}): %{error}"
 log.smart_dns_error: "Smart DNS did not answer for %{domain}, using the main DoH: %{error}"
+log.smart_dns_replaced: "Xbox DNS has shut down, smart DNS replaced with %{provider}: it only receives lookups for the AI services in smart_dns_domains.txt. Set your own provider in config.toml"
 log.blocked: "Blocked: %{domain} (%{via})"
 log.tproxy_forward_error: "TPROXY UDP: could not send to %{addr}: %{error}"
 log.tproxy_reply_bind_error: "TPROXY UDP: could not bind the reply socket to %{addr}: %{error}"

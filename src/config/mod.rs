@@ -222,6 +222,12 @@ pub struct Config {
     /// часть трафика, неожиданен, и включать это должен сам пользователь.
     #[serde(default)]
     pub block_trackers: bool,
+
+    /// В config.toml был закрывшийся Xbox DNS, и при загрузке он подменён
+    /// на Comss (см. `replace_dead_smart_dns`). Пишется в лог при запуске:
+    /// пользователь должен знать, кому теперь уходят запросы.
+    #[serde(skip)]
+    pub smart_dns_replaced: bool,
 }
 
 /// Адрес, где пустая строка значит «не задан». Без этого `doh_bootstrap_ip = ""`,
@@ -276,6 +282,7 @@ impl Config {
         if crate::dns::provider_endpoint(&self.smart_dns_provider).is_some_and(|(host, _)| host == "xbox-dns.ru") {
             self.smart_dns_provider = COMSS_DNS.to_string();
             self.smart_dns_bootstrap_ip = Some(std::net::IpAddr::from(COMSS_DNS_IP));
+            self.smart_dns_replaced = true;
         }
     }
 }
@@ -328,12 +335,14 @@ mod tests {
         config.replace_dead_smart_dns();
         assert_eq!(config.smart_dns_provider, COMSS_DNS);
         assert_eq!(config.smart_dns_bootstrap_ip, Some(std::net::IpAddr::from(COMSS_DNS_IP)));
+        assert!(config.smart_dns_replaced);
 
         // Свой провайдер не трогаем.
         let mut own: Config = toml::from_str(&shipped_config()).expect("config.toml должен разбираться");
         own.smart_dns_provider = "https://example.org/dns-query".to_string();
         own.replace_dead_smart_dns();
         assert_eq!(own.smart_dns_provider, "https://example.org/dns-query");
+        assert!(!own.smart_dns_replaced);
     }
 
     /// Конфиг, который лежит в репозитории, обязан разбираться этой же
