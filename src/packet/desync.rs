@@ -231,6 +231,31 @@ pub fn split_pos(payload: &[u8]) -> usize {
 
 /// Пакеты, которые уйдут вместо исходного, в порядке отправки.
 pub fn apply(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
+    let mut out = build(pkt, t, technique);
+    number_ip_ids(pkt, &mut out);
+    out
+}
+
+/// Даёт каждому пакету IPv4 свой ip_id: исходный, затем +1, +2…
+/// (как `--ip-id=seq` у zapret).
+///
+/// `with_payload` копирует IP-заголовок оригинала целиком, и без этого у
+/// приманки и всех кусков был бы один ip_id. Разные пакеты с одинаковым
+/// ненулевым ip_id — примета подделки, по которой ТСПУ, по документации
+/// zapret, блокирует соединение ещё до разбора имени. Контрольную сумму IP
+/// пересчитывает отправитель (WinDivert, `nfqueue::fixup_v4`). У IPv6 ip_id
+/// в основном заголовке нет.
+fn number_ip_ids(pkt: &[u8], parts: &mut [Vec<u8>]) {
+    if pkt.first().map(|b| b >> 4) != Some(4) || pkt.len() < 20 {
+        return;
+    }
+    let id = u16::from_be_bytes([pkt[4], pkt[5]]);
+    for (i, part) in parts.iter_mut().enumerate() {
+        part[4..6].copy_from_slice(&id.wrapping_add(i as u16).to_be_bytes());
+    }
+}
+
+fn build(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
     let payload = t.payload(pkt);
     // Сегменты данных `[from, to)`, каждый не длиннее MAX_SEGMENT.
     let segments = |from: usize, to: usize| -> Vec<Vec<u8>> {
@@ -519,6 +544,18 @@ mod tests {
         assert_eq!(fake.seq, 1000u32.wrapping_sub(BADSEQ_SHIFT));
         assert_eq!(fake.payload(&parts[0]), &decoy[..]);
         assert_eq!(reassemble(&parts, 1000), b"0123456789");
+    }
+
+    #[test]
+    fn every_ipv4_packet_gets_its_own_ip_id() {
+        let mut pkt = v4(b"0123456789", TCP_ACK | TCP_PSH);
+        pkt[4..6].copy_from_slice(&0xfffeu16.to_be_bytes());
+        let t = parse(&pkt).unwrap();
+        let decoy = crate::bypass::tls::build_client_hello_sized("www.google.com", 517);
+        let parts = apply(&pkt, &t, &Technique::FakeMultiDisorder { positions: vec![3, 7], decoy });
+        let ids: Vec<u16> = parts.iter().map(|p| u16::from_be_bytes([p[4], p[5]])).collect();
+        // Первый сохраняет исходный, дальше по порядку, с переходом через ноль.
+        assert_eq!(ids, vec![0xfffe, 0xffff, 0, 1]);
     }
 
     #[test]
