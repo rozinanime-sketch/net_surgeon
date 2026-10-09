@@ -88,9 +88,9 @@
 ### 🐧 Linux
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.7.4/net_surgeon-0.7.4-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.7.4-x86_64-linux.tar.gz
-cd net_surgeon-0.7.4
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.7.5/net_surgeon-0.7.5-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.7.5-x86_64-linux.tar.gz
+cd net_surgeon-0.7.5
 ./run.sh
 ```
 
@@ -195,7 +195,7 @@ cd net_surgeon-0.7.4
 Нужен Rust 1.88 или новее (проще всего через [rustup](https://rustup.rs)).
 
 ```sh
-git clone --branch v0.7.4 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.7.5 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```
