@@ -456,8 +456,11 @@ mod imp {
         let _ = std::thread::Builder::new().name("udp-junk".into()).spawn(move || {
             let Ok((first, addr)) = rx.recv() else { return };
             if let Some(u) = udp::parse(&first) {
+                // Приманка — под протокол первого пакета, как в Linux
+                // (session::classify_decoy): QUIC, STUN или голос Discord.
+                let kind = session::classify_decoy(first.get(u.ip_len + 8..).unwrap_or_default());
                 for i in 0..junk.count {
-                    let mut fake = udp::with_payload(&first, &u, &session::junk_packet(&junk, quic));
+                    let mut fake = udp::with_payload(&first, &u, &session::junk_packet(&junk, kind));
                     let mut fake_addr = addr;
                     handle.fix_checksums(&mut fake, &mut fake_addr);
                     handle.send(&fake, &fake_addr);
