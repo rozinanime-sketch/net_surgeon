@@ -430,6 +430,7 @@ async fn handle_connect(
                         Applied::Disorder { first, second } => format!("disorder {}+{}", first, second),
                         Applied::Oob { first, second } => format!("oob {}+{}", first, second),
                         Applied::Fake { decoy, real } => format!("fake {}+{}", decoy, real),
+                        Applied::FakeMultiDisorder { decoy, first, second } => format!("fake+multidisorder {}/{}+{}", decoy, first, second),
                         Applied::None => "direct".to_string(),
                     };
                     log_t(log_tx, LogLevel::Success, "log.socks5_hello_sent", vec![

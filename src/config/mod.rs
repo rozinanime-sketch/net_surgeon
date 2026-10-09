@@ -223,8 +223,8 @@ pub struct Config {
     #[serde(default)]
     pub block_trackers: bool,
 
-    /// В config.toml был закрывшийся Xbox DNS, и при загрузке он подменён
-    /// на Comss (см. `replace_dead_smart_dns`). Пишется в лог при запуске:
+    /// В config.toml был неработающий умный DNS (Xbox DNS или Comss), и при
+    /// загрузке он подменён на GeoHide (см. `replace_dead_smart_dns`). Пишется в лог при запуске:
     /// пользователь должен знать, кому теперь уходят запросы.
     #[serde(skip)]
     pub smart_dns_replaced: bool,
@@ -269,19 +269,27 @@ pub fn load_config() -> Result<Config, String> {
     Ok(config)
 }
 
-/// Умный DNS, сменивший закрытый Xbox DNS.
-const COMSS_DNS: &str = "https://dns.comss.one/dns-query";
-const COMSS_DNS_IP: [u8; 4] = [83, 220, 169, 155];
+/// Умный DNS, сменивший закрытый Xbox DNS и переставший работать Comss.
+const GEOHIDE_DNS: &str = "https://geohide.ru/dns-query";
+const GEOHIDE_DNS_IP: [u8; 4] = [159, 194, 200, 33];
+
+/// Умные DNS, которые больше не открывают нейросети.
+const DEAD_SMART_DNS: &[&str] = &["xbox-dns.ru", "dns.comss.one"];
 
 impl Config {
     /// Xbox DNS (xbox-dns.ru) закрылся осенью 2026 под блокировками, а
-    /// config.toml у уже установленных копий — и на телефонах, где его не
+    /// сменивший его Comss DNS перестал открывать нейросети. config.toml
+    /// у уже установленных копий — и на телефонах, где его не
     /// поправить руками, — не перезаписывается при обновлении. Без подмены
     /// нейросети из smart_dns_domains.txt молча перестали открываться.
     fn replace_dead_smart_dns(&mut self) {
-        if crate::dns::provider_endpoint(&self.smart_dns_provider).is_some_and(|(host, _)| host.trim_end_matches('.').eq_ignore_ascii_case("xbox-dns.ru")) {
-            self.smart_dns_provider = COMSS_DNS.to_string();
-            self.smart_dns_bootstrap_ip = Some(std::net::IpAddr::from(COMSS_DNS_IP));
+        let dead = crate::dns::provider_endpoint(&self.smart_dns_provider).is_some_and(|(host, _)| {
+            let host = host.trim_end_matches('.');
+            DEAD_SMART_DNS.iter().any(|d| host.eq_ignore_ascii_case(d))
+        });
+        if dead {
+            self.smart_dns_provider = GEOHIDE_DNS.to_string();
+            self.smart_dns_bootstrap_ip = Some(std::net::IpAddr::from(GEOHIDE_DNS_IP));
             self.smart_dns_replaced = true;
         }
     }
@@ -333,9 +341,16 @@ mod tests {
             .join("\n");
         let mut config: Config = toml::from_str(&text).expect("config.toml должен разбираться");
         config.replace_dead_smart_dns();
-        assert_eq!(config.smart_dns_provider, COMSS_DNS);
-        assert_eq!(config.smart_dns_bootstrap_ip, Some(std::net::IpAddr::from(COMSS_DNS_IP)));
+        assert_eq!(config.smart_dns_provider, GEOHIDE_DNS);
+        assert_eq!(config.smart_dns_bootstrap_ip, Some(std::net::IpAddr::from(GEOHIDE_DNS_IP)));
         assert!(config.smart_dns_replaced);
+
+        // Comss тоже больше не работает и заменяется так же.
+        let mut comss: Config = toml::from_str(&shipped_config()).expect("config.toml должен разбираться");
+        comss.smart_dns_provider = "https://dns.comss.one/dns-query".to_string();
+        comss.replace_dead_smart_dns();
+        assert_eq!(comss.smart_dns_provider, GEOHIDE_DNS);
+        assert!(comss.smart_dns_replaced);
 
         // Свой провайдер не трогаем.
         let mut own: Config = toml::from_str(&shipped_config()).expect("config.toml должен разбираться");

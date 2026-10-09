@@ -37,7 +37,8 @@ Built for Russian ISPs, but the techniques work against SNI-based DPI in general
 
 - 🧬 **Bypasses DPI** that filters by site name: splits the TLS ClientHello into
   several records, cuts the packet in the middle of the name, reorders the
-  pieces (disorder), inserts an out-of-band byte.
+  pieces (disorder), inserts an out-of-band byte, prepends a decoy with an
+  allowed name (fake) — including together with reordering (fake + multidisorder).
 - 🧠 **Picks the technique itself** for each site, remembers it and re-measures
   it when it stops working.
 - ⚙️ **No setup needed:** on Linux and on Windows (as administrator) it

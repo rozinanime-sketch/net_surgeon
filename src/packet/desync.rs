@@ -193,6 +193,30 @@ pub enum Technique {
     /// с настоящими данными в один сегмент, так что настоящие байты доходят
     /// сразу и ретрансмита ждать не нужно.
     Seqovl { pos: usize, overlap: usize, decoy: Vec<u8> },
+    /// fake + multidisorder (zapret `--dpi-desync=fake,multidisorder`).
+    ///
+    /// Сначала подделка на сдвинутом назад номере (сервер отбросит как чужую,
+    /// DPI разберёт первой), затем настоящие данные, порезанные по точкам
+    /// `positions` и отправленные сегментами в ОБРАТНОМ порядке. DPI,
+    /// читающий поток подряд, видит и чужое имя, и переставленные куски.
+    ///
+    /// `positions` — отсортированные точки реза внутри данных (0 и конец
+    /// добавляются сами); обычно их две: начало записи и центр имени в SNI.
+    FakeMultiDisorder { positions: Vec<usize>, decoy: Vec<u8> },
+}
+
+/// Точки реза для multidisorder: начало данных и центр имени в SNI.
+///
+/// Как у zapret по умолчанию (`--dpi-desync-split-pos=1,midsni`): первый байт
+/// отделяется от остального, а имя в SNI разрывается посередине. Возвращает
+/// отсортированный список без повторов; при отсутствии SNI остаётся одна
+/// точка — техника вырождается в двухсегментный disorder с приманкой.
+pub fn multidisorder_positions(payload: &[u8]) -> Vec<usize> {
+    let mut pts = vec![1usize, split_pos(payload)];
+    pts.retain(|&p| p >= 1 && p < payload.len());
+    pts.sort_unstable();
+    pts.dedup();
+    pts
 }
 
 /// Где резать данные: посередине имени, если оно целиком в сегменте,
@@ -259,6 +283,28 @@ pub fn apply(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
             first.extend_from_slice(&payload[..pos]);
             let ovl = with_payload(pkt, t, &first, t.seq.wrapping_sub(overlap as u32), t.flags & !TCP_PSH);
             [vec![ovl], segments(pos, payload.len())].concat()
+        }
+        Technique::FakeMultiDisorder { positions, decoy } => {
+            let decoy = &decoy[..decoy.len().min(MAX_SEGMENT)];
+            // Подделка на тех же номерах со сдвигом назад: сервер отбросит.
+            let fake = with_payload(pkt, t, decoy, t.seq.wrapping_sub(BADSEQ_SHIFT), t.flags);
+            // Границы сегментов: 0, точки реза (строго возрастающие, внутри
+            // данных), конец. На вход приходят отсортированные позиции.
+            let mut bounds = vec![0usize];
+            for &p in positions {
+                let p = p.min(payload.len());
+                if p > *bounds.last().unwrap() && p < payload.len() {
+                    bounds.push(p);
+                }
+            }
+            bounds.push(payload.len());
+            // Сегменты в обратном порядке — в этом и есть disorder: переставить
+            // пакеты можно прямо здесь, низкий TTL и ретрансмит не нужны.
+            let mut out = vec![fake];
+            for w in bounds.windows(2).rev() {
+                out.extend(segments(w[0], w[1]));
+            }
+            out
         }
     }
 }
@@ -473,6 +519,40 @@ mod tests {
         assert_eq!(fake.seq, 1000u32.wrapping_sub(BADSEQ_SHIFT));
         assert_eq!(fake.payload(&parts[0]), &decoy[..]);
         assert_eq!(reassemble(&parts, 1000), b"0123456789");
+    }
+
+    #[test]
+    fn fake_multidisorder_decoys_then_reverses_real_segments() {
+        let pkt = v4(b"0123456789", TCP_ACK | TCP_PSH);
+        let t = parse(&pkt).unwrap();
+        let decoy = crate::bypass::tls::build_client_hello_sized("www.google.com", 517);
+        // Две точки реза → три настоящих сегмента: [0,3) [3,7) [7,10).
+        let parts = apply(&pkt, &t, &Technique::FakeMultiDisorder {
+            positions: vec![3, 7],
+            decoy: decoy.clone(),
+        });
+        assert_eq!(parts.len(), 4, "приманка и три части");
+        // Первой уходит приманка вне окна сервера.
+        let fake = parse(&parts[0]).unwrap();
+        assert_eq!(fake.seq, 1000u32.wrapping_sub(BADSEQ_SHIFT));
+        assert_eq!(fake.payload(&parts[0]), &decoy[..]);
+        // Настоящие сегменты — в обратном порядке: последний раньше первого.
+        assert_eq!(parse(&parts[1]).unwrap().seq, 1007);
+        assert_eq!(parse(&parts[2]).unwrap().seq, 1003);
+        assert_eq!(parse(&parts[3]).unwrap().seq, 1000);
+        // Сервер всё равно собирает исходный поток, приманку отбросив.
+        assert_eq!(reassemble(&parts, 1000), b"0123456789");
+        assert_eq!(deliver(&parts, 1000), b"0123456789");
+    }
+
+    #[test]
+    fn multidisorder_positions_cut_at_start_and_mid_sni() {
+        let hello = crate::bypass::tls::build_client_hello_sized("discord.com", 517);
+        let pts = multidisorder_positions(&hello);
+        assert_eq!(pts.first(), Some(&1), "первый байт отделён");
+        let sni = split_pos(&hello);
+        assert!(pts.contains(&sni), "центр имени в SNI");
+        assert!(pts.windows(2).all(|w| w[0] < w[1]), "строго возрастают, без повторов");
     }
 
     #[test]

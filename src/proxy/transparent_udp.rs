@@ -428,7 +428,10 @@ async fn handle_datagram(
         && junk.calls
         && session::is_call_flow(&payload, orig_dst.ip());
     let is_quic = session::is_quic_initial(&payload);
-    let junk_plan = (bypass || call).then(|| (junk.clone(), is_quic));
+    // Приманка — под протокол первого пакета (QUIC/STUN/голос Discord), а не
+    // просто QUIC-или-мусор.
+    let decoy = session::classify_decoy(&payload);
+    let junk_plan = (bypass || call).then(|| (junk.clone(), decoy));
 
     let Some(session) = open_session(client_addr, orig_dst, is_quic, junk_plan, log_tx, metrics, token).await else {
         return;
@@ -461,7 +464,7 @@ async fn open_session(
     client_addr: SocketAddr,
     orig_dst: SocketAddr,
     is_quic: bool,
-    junk: Option<(Socks5JunkParams, bool)>,
+    junk: Option<(Socks5JunkParams, session::DecoyKind)>,
     log_tx: &LogSender,
     metrics: &Arc<Metrics>,
     token: &CancellationToken,

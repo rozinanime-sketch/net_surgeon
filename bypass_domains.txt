@@ -30,3 +30,4 @@ media.discordapp.net
 cdn.discordapp.com
 wattpad.com
 webnovel.com
+ficbook.net

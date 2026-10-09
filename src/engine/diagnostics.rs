@@ -88,6 +88,8 @@ pub enum FragStrategy {
     /// применяется перехватом, а не сокетом, поэтому меряется только под
     /// активным перехватом пакетов.
     Seqovl,
+    /// Приманка плюс перестановка настоящих данных (fake + multidisorder).
+    FakeMultiDisorder,
 }
 
 impl FragStrategy {
@@ -101,6 +103,7 @@ impl FragStrategy {
             FragStrategy::Fake => Strategy::Fake,
             FragStrategy::TlsRecord => Strategy::TlsRecord,
             FragStrategy::Seqovl => Strategy::Seqovl,
+            FragStrategy::FakeMultiDisorder => Strategy::FakeMultiDisorder,
         }
     }
 }
@@ -319,6 +322,10 @@ pub struct DiagnosticResult {
     /// активным перехватом пакетов: это единственный режим, где технику вообще
     /// можно применить. Без перехвата остаётся пустой.
     pub seqovl: SplitScore,
+    /// Приманка плюс перестановка настоящих данных (fake + multidisorder).
+    /// Меряется там же, где fake, но после него: платит и приманкой, и
+    /// ретрансмитом переставленных частей.
+    pub fake_multidisorder: SplitScore,
 }
 
 fn classify_write_error(_e: &std::io::Error) -> ProbeOutcome { ProbeOutcome::ResetOnWrite }
@@ -338,7 +345,8 @@ fn classify_reply(reply: &[u8], strategy: FragStrategy) -> ProbeOutcome {
     // отказ значит другое: сервер получил приманку с чужим именем, а
     // настоящий ClientHello выбросил как повтор. Раньше это засчитывалось
     // успехом, и fake «проходил» 3/3 там, где соединение рвалось.
-    let decoy_reached_server = matches!(strategy, FragStrategy::Fake) && crate::bypass::tls::is_fatal_alert(reply);
+    let decoy_reached_server = matches!(strategy, FragStrategy::Fake | FragStrategy::FakeMultiDisorder)
+        && crate::bypass::tls::is_fatal_alert(reply);
     if decoy_reached_server || crate::bypass::tls::is_corruption_alert(reply) {
         ProbeOutcome::Mangled
     } else if crate::bypass::tls::looks_like_tls_reply(reply) {
@@ -450,6 +458,12 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
         // Приманку не отправить (Windows) — ClientHello уходит как есть,
         // иначе проба молча ждала бы ответа на ничего.
         FragStrategy::Fake => match fragment::split_with_fake(&mut writer, fd, hello, bypass_params).await {
+            Ok(None) => writer.write_all(hello).await,
+            r => r.map(|_| ()),
+        },
+        // Та же оговорка, что у Fake: приманку не отправить — ClientHello
+        // уходит как есть, иначе проба ждала бы ответа на ничего.
+        FragStrategy::FakeMultiDisorder => match fragment::split_with_fake_disorder(&mut writer, fd, hello, bypass_params).await {
             Ok(None) => writer.write_all(hello).await,
             r => r.map(|_| ()),
         },
@@ -678,6 +692,7 @@ async fn diagnose_with(
             oob: empty,
             fake: empty,
             seqovl: empty,
+            fake_multidisorder: empty,
         };
     }
 
@@ -699,6 +714,7 @@ async fn diagnose_with(
             oob: empty,
             fake: empty,
             seqovl: empty,
+            fake_multidisorder: empty,
         };
     }
 
@@ -714,6 +730,7 @@ async fn diagnose_with(
             oob: empty,
             fake: empty,
             seqovl: empty,
+            fake_multidisorder: empty,
         };
     }
 
@@ -735,6 +752,7 @@ async fn diagnose_with(
             oob,
             fake: empty,
             seqovl: empty,
+            fake_multidisorder: empty,
         };
     }
 
@@ -794,7 +812,20 @@ async fn diagnose_with(
         empty
     };
 
-    // Ступень 7: seqovl. Только под перехватом пакетов: сокет не задаёт номер
+    // Ступень 7: fake + multidisorder. После fake: добавляет к приманке
+    // перестановку, нужен тот же режим. В сокетном режиме берём уже подобранный
+    // выше TTL приманки (fake_ttl::effective), чтобы не гонять свип повторно.
+    let fake_multidisorder = if packet_mode {
+        trials(&target, domain, FragStrategy::FakeMultiDisorder, bypass_params, trials_count, early_abandon, timing).await
+    } else if crate::bypass::socket::fake_supported() {
+        let mut probe_params = bypass_params.clone();
+        probe_params.fake_ttl = crate::bypass::fake_ttl::effective(bypass_params.fake_ttl);
+        trials(&target, domain, FragStrategy::FakeMultiDisorder, &probe_params, trials_count, early_abandon, timing).await
+    } else {
+        empty
+    };
+
+    // Ступень 8: seqovl. Только под перехватом пакетов: сокет не задаёт номер
     // последовательности, а без перехвата технику вообще нечем применить.
     // Приманку в бой ставит тот же перехват (env.decoy), так что отдельной
     // проверки «есть ли чем отправить» не нужно.
@@ -813,7 +844,7 @@ async fn diagnose_with(
         probe_quic(domain).await
     };
 
-    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake, seqovl }
+    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake, seqovl, fake_multidisorder }
 }
 
 #[cfg(test)]

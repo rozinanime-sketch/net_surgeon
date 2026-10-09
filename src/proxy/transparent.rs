@@ -459,6 +459,7 @@ async fn handle(
                 Applied::Disorder { first, second } => Some(format!("disorder {}+{}", first, second)),
                 Applied::Oob { first, second } => Some(format!("oob {}+{}", first, second)),
                 Applied::Fake { decoy, real } => Some(format!("fake {}+{}", decoy, real)),
+                Applied::FakeMultiDisorder { decoy, first, second } => Some(format!("fake+multidisorder {}/{}+{}", decoy, first, second)),
                 // Без обхода писать нечего: «bypass: false» уже есть в строке
                 // перехвата выше. Иначе каждое постороннее соединение давало
                 // лишнее предупреждение и топило в логе настоящие. Так же

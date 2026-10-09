@@ -204,6 +204,12 @@ pub async fn handle_connect(
                             ("real", real.to_string()),
                             ("domain", domain_c2s.clone()),
                         ]),
+                        Applied::FakeMultiDisorder { decoy, first, second } => log_t(&log_tx_c2s, LogLevel::Warning, "log.fake_multidisorder_applied", vec![
+                            ("decoy", decoy.to_string()),
+                            ("first", first.to_string()),
+                            ("second", second.to_string()),
+                            ("domain", domain_c2s.clone()),
+                        ]),
                         Applied::None => {}
                     }
                 }

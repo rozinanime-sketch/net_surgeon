@@ -210,6 +210,78 @@ where
     Ok(Some(FakeInfo { decoy: decoy.len(), real: data.len() }))
 }
 
+/// Как прошла техника fake + disorder — для лога вызывающей стороны.
+pub struct FakeDisorderInfo {
+    /// Размер отправленной приманки (= размер первой половины).
+    pub decoy: usize,
+    /// Первая половина настоящих данных (её доставляет ретрансмит).
+    pub first: usize,
+    /// Вторая половина (уходит сразу, с бОльшим номером).
+    pub second: usize,
+}
+
+/// Fake + disorder: приманка на первой половине, затем настоящие данные
+/// переставленными.
+///
+/// Это сокетная версия zapret-комбо `fake,multidisorder`. Чистого
+/// multidisorder на сокете не сделать — ядро ретранслирует неподтверждённые
+/// данные целиком, а не выбранными сегментами, — поэтому здесь перестановка
+/// на две части, но вместе с приманкой:
+///
+/// 1. Приманка (чужое имя, длиной в первую половину) уходит с низким TTL и
+///    умирает за DPI — тот классифицирует соединение по разрешённому имени.
+///    Механизм тот же, что у [`split_with_fake`]: ядро займёт её номерами
+///    `[S, S+pos)` и потом повторит на них настоящую первую половину.
+/// 2. Сразу следом уходит ВТОРАЯ половина — с восстановленным TTL и номером
+///    `S+pos`. Она доходит до сервера раньше, чем ретрансмит первой: DPI,
+///    читающий поток подряд, видит куски не в том порядке (disorder).
+/// 3. Ретрансмит доставляет настоящую первую половину на `[S, pos)`, и сервер
+///    собирает целый ClientHello.
+///
+/// `Ok(None)` — техника здесь неприменима (не та система, нет SNI, слишком
+/// короткий ClientHello для приманки): вызывающий откатывается на сплит.
+pub async fn split_with_fake_disorder<W>(
+    server_writer: &mut W,
+    fd: RawSock,
+    data: &[u8],
+    params: &crate::config::BypassParams,
+) -> std::io::Result<Option<FakeDisorderInfo>>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    if !socket::fake_supported() {
+        return Ok(None);
+    }
+    let Some(loc) = super::tls::find_sni(data) else {
+        return Ok(None);
+    };
+    let pos = loc.split_point().min(data.len());
+    // Нужны обе непустые половины: иначе это не disorder, а обычный fake.
+    if pos < 1 || pos >= data.len() {
+        return Ok(None);
+    }
+    let (first, second) = data.split_at(pos);
+
+    // Приманка ровно в размер первой половины: ретрансмит повторит её номера
+    // байт в байт настоящей первой половиной.
+    let Some(decoy) = super::tls::build_decoy_hello(&params.fake_sni, first.len()) else {
+        return Ok(None);
+    };
+
+    // Всё записанное раньше должно уйти до приманки, мимо подмены.
+    server_writer.flush().await?;
+    // send_fake возвращает управление, как только приманка ушла: TTL уже
+    // восстановлен, а настоящая первая половина ждёт ретрансмита на `[S, pos)`.
+    if !socket::send_fake(fd, &decoy, first, params.fake_ttl, params.fake_md5sig).await? {
+        return Ok(None);
+    }
+    // Вторая половина — с обычным TTL и номером S+pos: доходит раньше ретрансмита.
+    server_writer.write_all(second).await?;
+    server_writer.flush().await?;
+
+    Ok(Some(FakeDisorderInfo { decoy: decoy.len(), first: first.len(), second: second.len() }))
+}
+
 /// OOB: между половинами ClientHello вставляется мусорный байт с флагом URG.
 ///
 /// Получатель без `SO_OOBINLINE` его отбрасывает, то есть сервер видит
@@ -370,5 +442,40 @@ pub fn build_fake_quic_initial() -> Vec<u8> {
     // Случайное "тело" — имитация зашифрованного CRYPTO-фрейма + AEAD tag
     out.extend_from_slice(&random::bytes(payload_len));
 
+    out
+}
+
+/// Поддельный STUN Binding Request (RFC 5389): приманка для потоков звонков,
+/// которые DPI узнаёт по STUN (WebRTC, P2P Telegram/WhatsApp).
+///
+/// В отличие от случайного мусора, это структурно валидный STUN: DPI видит
+/// «начало звонка» и классифицирует поток по приманке, а настоящий первый
+/// пакет принимает за продолжение. Так же zapret шлёт `--dpi-desync-fake-stun`.
+///
+/// Тип — Binding Request (0x0001), magic cookie по RFC, случайный 12-байтовый
+/// transaction ID (чтобы серия не выглядела машинной), без атрибутов (длина 0).
+/// Сервер на чужой transaction ID не ответит ничем, что сломало бы звонок:
+/// настоящий ICE-агент сверяет ID и отбрасывает несовпавшее.
+pub fn build_fake_stun() -> Vec<u8> {
+    let mut out = Vec::with_capacity(20);
+    out.extend_from_slice(&[0x00, 0x01]); // Binding Request
+    out.extend_from_slice(&[0x00, 0x00]); // длина атрибутов = 0
+    out.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // magic cookie
+    out.extend_from_slice(&random::bytes(12)); // transaction ID
+    out
+}
+
+/// Поддельный первый пакет голоса Discord (запрос IP discovery): приманка
+/// для голосовых потоков Discord, которые узнаются именно по нему, а не по
+/// STUN (см. [`crate::proxy::udp::session::is_discord_ip_discovery`]).
+///
+/// Форма точная (74 байта, тип 0x0001, длина 70), тело — случайное: SSRC и
+/// адрес настоящему серверу ни о чём не говорят, а DPI видит узнаваемый
+/// пакет голоса и пропускает поток. Аналог `--dpi-desync-fake-discord`
+/// с заготовленным `ACTIVE_DISCORD_UDP.bin` у zapret.
+pub fn build_fake_discord_voice() -> Vec<u8> {
+    let mut out = Vec::with_capacity(74);
+    out.extend_from_slice(&[0x00, 0x01, 0x00, 70]); // тип запроса + длина тела
+    out.extend_from_slice(&random::bytes(70)); // SSRC + адрес + порт — шум
     out
 }

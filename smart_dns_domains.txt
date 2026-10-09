@@ -16,6 +16,7 @@ oaiusercontent.com
 claude.ai
 claude.com
 anthropic.com
+api.anthropic.com
 
 # Gemini и другие нейросети Google. Только их поддомены: остальному Google
 # умный DNS не нужен.

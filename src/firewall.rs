@@ -438,7 +438,7 @@ mod tests {
         assert!(r.contains("udp dport 53 redirect to :1053"));
         assert!(r.contains("meta mark set 0x1"));
         assert!(r.contains("tproxy ip to 127.0.0.1:1083 accept"));
-        assert!(r.contains("udp dport { 3478-3481, 19302-19309, 50000-65535 } meta mark set 0x1"));
+        assert!(r.contains("udp dport { 3478-3481, 19294-19344, 50000-65535 } meta mark set 0x1"));
         assert!(r.contains("ip daddr != { 127.0.0.0/8, "), "локальные адреса по портам звонков не трогаем");
         assert!(r.contains("ip daddr { 149.154.160.0/20, "));
         // Исключение своей группы должно идти раньше перехвата в каждой цепочке.

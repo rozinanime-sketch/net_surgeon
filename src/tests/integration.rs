@@ -452,7 +452,9 @@ async fn socks5_udp_junk_only_for_listed_domains() {
 
     assert_eq!(sizes(&plain_server, 1).await, vec![5], "поток вне списка получил мусор");
     assert_eq!(sizes(&listed_server, 3).await, vec![900, 900, 6], "поток из списка остался без мусора");
-    assert_eq!(sizes(&call_server, 3).await, vec![900, 900, 20], "звонок (STUN) остался без мусора");
+    // Приманка под STUN — валидный 20-байтовый Binding Request, а не 900
+    // случайных байт: DPI видит «начало звонка», а не мусор.
+    assert_eq!(sizes(&call_server, 3).await, vec![20, 20, 20], "звонок (STUN) получил приманку-STUN");
 
     token.cancel();
 }

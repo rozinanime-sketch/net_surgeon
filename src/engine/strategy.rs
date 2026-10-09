@@ -139,6 +139,20 @@ pub enum Strategy {
     /// Пакетная техника: обычному сокету номер последовательности не задать,
     /// поэтому доступна только под перехватом пакетов (Windows, Linux/nfqueue).
     Seqovl,
+    /// Приманка `fake` плюс перестановка настоящих данных (multidisorder, как
+    /// `--dpi-desync=fake,multidisorder` в zapret).
+    ///
+    /// Сначала уходит поддельный ClientHello с чужим именем, затем настоящие
+    /// данные, порезанные по нескольким точкам и отправленные в обратном
+    /// порядке. От `Fake` отличается именно перестановкой: DPI, который и имя
+    /// разбирает, и поток пересобирает, спотыкается дважды — на подделке и на
+    /// порядке сегментов. Как и `Fake`, платит ретрансмитом.
+    ///
+    /// В пакетном режиме режется по двум точкам (начало записи и центр имени в
+    /// SNI → три сегмента); на сокете ядро ретранслирует данные целиком, поэтому
+    /// честно получаются два сегмента — приманка на первой половине, затем
+    /// вторая половина раньше ретрансмита первой.
+    FakeMultiDisorder,
 }
 
 impl Strategy {
@@ -151,6 +165,7 @@ impl Strategy {
             Strategy::Oob => "oob",
             Strategy::Fake => "fake",
             Strategy::Seqovl => "seqovl",
+            Strategy::FakeMultiDisorder => "fake_multidisorder",
         }
     }
 
@@ -173,6 +188,7 @@ impl Strategy {
             "oob" => Some(Strategy::Oob),
             "fake" => Some(Strategy::Fake),
             "seqovl" => Some(Strategy::Seqovl),
+            "fake_multidisorder" => Some(Strategy::FakeMultiDisorder),
             // Техника убрана как нерабочая; записи из старых strategies.txt
             // не распознаются, и домен просто продиагностируется заново.
             "tiny_chunks" | "socks5_style" => None,
@@ -195,6 +211,7 @@ impl Strategy {
             Strategy::Oob => "strategy.oob",
             Strategy::Fake => "strategy.fake",
             Strategy::Seqovl => "strategy.seqovl",
+            Strategy::FakeMultiDisorder => "strategy.fake_multidisorder",
         }
     }
 }
@@ -267,6 +284,7 @@ pub fn choose_best(
         (Strategy::Oob, &result.oob),
         (Strategy::Disorder, &result.disorder),
         (Strategy::Fake, &result.fake),
+        (Strategy::FakeMultiDisorder, &result.fake_multidisorder),
         (Strategy::Seqovl, &result.seqovl),
     ];
 
@@ -292,6 +310,10 @@ pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
         }
         if result.fake.is_convincing() {
             return Some(Strategy::Fake);
+        }
+        // Приманка одна не прошла, но с перестановкой — прошла: берём её.
+        if result.fake_multidisorder.is_convincing() {
+            return Some(Strategy::FakeMultiDisorder);
         }
     }
     // TLS-record split — первым после direct: он единственный не боится
@@ -319,6 +341,12 @@ pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
     // — там, где не прошло ничего, шанс остаётся только у него.
     if result.fake.is_convincing() {
         return Some(Strategy::Fake);
+    }
+    // Fake + multidisorder — если даже одной приманки не хватило: перестановка
+    // сегментов добивает DPI, который и имя разбирает, и поток пересобирает.
+    // Дороже fake (ещё и ретрансмит переставленных частей), поэтому после него.
+    if result.fake_multidisorder.is_convincing() {
+        return Some(Strategy::FakeMultiDisorder);
     }
     // Seqovl — тоже последней надеждой (пакетный режим): как и fake, подставляет
     // разрешённое имя, но вдобавок снимает заморозку после ~16 КБ там, где имя
@@ -981,6 +1009,7 @@ pub fn confidence_of(result: &DiagnosticResult, chosen: Strategy) -> f64 {
         Strategy::Oob => result.oob.confidence,
         Strategy::Fake => result.fake.confidence,
         Strategy::Seqovl => result.seqovl.confidence,
+        Strategy::FakeMultiDisorder => result.fake_multidisorder.confidence,
         Strategy::None => 1.0,
     }
 }
@@ -1006,6 +1035,7 @@ mod tests {
             oob: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             fake: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             seqovl: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
+            fake_multidisorder: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
         }
     }
 
@@ -1096,6 +1126,19 @@ mod tests {
         let mut r = result(ProbeOutcome::Success, false);
         r.fake = SplitScore { successes: 3, attempts: 3, confidence: 0.44, median_ms: Some(150.0) };
         assert_eq!(choose_from_diagnostics(&r), Some(Strategy::None));
+    }
+
+    #[test]
+    fn fake_multidisorder_is_last_resort_after_plain_fake() {
+        // Приманка одна не прошла, а с перестановкой — прошла: берём комбо.
+        let mut r = result(ProbeOutcome::SilentDrop, false);
+        r.fake_multidisorder = SplitScore { successes: 3, attempts: 3, confidence: 0.44, median_ms: Some(300.0) };
+        assert_eq!(choose_from_diagnostics(&r), Some(Strategy::FakeMultiDisorder));
+        assert_eq!(confidence_of(&r, Strategy::FakeMultiDisorder), 0.44);
+
+        // Но если прошла и обычная приманка — она дешевле, берут её.
+        r.fake = SplitScore { successes: 3, attempts: 3, confidence: 0.44, median_ms: Some(150.0) };
+        assert_eq!(choose_from_diagnostics(&r), Some(Strategy::Fake));
     }
 
     #[test]
@@ -1623,6 +1666,7 @@ pub mod apply {
         Disorder { first: usize, second: usize },
         Oob { first: usize, second: usize },
         Fake { decoy: usize, real: usize },
+        FakeMultiDisorder { decoy: usize, first: usize, second: usize },
         Split { first: usize, second: usize },
     }
 
@@ -1689,6 +1733,23 @@ pub mod apply {
                 match fragment::split_with_fake(writer, fd, data, &tuned).await? {
                     Some(info) => Ok(Applied::Fake { decoy: info.decoy, real: info.real }),
                     // Приманку не собрать или не отправить — откат на обычный сплит, как у прочих.
+                    None => {
+                        let info = fragment::split_client_hello(writer, data, bypass).await?;
+                        Ok(Applied::Split { first: info.first, second: info.second })
+                    }
+                }
+            }
+            Strategy::FakeMultiDisorder => {
+                // TTL приманки подбирается сетью так же, как у fake.
+                let mut tuned = bypass.clone();
+                tuned.fake_ttl = crate::bypass::fake_ttl::effective(bypass.fake_ttl);
+                match fragment::split_with_fake_disorder(writer, fd, data, &tuned).await? {
+                    Some(info) => Ok(Applied::FakeMultiDisorder {
+                        decoy: info.decoy,
+                        first: info.first,
+                        second: info.second,
+                    }),
+                    // Приманку не собрать/не отправить — откат на обычный сплит.
                     None => {
                         let info = fragment::split_client_hello(writer, data, bypass).await?;
                         Ok(Applied::Split { first: info.first, second: info.second })

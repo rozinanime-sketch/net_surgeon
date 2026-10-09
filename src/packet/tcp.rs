@@ -257,6 +257,10 @@ fn technique_for(strategy: Strategy, payload: &[u8], env: &impl Env) -> Techniqu
             let decoy = env.decoy(payload.len());
             Technique::Seqovl { pos, overlap: decoy.len(), decoy }
         }
+        Strategy::FakeMultiDisorder => Technique::FakeMultiDisorder {
+            positions: desync::multidisorder_positions(payload),
+            decoy: env.decoy(payload.len()),
+        },
     }
 }
 
@@ -268,6 +272,20 @@ fn describe(technique: &Technique, len: usize) -> Option<String> {
         Technique::Disorder { pos } => Some(format!("disorder {}+{}", pos, len - pos)),
         Technique::Fake { pos, decoy } => Some(format!("fake {}+{}+{}", decoy.len(), pos, len - pos)),
         Technique::Seqovl { pos, overlap, .. } => Some(format!("seqovl {}:{}+{}", overlap, pos, len - pos)),
+        Technique::FakeMultiDisorder { positions, decoy } => {
+            // Размеры сегментов по точкам реза — для наглядности в логе.
+            let mut parts = Vec::new();
+            let mut prev = 0usize;
+            for &p in positions {
+                let p = p.min(len);
+                if p > prev {
+                    parts.push((p - prev).to_string());
+                    prev = p;
+                }
+            }
+            parts.push((len.saturating_sub(prev)).to_string());
+            Some(format!("fake+multidisorder {}/{}", decoy.len(), parts.join("+")))
+        }
     }
 }
 

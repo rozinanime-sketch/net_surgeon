@@ -47,7 +47,7 @@ pub fn socks_port() -> Option<u16> {
 /// Техника, подставляющая разрешённое имя в начало потока. Только она
 /// переживает заморозку после 16 КБ.
 pub fn is_decoy(strategy: Strategy) -> bool {
-    matches!(strategy, Strategy::Fake | Strategy::Seqovl)
+    matches!(strategy, Strategy::Fake | Strategy::Seqovl | Strategy::FakeMultiDisorder)
 }
 
 /// Что показала freeze-проба.
@@ -64,7 +64,11 @@ pub enum Verdict {
 /// Сколько байт прикладных данных считаем доказательством, что 16 КБ пройдены.
 const SURVIVE_BYTES: usize = 24 * 1024;
 /// Данных прошло больше этого — значит рукопожатие позади и пошёл поток.
-const STARTED_BYTES: usize = 4 * 1024;
+/// Порог низкий (заголовки ответа и первый кусок тела): часть сетей морозит
+/// соединение уже на 2–3 КБ, а не на 16 КБ, и при пороге 4 КБ заморозка до
+/// него просто не доходила — вердикт `Frozen` не выставлялся, и эскалации на
+/// decoy не было. От ложного `Frozen` защищает не этот порог, а STALL_CONFIRM.
+const STARTED_BYTES: usize = 1024;
 /// Как часто проверять, идут ли данные.
 const READ_POLL: Duration = Duration::from_secs(2);
 /// Непрерывная тишина дольше этого — поток действительно встал (заморозка), а

@@ -12,3 +12,4 @@ pub mod net_id;
 pub mod net_state;
 pub mod probe_force;
 pub mod strategy;
+pub mod voice_probe;

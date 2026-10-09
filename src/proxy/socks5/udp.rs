@@ -427,7 +427,7 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
     // следом за ним.
     let sender = session::spawn_writer(
         upstream,
-        (bypass || call).then(|| (ctx.junk.clone(), is_quic)),
+        (bypass || call).then(|| (ctx.junk.clone(), session::classify_decoy(&payload))),
         Arc::clone(&ctx.metrics),
         cancel.clone(),
         WriterLog {

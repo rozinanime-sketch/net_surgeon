@@ -100,7 +100,7 @@ fn technique_label(strategy: Strategy, resigned: bool) -> (String, Color) {
     match strategy {
         Strategy::None if resigned => (t!("strategies.resigned").to_string(), Color::LightRed),
         Strategy::None => (t!("strategies.direct").to_string(), Color::DarkGray),
-        Strategy::Fake | Strategy::Seqovl => (strategy.as_str().to_string(), Color::LightMagenta),
+        Strategy::Fake | Strategy::Seqovl | Strategy::FakeMultiDisorder => (strategy.as_str().to_string(), Color::LightMagenta),
         other => (other.as_str().to_string(), Color::LightGreen),
     }
 }

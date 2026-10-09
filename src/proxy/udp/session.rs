@@ -91,14 +91,19 @@ pub fn is_call_flow(payload: &[u8], dst: std::net::IpAddr) -> bool {
     is_stun(payload) || is_discord_ip_discovery(payload) || crate::proxy::telegram::is_telegram_network(dst)
 }
 
-/// Порты назначения, на которых бывают звонки: STUN (стандартный и
-/// Google, через него идёт WebRTC) и голосовые серверы Discord.
+/// Порты назначения, на которых бывают звонки: STUN (стандартный) и
+/// голосовые серверы Discord.
+///
+/// Диапазон `19294-19344` перекрывает и Google STUN (`19302-19309`, через
+/// него идёт WebRTC), и голосовые серверы Discord: часть из них отвечает в
+/// `19294-19344`, и на прежнем узком `19302-19309` такие звонки проходили
+/// мимо перехвата. Так же этот диапазон держат zapret/Flowseal.
 ///
 /// По ним прозрачный режим решает, какой UDP вообще перехватывать, —
 /// одинаково в Linux (правила nftables) и в Windows (фильтр WinDivert).
 /// Весь UDP перехватывать незачем: игры и VPN шли бы через прокси без
 /// всякой пользы. Сети Telegram перехватываются по адресу, на любом порту.
-pub const CALL_PORTS: &[(u16, u16)] = &[(3478, 3481), (19302, 19309), (50000, 65535)];
+pub const CALL_PORTS: &[(u16, u16)] = &[(3478, 3481), (19294, 19344), (50000, 65535)];
 
 /// Адреса, UDP к которым по портам звонков не перехватывается: петля,
 /// домашняя сеть, мультикаст. На тех же портах там бывают локальные игры
@@ -114,14 +119,50 @@ pub const LOCAL_NETS_V4: &[([u8; 4], u8)] = &[
     ([255, 255, 255, 255], 32),
 ];
 
-/// Один мусорный пакет: поддельный QUIC Initial, если поток — QUIC,
-/// иначе случайные байты. Поток случайных байт перед QUIC сам стал бы
-/// приметой.
-pub fn junk_packet(junk: &Socks5JunkParams, quic: bool) -> Vec<u8> {
-    if quic {
-        fragment::build_fake_quic_initial()
+/// Какую приманку слать перед настоящими датаграммами.
+///
+/// Приманка под протокол потока убедительнее случайного мусора: DPI узнаёт
+/// «начало» QUIC/STUN/голоса Discord и классифицирует поток по ней, а
+/// настоящий первый пакет принимает за продолжение. Тот же приём, что
+/// `--dpi-desync-fake-quic/-stun/-discord` у zapret, где под каждый протокол
+/// свой заготовленный .bin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoyKind {
+    /// Поддельный QUIC Initial — для QUIC (обычно UDP/443).
+    Quic,
+    /// Поддельный STUN Binding Request — для звонков по STUN (WebRTC, P2P).
+    Stun,
+    /// Поддельный запрос IP discovery — для голоса Discord.
+    Discord,
+    /// Случайные байты — для прочего UDP, где формы протокола у нас нет.
+    Random,
+}
+
+/// Подбирает приманку по первому пакету потока.
+///
+/// QUIC и голос Discord опознаются точно; STUN — по magic cookie. Всё
+/// остальное (MTProto к сетям Telegram, прочий UDP из списка обхода) не имеет
+/// у нас узнаваемой формы, поэтому остаётся случайный мусор, как раньше.
+pub fn classify_decoy(payload: &[u8]) -> DecoyKind {
+    if is_quic_initial(payload) {
+        DecoyKind::Quic
+    } else if is_discord_ip_discovery(payload) {
+        DecoyKind::Discord
+    } else if is_stun(payload) {
+        DecoyKind::Stun
     } else {
-        random::bytes(random::in_range_usize(junk.size_min, junk.size_max))
+        DecoyKind::Random
+    }
+}
+
+/// Один пакет приманки под тип потока. Случайный мусор меняет размер в
+/// заданных пределах, чтобы серия не выглядела одинаковой.
+pub fn junk_packet(junk: &Socks5JunkParams, kind: DecoyKind) -> Vec<u8> {
+    match kind {
+        DecoyKind::Quic => fragment::build_fake_quic_initial(),
+        DecoyKind::Stun => fragment::build_fake_stun(),
+        DecoyKind::Discord => fragment::build_fake_discord_voice(),
+        DecoyKind::Random => random::bytes(random::in_range_usize(junk.size_min, junk.size_max)),
     }
 }
 
@@ -132,7 +173,7 @@ pub fn junk_packet(junk: &Socks5JunkParams, quic: bool) -> Vec<u8> {
 /// GC) или отменён `cancel`.
 pub fn spawn_writer(
     upstream: Arc<UdpSocket>,
-    junk: Option<(Socks5JunkParams, bool)>,
+    junk: Option<(Socks5JunkParams, DecoyKind)>,
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
     log: WriterLog,
@@ -140,10 +181,10 @@ pub fn spawn_writer(
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(QUEUE_CAPACITY);
 
     tokio::spawn(async move {
-        if let Some((params, quic)) = junk {
+        if let Some((params, kind)) = junk {
             tokio::select! {
                 _ = cancel.cancelled() => return,
-                _ = send_junk(&upstream, &params, quic, &metrics) => {}
+                _ = send_junk(&upstream, &params, kind, &metrics) => {}
             }
             if let Some(key) = log.junk_sent_key {
                 log_t(&log.log_tx, LogLevel::Success, key, vec![
@@ -179,12 +220,12 @@ pub fn enqueue(sender: &mpsc::Sender<Vec<u8>>, payload: Vec<u8>) {
     let _ = sender.try_send(payload);
 }
 
-async fn send_junk(upstream: &UdpSocket, junk: &Socks5JunkParams, quic: bool, metrics: &Metrics) {
+async fn send_junk(upstream: &UdpSocket, junk: &Socks5JunkParams, kind: DecoyKind, metrics: &Metrics) {
     for i in 0..junk.count {
-        if quic {
+        if kind == DecoyKind::Quic {
             metrics.quic_initial_sent();
         }
-        let packet = junk_packet(junk, quic);
+        let packet = junk_packet(junk, kind);
 
         let _ = upstream.send(&packet).await;
 
@@ -256,6 +297,31 @@ mod tests {
         assert!(!is_call_flow(b"any payload", elsewhere));
     }
 
+    #[test]
+    fn protocol_decoys_pass_their_own_detectors() {
+        // Приманка каждого типа структурно валидна — DPI увидит «начало»
+        // нужного протокола, а не мусор.
+        assert!(is_stun(&fragment::build_fake_stun()), "фейковый STUN — валидный STUN");
+        assert!(
+            is_discord_ip_discovery(&fragment::build_fake_discord_voice()),
+            "фейковый голос Discord — валидный IP discovery",
+        );
+        assert!(
+            is_quic_initial(&fragment::build_fake_quic_initial()),
+            "фейковый QUIC — валидный Initial",
+        );
+    }
+
+    #[test]
+    fn decoy_kind_follows_the_first_packet() {
+        assert_eq!(classify_decoy(&fragment::build_fake_quic_initial()), DecoyKind::Quic);
+        assert_eq!(classify_decoy(&binding_request()), DecoyKind::Stun);
+        let mut discovery = vec![0x00, 0x01, 0x00, 70];
+        discovery.extend_from_slice(&[0u8; 70]);
+        assert_eq!(classify_decoy(&discovery), DecoyKind::Discord);
+        assert_eq!(classify_decoy(b"just some bytes"), DecoyKind::Random);
+    }
+
     #[tokio::test]
     async fn junk_goes_first_and_payloads_keep_their_order() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -266,7 +332,7 @@ mod tests {
         let junk = Socks5JunkParams { count: 3, size_min: 1000, size_max: 1000, delay_min_ms: 20, delay_max_ms: 20, calls: true };
         let tx = spawn_writer(
             Arc::new(upstream),
-            Some((junk, false)),
+            Some((junk, DecoyKind::Random)),
             Metrics::new(),
             CancellationToken::new(),
             WriterLog {

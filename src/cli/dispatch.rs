@@ -37,6 +37,7 @@ fn reward_table(
         (Strategy::Oob, &result.oob),
         (Strategy::Disorder, &result.disorder),
         (Strategy::Fake, &result.fake),
+        (Strategy::FakeMultiDisorder, &result.fake_multidisorder),
         (Strategy::Seqovl, &result.seqovl),
     ]
     .into_iter()
@@ -58,6 +59,17 @@ fn reward_table(
 /// Форматирует медианную задержку успешных проб: «120 мс» или «—».
 fn fmt_ms(value: Option<f64>) -> String {
     value.map(|ms| format!("{:.0}", ms)).unwrap_or_else(|| "—".to_string())
+}
+
+/// Домен сервиса со звонками, для которого уместна UDP-проба голоса.
+///
+/// Блок звонков — сетевой (по STUN), а не по конкретному хосту, поэтому
+/// важна не точная принадлежность, а повод запустить пробу: пользователь
+/// диагностирует именно звонковый сервис.
+fn is_call_service(domain: &str) -> bool {
+    ["discord", "telegram", "whatsapp", "t.me"]
+        .iter()
+        .any(|s| domain.contains(s))
 }
 
 /// Предупреждает, что техника fake в этом прогоне не будет измерена.
@@ -138,6 +150,14 @@ fn report_diagnostics(log_tx: &LogSender, domain: &str, result: &crate::engine::
         ("median", fmt_ms(result.fake.median_ms)),
     ]);
 
+    log::log_t(log_tx, LogLevel::Info, "log.fake_multidisorder_score", vec![
+        ("domain", domain.to_string()),
+        ("successes", result.fake_multidisorder.successes.to_string()),
+        ("attempts", result.fake_multidisorder.attempts.to_string()),
+        ("confidence", format!("{:.2}", result.fake_multidisorder.confidence)),
+        ("median", fmt_ms(result.fake_multidisorder.median_ms)),
+    ]);
+
     log::log_nested_t(log_tx, LogLevel::Info, "log.diag_quic", "verdict", result.quic.description_key(), vec![
         ("domain", domain.to_string()),
     ]);
@@ -190,6 +210,15 @@ pub fn run(
                 let result = crate::engine::diagnostics::diagnose(&domain, &config.bypass, timing).await;
 
                 report_diagnostics(&log_tx, &domain, &result);
+
+                // Для звонковых сервисов — ещё и UDP-проба голоса: режут по DPI
+                // (приманка поможет) или по IP (не поможет). Блок звонков
+                // сетевой, не по домену, поэтому гоняем только когда домен
+                // звонковый, а не на каждой диагностике подряд.
+                if is_call_service(&domain) {
+                    let verdict = crate::engine::voice_probe::diagnose_voice(&config.socks5_junk).await;
+                    log::log_nested_t(&log_tx, LogLevel::Info, "voice.verdict", "verdict", verdict.description_key(), vec![]);
+                }
 
                 // Структурный итог — на экран «Диагностика» (последний прогон).
                 crate::engine::domain_check::set(crate::engine::domain_check::DomainCheck {
