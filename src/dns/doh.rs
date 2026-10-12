@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::observability::logging::{LogSender, log_t, LogLevel};
 use crate::observability::metrics::Metrics;
-use super::ip_cache::{IpDomainCache, extract_qname, extract_ips_from_dns_response, nxdomain_response};
+use super::ip_cache::{IpDomainCache, extract_qname, extract_ips_from_dns_response, nxdomain_response, servfail_response};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_doh_relay(
@@ -29,15 +29,9 @@ pub async fn run_doh_relay(
     };
     let socket = Arc::new(socket);
 
-    metrics.set_udp_listening(true);
-    log_t(&log_tx, LogLevel::Success, "log.doh_listening", vec![
-        ("addr", listen_address.clone()),
-        ("provider", doh_provider.clone()),
-    ]);
-
     // Раньше здесь был .expect(): падение сборки HTTP-клиента паниковало внутри
     // спавнутой задачи, то есть DoH-релей молча умирал, а TUI продолжал показывать
-    // его как работающий.
+    // его как работающий. «Слушает» — только после клиента, по той же причине.
     let client = match super::doh_client(&doh_provider, bootstrap, Duration::from_secs(5)) {
         Ok(c) => c,
         Err(e) => {
@@ -45,6 +39,12 @@ pub async fn run_doh_relay(
             return;
         }
     };
+
+    metrics.set_udp_listening(true);
+    log_t(&log_tx, LogLevel::Success, "log.doh_listening", vec![
+        ("addr", listen_address.clone()),
+        ("provider", doh_provider.clone()),
+    ]);
 
     // Умный DNS — только для имён из smart_dns_domains.txt (см. dns::smart).
     // Не собрался клиент — работаем без него: все имена идут основным путём.
@@ -102,10 +102,18 @@ pub async fn run_doh_relay(
                             let via_smart = smart.as_ref().filter(|_| {
                                 qname.as_deref().is_some_and(super::smart::matches)
                             });
+                            // Ответ умного DNS — общий адрес его прокси для
+                            // всех имён списка: в кэш «адрес → домен» он не
+                            // идёт, там осталось бы последнее имя, и соединение
+                            // по адресу получило бы чужой домен и стратегию.
+                            let mut from_smart = false;
                             let result = match via_smart {
                                 Some((smart_client, smart_provider)) => {
                                     match resolve_via_doh(smart_client, smart_provider, &query).await {
-                                        Ok(r) => Ok(r),
+                                        Ok(r) => {
+                                            from_smart = true;
+                                            Ok(r)
+                                        }
                                         // Умный DNS не ответил — лучше настоящий
                                         // адрес от основного провайдера, чем никакого:
                                         // сервис хотя бы скажет, что закрыт по стране.
@@ -124,16 +132,23 @@ pub async fn run_doh_relay(
                                 Ok(response) => {
                                     metrics.set_dns_ok(true);
                                     metrics.add_tx(response.len() as u64);
-                                    if let Some(qname) = qname {
+                                    if let Some(qname) = qname.filter(|_| !from_smart) {
                                         for ip in extract_ips_from_dns_response(&response) {
                                             ip_cache.insert(ip, qname.clone());
                                         }
                                     }
                                     let _ = socket.send_to(&response, client_addr).await;
                                 }
+                                // SERVFAIL, а не молчание: иначе клиент ждал
+                                // свой таймаут (~5 с) на каждый запрос, прежде
+                                // чем идти к следующему серверу.
                                 Err(e) => {
                                     metrics.set_dns_ok(false);
                                     log_t(&log_tx, LogLevel::Warning, "log.doh_error", vec![("error", e)]);
+                                    if let Some(response) = servfail_response(&query) {
+                                        metrics.add_tx(response.len() as u64);
+                                        let _ = socket.send_to(&response, client_addr).await;
+                                    }
                                 }
                             }
                         });

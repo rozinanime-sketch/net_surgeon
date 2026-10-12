@@ -11,7 +11,13 @@ use std::time::Duration;
 ///
 /// Порт по умолчанию 443, а не 80 даже для `http://`: DoH без TLS не бывает,
 /// и такой адрес в конфиге — это опечатка, а не намерение.
-pub fn provider_endpoint(url: &str) -> Option<(&str, u16)> {
+///
+/// Хост — в том виде, в каком его увидит reqwest: разбор URL приводит его к
+/// нижнему регистру (точку в конце оставляет). Иначе подмена адреса
+/// (`resolve`) для `DNS11.Quad9.net` не совпадала с хостом из URL,
+/// bootstrap-адрес не применялся, и возвращался тот самый замкнутый круг,
+/// ради которого он нужен.
+pub fn provider_endpoint(url: &str) -> Option<(String, u16)> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
@@ -27,13 +33,14 @@ pub fn provider_endpoint(url: &str) -> Option<(&str, u16)> {
             Some(p) => p.parse().ok()?,
             None => 443,
         };
-        return Some((host, port));
+        return Some((host.to_ascii_lowercase(), port));
     }
 
-    match authority.split_once(':') {
-        Some((host, port)) => Some((host, port.parse().ok()?)),
-        None => Some((authority, 443)),
-    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, port.parse().ok()?),
+        None => (authority, 443),
+    };
+    Some((host.to_ascii_lowercase(), port))
 }
 
 /// Текст ошибки вместе со всеми причинами.
@@ -95,7 +102,7 @@ pub fn doh_client(
     if let Some(ip) = bootstrap
         && let Some((host, port)) = provider_endpoint(provider)
     {
-        builder = builder.resolve(host, SocketAddr::new(ip, port));
+        builder = builder.resolve(&host, SocketAddr::new(ip, port));
     }
 
     // По умолчанию reqwest проверяет сертификаты системным верификатором,
@@ -182,11 +189,14 @@ mod tests {
 
     #[test]
     fn splits_provider_url_into_host_and_port() {
-        assert_eq!(provider_endpoint("https://xbox-dns.ru/dns-query"), Some(("xbox-dns.ru", 443)));
-        assert_eq!(provider_endpoint("https://dns.google/dns-query"), Some(("dns.google", 443)));
-        assert_eq!(provider_endpoint("https://example.com:8443/dns-query"), Some(("example.com", 8443)));
-        assert_eq!(provider_endpoint("https://[2606:4700:4700::1111]/dns-query"), Some(("2606:4700:4700::1111", 443)));
-        assert_eq!(provider_endpoint("https://[2606:4700::1111]:8443/x"), Some(("2606:4700::1111", 8443)));
+        assert_eq!(provider_endpoint("https://xbox-dns.ru/dns-query"), Some(("xbox-dns.ru".to_string(), 443)));
+        assert_eq!(provider_endpoint("https://dns.google/dns-query"), Some(("dns.google".to_string(), 443)));
+        assert_eq!(provider_endpoint("https://example.com:8443/dns-query"), Some(("example.com".to_string(), 8443)));
+        assert_eq!(provider_endpoint("https://[2606:4700:4700::1111]/dns-query"), Some(("2606:4700:4700::1111".to_string(), 443)));
+        assert_eq!(provider_endpoint("https://[2606:4700::1111]:8443/x"), Some(("2606:4700::1111".to_string(), 8443)));
+        // Как хост увидит reqwest: регистр понижен, точка в конце осталась.
+        assert_eq!(provider_endpoint("https://DNS11.Quad9.net/dns-query"), Some(("dns11.quad9.net".to_string(), 443)));
+        assert_eq!(provider_endpoint("https://XBOX-DNS.ru./dns-query"), Some(("xbox-dns.ru.".to_string(), 443)));
     }
 
     #[test]

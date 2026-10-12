@@ -72,6 +72,10 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 /// Тот же приём, что в ip_cache.
 const CACHE_MAX_ENTRIES: usize = 10_000;
 
+/// Сколько помнить ответ «A-записей нет» (NXDOMAIN, только IPv6, apex вроде
+/// ytimg.com). Коротко: имя может и появиться.
+const EMPTY_ANSWER_TTL: Duration = Duration::from_secs(60);
+
 /// Сколько считать провайдера недоступным после неудачного запроса.
 ///
 /// Неудача не запоминалась, а запросы к одному домену стоят в очереди на
@@ -109,26 +113,50 @@ struct Resolver {
     /// Писать ли в лог каждый полученный ответ. У запасного резолвера
     /// своя строка лога (с маской для адреса воркера Telegram).
     log_resolved: bool,
+    /// Заполнять ли кэш «адрес → домен». Не у умного DNS: он отвечает общим
+    /// адресом своего прокси на все имена списка, и в кэше оставалось бы
+    /// последнее — соединение по адресу получало чужой домен и стратегию.
+    fill_ip_cache: bool,
 }
 
-static RESOLVER: OnceLock<Option<Resolver>> = OnceLock::new();
+/// Резолверы по текущим настройкам.
+struct Resolvers {
+    main: Option<Arc<Resolver>>,
+    /// Резолвер умного DNS для имён из smart_dns_domains.txt (см. `dns::smart`).
+    /// Работает и при выключенном `resolve_via_doh`: иначе на телефоне, где
+    /// DNS-релея нет, нейросети получали бы настоящие адреса и отказ по стране.
+    smart: Option<Arc<Resolver>>,
+    /// Запасной DoH на случай, когда системный резолвер не нашёл адрес.
+    ///
+    /// Оператор блокирует часть сайтов и на уровне DNS: отвечает «адресов нет»,
+    /// причём не всегда — на телефоне Instagram то резолвился, то нет. Обход
+    /// DPI тут бессилен, до соединения дело не доходит. Резолвить через DoH
+    /// всё подряд по умолчанию не стоит (см. `resolve_via_doh`), а переспросить
+    /// только то, что система не нашла, — безопасно: хуже не станет.
+    ///
+    /// Есть, только когда основной DoH выключен: иначе он уже спрошен, и
+    /// повторять его отказ незачем.
+    fallback: Option<Arc<Resolver>>,
+}
 
-/// Резолвер умного DNS для имён из smart_dns_domains.txt (см. `dns::smart`).
-/// Работает и при выключенном `resolve_via_doh`: иначе на телефоне, где
-/// DNS-релея нет, нейросети получали бы настоящие адреса и отказ по стране.
-static SMART: OnceLock<Option<Resolver>> = OnceLock::new();
+/// Настройки, по которым собраны резолверы: `resolve_via_doh`, провайдер и
+/// его адрес, умный DNS и его адрес.
+type Settings = (bool, String, Option<IpAddr>, String, Option<IpAddr>);
 
-/// Запасной DoH на случай, когда системный резолвер не нашёл адрес.
-///
-/// Оператор блокирует часть сайтов и на уровне DNS: отвечает «адресов нет»,
-/// причём не всегда — на телефоне Instagram то резолвился, то нет. Обход
-/// DPI тут бессилен, до соединения дело не доходит. Резолвить через DoH
-/// всё подряд по умолчанию не стоит (см. `resolve_via_doh`), а переспросить
-/// только то, что система не нашла, — безопасно: хуже не станет.
-///
-/// Есть, только когда основной DoH выключен: иначе он уже спрошен, и
-/// повторять его отказ незачем.
-static FALLBACK: OnceLock<Option<Resolver>> = OnceLock::new();
+/// Текущие резолверы. Пересобираются при перезапуске прокси, если сменились
+/// настройки (см. [`init`]): раньше они ставились один раз за жизнь
+/// программы, и правка провайдера в интерфейсе доходила до релея, но не до
+/// SOCKS5, HTTP и диагностики.
+static RESOLVERS: RwLock<Option<(Settings, Arc<Resolvers>)>> = RwLock::new(None);
+
+fn resolvers() -> Option<Arc<Resolvers>> {
+    RESOLVERS.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(_, r)| Arc::clone(r))
+}
+
+/// Предел на множества «о домене уже сообщено»: при долгой работе с
+/// заблокированным DoH они росли на каждый новый домен. Переполнилось —
+/// начинаем заново: худшее, что будет, — повтор предупреждения.
+const NOTED_MAX: usize = 1024;
 
 /// Канал логов подключается отдельно от init: он создаётся уже внутри
 /// event loop интерфейса, когда резолвер давно поднят.
@@ -154,7 +182,13 @@ fn note_fallback(host: &str) {
     if already {
         return;
     }
-    fallback_set().write().unwrap_or_else(|e| e.into_inner()).insert(host.to_string());
+    {
+        let mut set = fallback_set().write().unwrap_or_else(|e| e.into_inner());
+        if set.len() >= NOTED_MAX {
+            set.clear();
+        }
+        set.insert(host.to_string());
+    }
 
     if let Some(tx) = LOG.get() {
         log_t(tx, LogLevel::Warning, "log.doh_fallback", vec![("domain", host.to_string())]);
@@ -169,8 +203,10 @@ fn note_recovered(host: &str) {
     }
 }
 
-/// Инициализация при старте. `None` — резолв через DoH выключен, всё идёт
-/// через системный резолвер. Пустой `smart_provider` — умного DNS нет.
+/// Ставит резолверы по настройкам: при старте программы и при каждом
+/// перезапуске прокси. Настройки те же — ничего не делает, и кэши ответов
+/// живут дальше. `enabled = false` — основной резолв через систему (DoH
+/// остаётся запасным). Пустой `smart_provider` — умного DNS нет.
 pub fn init(
     enabled: bool,
     provider: String,
@@ -179,6 +215,10 @@ pub fn init(
     smart_bootstrap: Option<std::net::IpAddr>,
     ip_cache: Arc<IpDomainCache>,
 ) {
+    let settings: Settings = (enabled, provider.clone(), bootstrap, smart_provider.clone(), smart_bootstrap);
+    if RESOLVERS.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|(current, _)| *current == settings) {
+        return;
+    }
     let main = enabled.then(|| Resolver::new(provider.clone(), bootstrap, Arc::clone(&ip_cache))).flatten();
     let fallback = (!enabled && !provider.is_empty())
         .then(|| Resolver::new(provider, bootstrap, Arc::clone(&ip_cache)))
@@ -186,11 +226,27 @@ pub fn init(
         .map(|r| Resolver { log_resolved: false, ..r });
     let smart = (!smart_provider.is_empty())
         .then(|| Resolver::new(smart_provider, smart_bootstrap, ip_cache))
-        .flatten();
+        .flatten()
+        .map(|r| Resolver { fill_ip_cache: false, ..r });
 
-    let _ = RESOLVER.set(main);
-    let _ = FALLBACK.set(fallback);
-    let _ = SMART.set(smart);
+    let resolvers = Resolvers { main: main.map(Arc::new), smart: smart.map(Arc::new), fallback: fallback.map(Arc::new) };
+    *RESOLVERS.write().unwrap_or_else(|e| e.into_inner()) = Some((settings, Arc::new(resolvers)));
+}
+
+/// Адреса только от своего DoH — основного, запасного или умного, — без DNS
+/// провайдера. `None` — DoH не настроен вовсе; пустой список — DoH имени не
+/// знает или недоступен.
+///
+/// Для запасного адреса в прозрачном режиме: DNS провайдера отдаёт адреса
+/// заглушек, а [`resolve_all`] при выключенном `resolve_via_doh` (так по
+/// умолчанию) спрашивает именно его.
+pub async fn resolve_doh_only(target: &str) -> Option<Vec<SocketAddr>> {
+    let resolvers = resolvers()?;
+    let (host, port) = split_host_port(target)?;
+    let smart = resolvers.smart.clone().filter(|_| super::smart::matches(&host));
+    let resolver = smart.or_else(|| resolvers.main.clone()).or_else(|| resolvers.fallback.clone())?;
+    let ips = resolver.lookup(&host).await.unwrap_or_default();
+    Some(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
 }
 
 /// Разрешает `host:port` во все адреса в том порядке, в каком их перебирает
@@ -282,6 +338,10 @@ pub async fn connect_without_dead_cache(addrs: &[SocketAddr], budget: std::time:
 /// 4 с, следом IPv6 в сети без IPv6 мгновенно дал «Network is unreachable»).
 /// По той же причине вид ошибки — не «сеть недоступна», если есть другой.
 fn merge_connect_errors(mut errors: Vec<(SocketAddr, std::io::Error)>) -> std::io::Error {
+    // Все — отказы по кэшу: так и сообщаем (см. `is_recently_dead`).
+    if !errors.is_empty() && errors.iter().all(|(_, e)| is_recently_dead(e)) {
+        return errors.swap_remove(0).1;
+    }
     match errors.len() {
         0 => std::io::Error::new(std::io::ErrorKind::NotFound, rust_i18n::t!("err.no_addresses").into_owned()),
         1 => errors.pop().expect("ровно одна ошибка").1,
@@ -316,6 +376,33 @@ const DEAD_ADDR_MAX: usize = 512;
 
 static DEAD_ADDRS: std::sync::Mutex<Option<std::collections::HashMap<std::net::IpAddr, std::time::Instant>>> =
     std::sync::Mutex::new(None);
+
+/// Отказ по кэшу мёртвых адресов, а не по своему таймауту. Вид ошибки тот
+/// же — `TimedOut`, — а отличить её можно через [`is_recently_dead`]: раньше
+/// вызывающим приходилось заглядывать в кэш до подключения, и это гонялось
+/// с соседними соединениями.
+#[derive(Debug)]
+struct RecentlyDead(String);
+
+impl std::fmt::Display for RecentlyDead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RecentlyDead {}
+
+fn recently_dead(addr: SocketAddr) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        RecentlyDead(rust_i18n::t!("err.connect_timeout", addr = addr, secs = 0).into_owned()),
+    )
+}
+
+/// Ошибка — мгновенный отказ по кэшу мёртвых адресов, подключения не было.
+pub fn is_recently_dead(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<RecentlyDead>())
+}
 
 /// Помечен ли адрес недавно не ответившим. Заодно чистит протухшие записи.
 pub(crate) fn addr_is_dead(ip: std::net::IpAddr) -> bool {
@@ -359,8 +446,13 @@ pub async fn connect(target: &str) -> std::io::Result<TcpStream> {
             // (у updates.discord.com 162.159.136.232 не отвечал на SYN)
             // держал подключение около двух минут — столько ядро повторяет
             // SYN, — и до живых адресов дело не доходило.
-            if let Ok(stream) = connect_each(&addrs).await {
-                return Ok(stream);
+            match connect_each(&addrs).await {
+                Ok(stream) => return Ok(stream),
+                // Все адреса отвергнуты кэшем мёртвых — подключений не было.
+                // Системный резолвер тут не выход: кэш для того и есть, чтобы
+                // отказывать сразу, а DNS провайдера отдал бы адрес заглушки.
+                Err(e) if is_recently_dead(&e) => return Err(e),
+                Err(_) => {}
             }
             // Адреса получены, но ни один не подключился — это уже не проблема
             // резолва, поэтому откат не отмечаем как отказ DoH. Таймаут и
@@ -393,10 +485,7 @@ pub async fn connect_addr(addr: SocketAddr) -> std::io::Result<TcpStream> {
     // Быстрый отказ по negative-кэшу: если адрес только что не ответил, не ждём
     // снова 4 с — приложение сразу получит отказ и перейдёт к другому адресу.
     if addr_is_dead(addr.ip()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            rust_i18n::t!("err.connect_timeout", addr = addr, secs = 0).into_owned(),
-        ));
+        return Err(recently_dead(addr));
     }
     match tokio::time::timeout(PER_ADDRESS_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         // Все подключения прокси проходят здесь. Метка — чтобы перехват
@@ -463,7 +552,7 @@ pub async fn lookup_system(target: &str) -> std::io::Result<Vec<SocketAddr>> {
 /// Адреса через запасной DoH для имени, которое не нашёл системный
 /// резолвер. `None` — запасного нет, хост уже адрес или DoH тоже не знает.
 async fn resolve_unresolvable(target: &str) -> Option<Vec<SocketAddr>> {
-    let fallback = FALLBACK.get()?.as_ref()?;
+    let fallback = resolvers()?.fallback.clone()?;
     let (host, port) = split_host_port(target)?;
     if host.parse::<IpAddr>().is_ok() {
         return None;
@@ -474,7 +563,12 @@ async fn resolve_unresolvable(target: &str) -> Option<Vec<SocketAddr>> {
     let first_time = NOTED
         .get_or_init(Default::default)
         .lock()
-        .map(|mut seen| seen.insert(host.clone()))
+        .map(|mut seen| {
+            if seen.len() >= NOTED_MAX {
+                seen.clear();
+            }
+            seen.insert(host.clone())
+        })
         .unwrap_or(false);
     if first_time && let Some(tx) = LOG.get() {
         log_t(tx, LogLevel::Warning, "log.dns_fallback_used", vec![
@@ -503,8 +597,9 @@ async fn resolve_target(target: &str) -> Resolution {
         return Resolution::NotApplicable;
     }
 
-    let smart = SMART.get().and_then(Option::as_ref).filter(|_| super::smart::matches(&host));
-    let Some(resolver) = smart.or_else(|| RESOLVER.get().and_then(Option::as_ref)) else {
+    let resolvers = resolvers();
+    let smart = resolvers.as_ref().and_then(|r| r.smart.clone()).filter(|_| super::smart::matches(&host));
+    let Some(resolver) = smart.or_else(|| resolvers.as_ref().and_then(|r| r.main.clone())) else {
         return Resolution::NotApplicable;
     };
 
@@ -545,6 +640,7 @@ impl Resolver {
             down_until: std::sync::Mutex::new(None),
             ip_cache,
             log_resolved: true,
+            fill_ip_cache: true,
         })
     }
 
@@ -623,7 +719,10 @@ impl Resolver {
         let body = response.bytes().await.map_err(|_| ())?;
         let ips = extract_ips_from_dns_response(&body);
         if ips.is_empty() {
-            // Ответ получен, просто A-записей нет — это не отказ DoH.
+            // Ответ получен, просто A-записей нет — это не отказ DoH. Тоже
+            // в кэш, но ненадолго: иначе каждое из десятков соединений
+            // браузера к такому имени заново ходило к провайдеру.
+            self.remember(host, Vec::new(), EMPTY_ANSWER_TTL);
             return Ok(Vec::new());
         }
 
@@ -640,23 +739,23 @@ impl Resolver {
 
         // Заполняем и обратный кэш: он нужен, когда клиент шлёт CONNECT
         // сразу на IP, минуя имя из списка обхода.
-        for ip in &ips {
-            self.ip_cache.insert(*ip, host.to_string());
-        }
-
-        {
-            let mut guard = self.forward.write().unwrap_or_else(|e| e.into_inner());
-            if guard.len() > CACHE_MAX_ENTRIES {
-                let now = Instant::now();
-                guard.retain(|_, e| e.expires > now);
+        if self.fill_ip_cache {
+            for ip in &ips {
+                self.ip_cache.insert(*ip, host.to_string());
             }
-            guard.insert(
-                host.to_string(),
-                Entry { ips: ips.clone(), expires: Instant::now() + CACHE_TTL },
-            );
         }
 
+        self.remember(host, ips.clone(), CACHE_TTL);
         Ok(ips)
+    }
+
+    fn remember(&self, host: &str, ips: Vec<IpAddr>, ttl: Duration) {
+        let mut guard = self.forward.write().unwrap_or_else(|e| e.into_inner());
+        if guard.len() > CACHE_MAX_ENTRIES {
+            let now = Instant::now();
+            guard.retain(|_, e| e.expires > now);
+        }
+        guard.insert(host.to_string(), Entry { ips, expires: Instant::now() + ttl });
     }
 
     fn cached(&self, host: &str) -> Option<Vec<IpAddr>> {
@@ -700,6 +799,21 @@ fn build_dns_query(host: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Отказ по кэшу отличим от настоящего таймаута, и сводная ошибка по
+    /// нескольким адресам это сохраняет, только если отказали все по кэшу.
+    #[test]
+    fn cache_rejection_is_marked_and_survives_merging() {
+        use std::io::{Error, ErrorKind};
+        let dead: SocketAddr = "203.0.113.91:443".parse().unwrap();
+        let rejected = recently_dead(dead);
+        assert_eq!(rejected.kind(), ErrorKind::TimedOut);
+        assert!(is_recently_dead(&rejected));
+        assert!(!is_recently_dead(&Error::from(ErrorKind::TimedOut)));
+
+        assert!(is_recently_dead(&merge_connect_errors(vec![(dead, recently_dead(dead)), (dead, recently_dead(dead))])));
+        assert!(!is_recently_dead(&merge_connect_errors(vec![(dead, recently_dead(dead)), (dead, Error::from(ErrorKind::TimedOut))])));
+    }
 
     /// Кэш мёртвых адресов помечает и не растёт сверх предела: при потоке из
     /// множества разных IP размер держится в границах (защита от разрастания).
@@ -794,6 +908,7 @@ mod tests {
             down_until: std::sync::Mutex::new(None),
             ip_cache: Arc::new(IpDomainCache::new()),
             log_resolved: true,
+            fill_ip_cache: true,
         });
 
         let started = Instant::now();

@@ -145,6 +145,15 @@ pub async fn run_all(
         log_t(&log_tx, LogLevel::Warning, "log.smart_dns_replaced", vec![("provider", config.smart_dns_provider.clone())]);
     }
     crate::dns::smart::reload(&config.smart_dns_provider, &log_tx);
+    // Резолверы — по этому же конфигу: провайдер мог смениться.
+    crate::dns::resolver::init(
+        config.resolve_via_doh,
+        config.doh_provider.clone(),
+        config.doh_bootstrap_ip,
+        config.smart_dns_provider.clone(),
+        config.smart_dns_bootstrap_ip,
+        Arc::clone(&ip_cache),
+    );
     telegram::reload(&log_tx, &config.bypass);
 
     let tcp_task = {

@@ -651,9 +651,14 @@ async fn connect_with_fallback(
 
     let Some(name) = name else { return last_resort().await };
 
-    // Через свой резолвер (DoH), а не системный: DNS провайдера отдаёт
-    // адреса заглушек, и «другим адресом сайта» оказалась бы она.
-    let addrs = crate::dns::resolver::resolve_all(&format!("{name}:{}", target.port())).await;
+    // Через свой DoH, а не системный резолвер: DNS провайдера отдаёт адреса
+    // заглушек, и «другим адресом сайта» оказалась бы она. Системный — только
+    // если DoH не настроен вовсе.
+    let lookup = format!("{name}:{}", target.port());
+    let addrs = match crate::dns::resolver::resolve_doh_only(&lookup).await {
+        Some(addrs) => addrs,
+        None => crate::dns::resolver::resolve_all(&lookup).await,
+    };
     // Только того же семейства: к IPv6 из IPv4-соединения (и наоборот)
     // может не быть маршрута.
     for addr in addrs.into_iter().filter(|a| a.is_ipv4() == target.is_ipv4() && a.ip() != target.ip()) {
@@ -676,10 +681,9 @@ async fn connect_with_fallback(
 /// таймауту, а не по мгновенному отказу из кэша резолвера: тот помнит адрес
 /// минуту, и его отказ продлевал бы её до десяти.
 async fn try_addr(addr: std::net::SocketAddr) -> std::io::Result<TcpStream> {
-    let cached = crate::dns::resolver::addr_is_dead(addr.ip());
     let result = crate::dns::resolver::connect_addr(addr).await;
     if let Err(e) = &result
-        && !cached
+        && !crate::dns::resolver::is_recently_dead(e)
     {
         mark_dead_if_blocked(addr.ip(), e);
     }

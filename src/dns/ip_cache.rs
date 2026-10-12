@@ -87,6 +87,17 @@ pub fn extract_ips_from_dns_response(buf: &[u8]) -> Vec<IpAddr> {
 /// (A, AAAA, HTTPS), и клиенту не с чем пытаться соединиться. Секция
 /// дополнительных записей (EDNS) отбрасывается вместе со своим счётчиком.
 pub fn nxdomain_response(query: &[u8]) -> Option<Vec<u8>> {
+    error_response(query, 3)
+}
+
+/// Ответ SERVFAIL: «сервер не смог ответить». Клиент сразу идёт к
+/// следующему серверу или повторяет, а не ждёт свой таймаут молча.
+pub fn servfail_response(query: &[u8]) -> Option<Vec<u8>> {
+    error_response(query, 2)
+}
+
+/// Ответ без записей с кодом `rcode`: тот же ID и вопрос.
+fn error_response(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
     if query.len() < 12 { return None; }
     // Только стандартный запрос: ответ на что-то другое — не наше дело.
     if query[2] & 0x80 != 0 || (query[2] >> 3) & 0x0F != 0 { return None; }
@@ -100,9 +111,9 @@ pub fn nxdomain_response(query: &[u8]) -> Option<Vec<u8>> {
     }
 
     let mut out = query[..p].to_vec();
-    // QR = 1, RD копируется из запроса; RA = 1, RCODE = 3 (NXDOMAIN).
+    // QR = 1, RD копируется из запроса; RA = 1, RCODE — заданный.
     out[2] = 0x80 | (query[2] & 0x01);
-    out[3] = 0x80 | 0x03;
+    out[3] = 0x80 | rcode;
     // ANCOUNT, NSCOUNT, ARCOUNT
     out[6..12].fill(0);
     Some(out)
@@ -232,6 +243,16 @@ mod tests {
         // Вопрос целиком, EDNS отброшен.
         assert_eq!(r.len(), 12 + 14 + 4);
         assert!(extract_ips_from_dns_response(&r).is_empty());
+    }
+
+    #[test]
+    fn servfail_differs_from_nxdomain_only_in_rcode() {
+        let q = query(b"example.com");
+        let nx = nxdomain_response(&q).unwrap();
+        let fail = servfail_response(&q).unwrap();
+        assert_eq!(fail[3] & 0x0F, 2);
+        assert_eq!(nx[..3], fail[..3]);
+        assert_eq!(nx[4..], fail[4..]);
     }
 
     #[test]
