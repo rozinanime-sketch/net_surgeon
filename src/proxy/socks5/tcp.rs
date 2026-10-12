@@ -416,7 +416,7 @@ async fn handle_connect(
             // Принудительная техника freeze-пробы важнее автоподбора: проба
             // меряет именно её. Для обычных клиентов метки нет — идёт автоподбор.
             if let Some(forced) = client_port.and_then(crate::engine::probe_force::take) {
-                selected = crate::proxy::adaptive::Selected { strategy: forced, source: None };
+                selected = crate::proxy::adaptive::Selected::new(forced, None);
             } else if wants_bypass {
                 selected = crate::proxy::adaptive::select(&adaptive_ctx, &domain, initial.len());
             }

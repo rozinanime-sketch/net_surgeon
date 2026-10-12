@@ -473,6 +473,11 @@ fn usable_at(ttl_hours: u64, now: u64) -> impl Fn(&Entry) -> bool {
     }
 }
 
+/// Выбрасывает записи старше [`STALE_RETENTION_SECS`].
+fn prune_stale(map: &mut HashMap<Key, Entry>, now: u64) {
+    map.retain(|_, e| now.saturating_sub(e.decided_at) < STALE_RETENTION_SECS);
+}
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
@@ -498,6 +503,15 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// гейтит кулдаун автодиагностики (10 мин), так что «долбёжки» не будет, а
 /// ложный резигн самоизлечится за ~15 минут вместо часа.
 const RESIGNED_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Сколько хранить запись, которую никто не переизмерил.
+///
+/// Протухшая запись не выбрасывается сразу: она не даёт поддомену взять
+/// стратегию родителя и запускает свою диагностику (см. `lookup_detailed`), а
+/// запись чужой сети пригодится при возврате в неё. Но домен, к которому месяц
+/// не ходили, и сеть, где месяц не были, уже не нужны, а без предела
+/// strategies.txt только рос: `save` пишет обратно всё, что в памяти.
+const STALE_RETENTION_SECS: u64 = 30 * 24 * 3600;
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
@@ -767,7 +781,12 @@ impl StrategyStore {
     ///
     /// Возвращает true, если запись была сброшена — вызывающий код тогда
     /// сообщает об этом в лог.
-    pub fn record_outcome(&self, domain: &str, class: HelloClass, succeeded: bool, ttl_hours: u64) -> bool {
+    ///
+    /// `applied` — стратегия, которая на самом деле применялась. Запись могли
+    /// переизмерить, пока соединение жило (долгий WebSocket пережил новую
+    /// диагностику): тогда исход говорит о прежней технике, а не о нынешней,
+    /// и не засчитывается.
+    pub fn record_outcome(&self, domain: &str, class: HelloClass, applied: Strategy, succeeded: bool, ttl_hours: u64) -> bool {
         use std::sync::atomic::Ordering;
 
         let exact = key_for(domain, class);
@@ -821,7 +840,7 @@ impl StrategyStore {
         // техниками. Раньше её пропускали, и вердикт, снятый одной удачной
         // пробой, жил сутки без обратной связи: если DPI пропускал пакеты
         // через раз, домен до конца TTL ходил без обхода и не открывался.
-        if entry.resigned {
+        if entry.resigned || entry.strategy != applied {
             return false;
         }
 
@@ -931,7 +950,8 @@ impl StrategyStore {
         // сбрасывался после записи и стирал такую пометку.
         self.dirty.store(false, Ordering::Relaxed);
 
-        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        prune_stale(&mut guard, now_secs());
         let mut lines: Vec<String> = guard
             .iter()
             .map(|((net, domain, class), e)| format!(
@@ -990,6 +1010,9 @@ impl StrategyStore {
         let key = key_for(domain, class);
         let now = std::time::Instant::now();
         let mut guard = self.auto_diagnosis.lock().unwrap_or_else(|e| e.into_inner());
+        // Отметки старше паузы ничего не решают; без чистки карта росла на
+        // каждую пару «сеть + домен + размер» до конца работы программы.
+        guard.retain(|_, started| now.duration_since(*started) < cooldown);
         match guard.get(&key) {
             Some(started) if now.duration_since(*started) < cooldown => false,
             _ => {
@@ -1276,10 +1299,10 @@ mod tests {
         store.set("googlevideo.com", HelloClass::Large, Strategy::TlsRecord, 0.44);
 
         for _ in 0..MAX_CONSECUTIVE_FAILURES - 1 {
-            assert!(!store.record_outcome("rr3---sn-pivhx.googlevideo.com", HelloClass::Large, false, 24));
+            assert!(!store.record_outcome("rr3---sn-pivhx.googlevideo.com", HelloClass::Large, Strategy::TlsRecord, false, 24));
         }
         // Третья неудача подряд сбрасывает запись родителя
-        assert!(store.record_outcome("rr5---sn-other.googlevideo.com", HelloClass::Large, false, 24));
+        assert!(store.record_outcome("rr5---sn-other.googlevideo.com", HelloClass::Large, Strategy::TlsRecord, false, 24));
         assert_eq!(store.lookup_detailed("googlevideo.com", HelloClass::Large, 24), None);
 
         assert_eq!(store.verification_stats().total, MAX_CONSECUTIVE_FAILURES as u64);
@@ -1296,7 +1319,7 @@ mod tests {
         store.set("a.example.com", HelloClass::Large, Strategy::None, 1.0);
 
         for _ in 0..MAX_CONSECUTIVE_FAILURES {
-            store.record_outcome("b.a.example.com", HelloClass::Large, false, 24);
+            store.record_outcome("b.a.example.com", HelloClass::Large, Strategy::TlsRecord, false, 24);
         }
         assert_eq!(
             store.lookup_detailed("a.example.com", HelloClass::Large, 24),
@@ -1311,18 +1334,31 @@ mod tests {
         let store = StrategyStore::new();
         store.set("googlevideo.com", HelloClass::Large, Strategy::TlsRecord, 0.44);
 
-        assert!(!store.record_outcome("a.googlevideo.com", HelloClass::Large, false, 24));
-        assert!(!store.record_outcome("b.googlevideo.com", HelloClass::Large, true, 24));
+        assert!(!store.record_outcome("a.googlevideo.com", HelloClass::Large, Strategy::TlsRecord, false, 24));
+        assert!(!store.record_outcome("b.googlevideo.com", HelloClass::Large, Strategy::TlsRecord, true, 24));
         // Серия прервана, поэтому следующие две неудачи ещё не сбрасывают запись
-        assert!(!store.record_outcome("c.googlevideo.com", HelloClass::Large, false, 24));
-        assert!(!store.record_outcome("d.googlevideo.com", HelloClass::Large, false, 24));
+        assert!(!store.record_outcome("c.googlevideo.com", HelloClass::Large, Strategy::TlsRecord, false, 24));
+        assert!(!store.record_outcome("d.googlevideo.com", HelloClass::Large, Strategy::TlsRecord, false, 24));
         assert!(store.lookup_detailed("googlevideo.com", HelloClass::Large, 24).is_some());
+    }
+
+    /// Запись переизмерили, пока соединение жило: его исход — про прежнюю
+    /// технику и новой не засчитывается.
+    #[test]
+    fn outcome_of_a_replaced_strategy_is_ignored() {
+        let store = StrategyStore::new();
+        store.set("example.com", HelloClass::Large, Strategy::Fake, 0.44);
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            assert!(!store.record_outcome("example.com", HelloClass::Large, Strategy::TlsRecord, false, 24));
+        }
+        assert_eq!(store.lookup_detailed("example.com", HelloClass::Large, 24).map(|(s, _)| s), Some(Strategy::Fake));
+        assert_eq!(store.verification_stats().total, 0);
     }
 
     #[test]
     fn outcome_for_an_unknown_domain_is_ignored() {
         let store = StrategyStore::new();
-        assert!(!store.record_outcome("example.com", HelloClass::Large, false, 24));
+        assert!(!store.record_outcome("example.com", HelloClass::Large, Strategy::TlsRecord, false, 24));
         assert_eq!(store.verification_stats().total, 0);
     }
 
@@ -1334,9 +1370,9 @@ mod tests {
         let store = StrategyStore::new();
         store.set("example.com", HelloClass::Large, Strategy::TlsRecord, 0.44);
         for _ in 0..4 {
-            store.record_outcome("example.com", HelloClass::Large, true, 24);
+            store.record_outcome("example.com", HelloClass::Large, Strategy::TlsRecord, true, 24);
         }
-        store.record_outcome("example.com", HelloClass::Large, false, 24);
+        store.record_outcome("example.com", HelloClass::Large, Strategy::TlsRecord, false, 24);
 
         // Та же техника — статистика продолжает накапливаться
         store.set("example.com", HelloClass::Large, Strategy::TlsRecord, 0.60);
@@ -1376,7 +1412,7 @@ mod tests {
 
         // Провалы маленького пакета сбрасывают только его запись
         for _ in 0..MAX_CONSECUTIVE_FAILURES {
-            store.record_outcome("updates.discord.com", HelloClass::Small, false, 24);
+            store.record_outcome("updates.discord.com", HelloClass::Small, Strategy::Oob, false, 24);
         }
         assert_eq!(store.lookup_detailed("updates.discord.com", HelloClass::Small, 24), None);
         assert_eq!(store.lookup_detailed("updates.discord.com", HelloClass::Large, 24).map(|(s, _)| s), Some(Strategy::TlsRecord));
@@ -1449,6 +1485,20 @@ mod tests {
         store
     }
 
+    #[test]
+    fn long_stale_entries_are_pruned_and_recent_stale_ones_kept() {
+        let v = crate::engine::diagnostics::DIAGNOSTIC_VERSION;
+        let store = store_from(&format!(
+            "{}{}",
+            store_line("old.example.com", Strategy::TlsRecord, STALE_RETENTION_SECS + 60, v),
+            store_line("week.example.com", Strategy::TlsRecord, 7 * 24 * 3600, v),
+        ));
+        let mut map = store.inner.write().unwrap();
+        prune_stale(&mut map, now_secs());
+        let domains: Vec<&str> = map.keys().map(|(_, d, _)| d.as_str()).collect();
+        assert_eq!(domains, ["week.example.com"]);
+    }
+
     /// Протухший предок не должен обрывать подъём по дереву: выше может
     /// лежать свежая запись, и раньше она не находилась.
     #[test]
@@ -1478,9 +1528,9 @@ mod tests {
         ));
 
         for _ in 0..MAX_CONSECUTIVE_FAILURES - 1 {
-            assert!(!store.record_outcome("a.b.example.com", HelloClass::Large, false, 1));
+            assert!(!store.record_outcome("a.b.example.com", HelloClass::Large, Strategy::TlsRecord, false, 1));
         }
-        assert!(store.record_outcome("a.b.example.com", HelloClass::Large, false, 1));
+        assert!(store.record_outcome("a.b.example.com", HelloClass::Large, Strategy::TlsRecord, false, 1));
         assert_eq!(store.lookup_detailed("example.com", HelloClass::Large, 1), None);
     }
 
@@ -1615,9 +1665,9 @@ mod tests {
         let store = StrategyStore::new();
         store.set("flaky.example.com", HelloClass::Large, Strategy::None, 1.0);
 
-        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, false, 24));
-        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, false, 24));
-        assert!(store.record_outcome("flaky.example.com", HelloClass::Large, false, 24));
+        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, Strategy::None, false, 24));
+        assert!(!store.record_outcome("flaky.example.com", HelloClass::Large, Strategy::None, false, 24));
+        assert!(store.record_outcome("flaky.example.com", HelloClass::Large, Strategy::None, false, 24));
         assert_eq!(store.lookup_detailed("flaky.example.com", HelloClass::Large, 24), None);
         assert_eq!(store.verification_stats().invalidations, 1);
     }
@@ -1630,7 +1680,7 @@ mod tests {
         store.set_resigned("hopeless.example.com", HelloClass::Large);
 
         for _ in 0..10 {
-            assert!(!store.record_outcome("hopeless.example.com", HelloClass::Large, false, 24));
+            assert!(!store.record_outcome("hopeless.example.com", HelloClass::Large, Strategy::None, false, 24));
         }
         assert!(store.is_resigned("hopeless.example.com", HelloClass::Large, 24));
         assert_eq!(store.verification_stats().total, 0);
@@ -1686,8 +1736,11 @@ pub mod apply {
         }
     }
 
-    /// Отправляет первый пакет по выбранной стратегии.
-    /// `Ok(None)` — запись не удалась, соединение надо закрывать.
+    /// Отправляет первый пакет по выбранной стратегии и говорит, что
+    /// применилось на самом деле: техника, которой здесь нечего делать (нет
+    /// SNI, нет приманки), откатывается на обычный сплит. `Applied::None` —
+    /// пакет ушёл как есть, по стратегии `None`. Ошибка — запись не удалась,
+    /// соединение надо закрывать.
     pub async fn first_packet<W>(
         writer: &mut W,
         fd: crate::bypass::socket::RawSock,
@@ -1698,94 +1751,49 @@ pub mod apply {
     where
         W: tokio::io::AsyncWriteExt + Unpin,
     {
-        match strategy {
+        // TTL приманки — подобранный сетью, а не из конфига: он должен
+        // умереть дальше DPI, но ближе сервера (см. bypass::fake_ttl).
+        let decoy_params = || {
+            let mut tuned = bypass.clone();
+            tuned.fake_ttl = crate::bypass::fake_ttl::effective(bypass.fake_ttl);
+            tuned
+        };
+        let applied = match strategy {
             Strategy::None => {
                 writer.write_all(data).await?;
                 writer.flush().await?;
-                Ok(Applied::None)
+                return Ok(Applied::None);
             }
-            Strategy::TlsRecord => {
-                match fragment::tls_record_split(writer, data, bypass.split_delay_ms).await? {
-                    Some(bytes) => Ok(Applied::TlsRecord { bytes }),
-                    // SNI нет (подключение по IP, ECH) — откат на обычный сплит
-                    None => {
-                        let info = fragment::split_client_hello(writer, data, bypass).await?;
-                        Ok(Applied::Split { first: info.first, second: info.second })
-                    }
-                }
-            }
-            Strategy::Disorder => {
-                match fragment::split_with_disorder(writer, fd, data, bypass.disorder_ttl).await? {
-                    Some(info) => Ok(Applied::Disorder { first: info.first, second: info.second }),
-                    None => {
-                        let info = fragment::split_client_hello(writer, data, bypass).await?;
-                        Ok(Applied::Split { first: info.first, second: info.second })
-                    }
-                }
-            }
-            Strategy::Oob => {
-                match fragment::split_with_oob(writer, fd, data).await? {
-                    Some(info) => Ok(Applied::Oob { first: info.first, second: info.second }),
-                    None => {
-                        let info = fragment::split_client_hello(writer, data, bypass).await?;
-                        Ok(Applied::Split { first: info.first, second: info.second })
-                    }
-                }
-            }
-            Strategy::SniSplit => {
-                match fragment::split_at_sni(writer, data, bypass.split_delay_ms).await? {
-                    Some(info) => Ok(Applied::SniSplit { first: info.first, second: info.second }),
-                    None => {
-                        let info = fragment::split_client_hello(writer, data, bypass).await?;
-                        Ok(Applied::Split { first: info.first, second: info.second })
-                    }
-                }
-            }
-            Strategy::Fake => {
-                // TTL приманки — подобранный сетью, а не из конфига: он должен
-                // умереть дальше DPI, но ближе сервера (см. bypass::fake_ttl).
-                let mut tuned = bypass.clone();
-                tuned.fake_ttl = crate::bypass::fake_ttl::effective(bypass.fake_ttl);
-                match fragment::split_with_fake(writer, fd, data, &tuned).await? {
-                    Some(info) => Ok(Applied::Fake { decoy: info.decoy, real: info.real }),
-                    // Приманку не собрать или не отправить — откат на обычный сплит, как у прочих.
-                    None => {
-                        let info = fragment::split_client_hello(writer, data, bypass).await?;
-                        Ok(Applied::Split { first: info.first, second: info.second })
-                    }
-                }
-            }
-            Strategy::FakeMultiDisorder => {
-                // TTL приманки подбирается сетью так же, как у fake.
-                let mut tuned = bypass.clone();
-                tuned.fake_ttl = crate::bypass::fake_ttl::effective(bypass.fake_ttl);
-                match fragment::split_with_fake_disorder(writer, fd, data, &tuned).await? {
-                    Some(info) => Ok(Applied::FakeMultiDisorder {
-                        decoy: info.decoy,
-                        first: info.first,
-                        second: info.second,
-                    }),
-                    // Приманку не собрать/не отправить — откат на обычный сплит.
-                    None => {
-                        let info = fragment::split_client_hello(writer, data, bypass).await?;
-                        Ok(Applied::Split { first: info.first, second: info.second })
-                    }
-                }
-            }
+            Strategy::TlsRecord => fragment::tls_record_split(writer, data, bypass.split_delay_ms)
+                .await?
+                .map(|bytes| Applied::TlsRecord { bytes }),
+            Strategy::Disorder => fragment::split_with_disorder(writer, fd, data, bypass.disorder_ttl)
+                .await?
+                .map(|info| Applied::Disorder { first: info.first, second: info.second }),
+            Strategy::Oob => fragment::split_with_oob(writer, fd, data)
+                .await?
+                .map(|info| Applied::Oob { first: info.first, second: info.second }),
+            Strategy::SniSplit => fragment::split_at_sni(writer, data, bypass.split_delay_ms)
+                .await?
+                .map(|info| Applied::SniSplit { first: info.first, second: info.second }),
             // Seqovl — пакетная техника: сокету номер последовательности не
             // задать. Сюда она попадать не должна (adaptive не выбирает её вне
             // перехвата пакетов), но на случай устаревшей записи откатываемся
             // на fake — ближайшую по смыслу (та же приманка с чужим именем).
-            Strategy::Seqovl => {
-                let mut tuned = bypass.clone();
-                tuned.fake_ttl = crate::bypass::fake_ttl::effective(bypass.fake_ttl);
-                match fragment::split_with_fake(writer, fd, data, &tuned).await? {
-                    Some(info) => Ok(Applied::Fake { decoy: info.decoy, real: info.real }),
-                    None => {
-                        let info = fragment::split_client_hello(writer, data, bypass).await?;
-                        Ok(Applied::Split { first: info.first, second: info.second })
-                    }
-                }
+            Strategy::Fake | Strategy::Seqovl => fragment::split_with_fake(writer, fd, data, &decoy_params())
+                .await?
+                .map(|info| Applied::Fake { decoy: info.decoy, real: info.real }),
+            Strategy::FakeMultiDisorder => fragment::split_with_fake_disorder(writer, fd, data, &decoy_params())
+                .await?
+                .map(|info| Applied::FakeMultiDisorder { decoy: info.decoy, first: info.first, second: info.second }),
+        };
+        match applied {
+            Some(applied) => Ok(applied),
+            // Техника здесь неприменима (нет SNI — подключение по IP, ECH;
+            // приманку не собрать или не отправить) — обычный сплит.
+            None => {
+                let info = fragment::split_client_hello(writer, data, bypass).await?;
+                Ok(Applied::Split { first: info.first, second: info.second })
             }
         }
     }

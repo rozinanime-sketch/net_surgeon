@@ -26,7 +26,19 @@ pub fn net_id() -> String {
 
 /// Задаёт id сети (старт и смена сети).
 pub fn set_net_id(id: String) {
-    *net_id_slot().write().unwrap_or_else(|e| e.into_inner()) = id;
+    let mut slot = net_id_slot().write().unwrap_or_else(|e| e.into_inner());
+    if *slot != id {
+        NET_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    *slot = id;
+}
+
+/// Сколько раз менялась сеть. Дешёвый признак «сеть та же», который можно
+/// запомнить в `Copy`-структуре (см. `adaptive::Selected`).
+static NET_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn net_generation() -> u64 {
+    NET_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Читаемый вид id сети для интерфейса. Десктопный id вида `gw:0102A8C0` —

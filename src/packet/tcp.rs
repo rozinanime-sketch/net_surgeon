@@ -320,7 +320,7 @@ mod tests {
             self.strategy.is_some()
         }
         fn select(&self, _: &str, _: usize) -> Selected {
-            Selected { strategy: self.strategy.unwrap(), source: Some(HelloClass::Small) }
+            Selected::new(self.strategy.unwrap(), Some(HelloClass::Small))
         }
         fn record(&self, _: &str, _: Selected, responded: bool) {
             self.records.borrow_mut().push(responded);

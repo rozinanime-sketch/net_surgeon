@@ -517,7 +517,16 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
 /// сервер вообще не говорит по QUIC. Различить эти два случая без полноценного
 /// QUIC-стека нельзя.
 async fn probe_quic(domain: &str) -> ProbeOutcome {
-    let target = format!("{}:443", domain);
+    // Тем же резолвером, что и пробы TCP (DoH с откатом на системный): иначе
+    // при блокировке по DNS TCP-пробы доходили до сервера, а QUIC — до
+    // заглушки, и отчёт противоречил сам себе.
+    let Some(target) = crate::dns::resolver::resolve_all(&format!("{domain}:443"))
+        .await
+        .into_iter()
+        .find(|a| a.is_ipv4())
+    else {
+        return ProbeOutcome::ConnectFailed;
+    };
 
     let sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
@@ -526,7 +535,7 @@ async fn probe_quic(domain: &str) -> ProbeOutcome {
         Err(_) => return ProbeOutcome::NotApplicable,
     };
 
-    if sock.connect(&target).await.is_err() {
+    if sock.connect(target).await.is_err() {
         return ProbeOutcome::ConnectFailed;
     }
 
@@ -697,7 +706,12 @@ async fn diagnose_with(
     let (direct, _direct_ms) = probe_tcp(&target, &fresh_hello(), FragStrategy::None, bypass_params).await;
 
     // Домен открывается напрямую — обход не нужен, остальное измерять незачем.
-    if direct == ProbeOutcome::Success {
+    // Не открылся даже TCP (хост лежит, блок по IP, нет сети) — техникам,
+    // которые меняют только ClientHello, тут не помочь, а лестница с подбором
+    // TTL занимала бы слот автодиагностики минуты: каждая проба ждёт
+    // таймаут подключения. Такой прогон и так отбрасывается
+    // (`record_nothing_worked`).
+    if direct == ProbeOutcome::Success || direct == ProbeOutcome::ConnectFailed {
         return DiagnosticResult {
             direct,
             quic: ProbeOutcome::NotApplicable,
@@ -715,11 +729,15 @@ async fn diagnose_with(
     // умеет применить: две TLS-записи и OOB меняют число байт в потоке, а
     // disorder и fake там работают без низкого TTL и прав на ремонт TCP.
     let packet_mode = crate::bypass::packet_mode::is_active();
+    // Сеть уличена в заморозке: дешёвые техники проходят рукопожатие и всё
+    // равно замерзают, так что на первой из них не останавливаемся — иначе
+    // приманки так и не были бы измерены, и предпочесть их было бы не из чего.
+    let stop_at_cheap = early_abandon && !crate::engine::freeze::prefer_decoy();
 
     // Ступень 1: две TLS-записи — единственная техника, которой не мешает
     // пересборка TCP-потока, поэтому пробуется первой.
     let tls_record = if packet_mode { empty } else { trials(&target, domain, FragStrategy::TlsRecord, bypass_params, trials_count, early_abandon, timing).await };
-    if early_abandon && tls_record.is_convincing() {
+    if stop_at_cheap && tls_record.is_convincing() {
         return DiagnosticResult {
             direct,
             quic: ProbeOutcome::NotApplicable,
@@ -735,7 +753,7 @@ async fn diagnose_with(
 
     // Ступень 2: разрыв точно по SNI.
     let sni_split = trials(&target, domain, FragStrategy::SniSplit, bypass_params, trials_count, early_abandon, timing).await;
-    if early_abandon && sni_split.is_convincing() {
+    if stop_at_cheap && sni_split.is_convincing() {
         return DiagnosticResult {
             direct,
             quic: ProbeOutcome::NotApplicable,
@@ -757,7 +775,7 @@ async fn diagnose_with(
     } else {
         empty
     };
-    if early_abandon && oob.is_convincing() {
+    if stop_at_cheap && oob.is_convincing() {
         return DiagnosticResult {
             direct,
             quic: ProbeOutcome::NotApplicable,
@@ -797,6 +815,8 @@ async fn diagnose_with(
     // Ступень 6: fake. Последней: как и disorder, платит ретрансмитом. Где
     // приманку отправить нечем, не пробуем: техника молча откатилась бы на
     // обычный сплит, и мы бы измерили не её.
+    // TTL, который свип ниже подтвердил для этого домена.
+    let mut swept_ttl = None;
     let fake = if packet_mode {
         // В пакетном режиме приманку ставит перехват (badseq), TTL ни при чём.
         trials(&target, domain, FragStrategy::Fake, bypass_params, trials_count, early_abandon, timing).await
@@ -813,6 +833,7 @@ async fn diagnose_with(
             let score = trials(&target, domain, FragStrategy::Fake, &probe_params, trials_count, early_abandon, timing).await;
             if score.is_convincing() {
                 crate::bypass::fake_ttl::note_working(ttl);
+                swept_ttl = Some(ttl);
                 chosen = score;
                 break;
             }
@@ -828,13 +849,15 @@ async fn diagnose_with(
     };
 
     // Ступень 7: fake + multidisorder. После fake: добавляет к приманке
-    // перестановку, нужен тот же режим. В сокетном режиме берём уже подобранный
-    // выше TTL приманки (fake_ttl::effective), чтобы не гонять свип повторно.
+    // перестановку, нужен тот же режим. В сокетном режиме берём TTL, который
+    // свип выше подтвердил для этого домена, а не общий минимум по сети
+    // (`fake_ttl::effective`): другой домен мог опустить его так, что приманка
+    // умирает раньше DPI. Свип ничего не нашёл — тогда общий.
     let fake_multidisorder = if packet_mode {
         trials(&target, domain, FragStrategy::FakeMultiDisorder, bypass_params, trials_count, early_abandon, timing).await
     } else if crate::bypass::socket::fake_supported() {
         let mut probe_params = bypass_params.clone();
-        probe_params.fake_ttl = crate::bypass::fake_ttl::effective(bypass_params.fake_ttl);
+        probe_params.fake_ttl = swept_ttl.unwrap_or_else(|| crate::bypass::fake_ttl::effective(bypass_params.fake_ttl));
         trials(&target, domain, FragStrategy::FakeMultiDisorder, &probe_params, trials_count, early_abandon, timing).await
     } else {
         empty

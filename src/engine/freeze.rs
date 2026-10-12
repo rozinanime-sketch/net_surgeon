@@ -130,6 +130,7 @@ async fn probe_inner(socks_port: u16, host: &str, strategy: Strategy) -> Verdict
     }
 
     let mut total = 0usize;
+    let mut response = ResponseEnd::default();
     let mut buf = [0u8; 8192];
     // Момент начала непрерывной тишины; сбрасывается на каждом пришедшем байте.
     let mut silent_since: Option<Instant> = None;
@@ -144,6 +145,13 @@ async fn probe_inner(socks_port: u16, host: &str, strategy: Strategy) -> Verdict
                 silent_since = None;
                 if total >= SURVIVE_BYTES {
                     return Verdict::Survived;
+                }
+                response.feed(&buf[..n]);
+                // Ответ пришёл целиком, а сервер держит соединение вопреки
+                // `Connection: close`: дальше будет тишина, но не заморозка.
+                // Ресурс мал для проверки.
+                if response.complete() {
+                    return Verdict::Inconclusive;
                 }
             }
             // Ошибка чтения — не улика.
@@ -161,29 +169,37 @@ async fn probe_inner(socks_port: u16, host: &str, strategy: Strategy) -> Verdict
     }
 }
 
+/// Итог эскалации.
+pub struct Escalation {
+    pub strategy: Option<Strategy>,
+    /// Приманку выбрала freeze-проба, а не диагностика: та её могла и не
+    /// мерить (лестница останавливается на первой дешёвой технике).
+    pub escalated: bool,
+}
+
 /// Проверяет выбранную технику на заморозку и при необходимости переключает на
-/// decoy. Возвращает итоговую стратегию для сохранения.
+/// decoy.
 ///
 /// Только сокетный путь: в пакетном режиме seqovl подбирается обычными пробами
 /// (см. diagnostics), там эскалация не нужна. Запускается лишь когда поднят
 /// собственный SOCKS5 (через него идёт проба) и выбрана НЕ decoy-техника.
+/// «Напрямую» тоже проверяется: заморозка бьёт по незабелённому TLS, а не по
+/// заблокированным именам, и прямое рукопожатие она пропускает.
 pub async fn escalate_on_freeze(
     domain: &str,
     chosen: Option<Strategy>,
-    result: &crate::engine::diagnostics::DiagnosticResult,
     log_tx: &crate::observability::logging::LogSender,
-) -> Option<Strategy> {
+) -> Escalation {
     use crate::observability::logging::{log_t, LogLevel};
 
+    let unchanged = Escalation { strategy: chosen, escalated: false };
     if crate::bypass::packet_mode::is_active() {
-        return chosen;
+        return unchanged;
     }
-    let Some(port) = socks_port() else { return chosen };
-    let fake_convincing = result.fake.is_convincing();
+    let Some(port) = socks_port() else { return unchanged };
 
     // Решение отделено от сетевого I/O (тестируется), пробы подставляются здесь.
-    let (final_strategy, froze) =
-        resolve(chosen, fake_convincing, |s| probe(port, domain, s)).await;
+    let (final_strategy, froze) = resolve(chosen, |s| probe(port, domain, s)).await;
 
     if froze {
         // Сеть морозит незабелённый TLS: дальше по умолчанию предпочитаем decoy.
@@ -193,17 +209,21 @@ pub async fn escalate_on_freeze(
             log_t(log_tx, LogLevel::Success, "log.freeze_escalated", vec![("domain", domain.to_string())]);
         }
     }
-    final_strategy
+    Escalation { strategy: final_strategy, escalated: final_strategy != chosen }
 }
+
+/// Приманки сокетного пути по возрастанию цены (seqovl без перехвата пакетов
+/// недоступен).
+const SOCKET_DECOYS: [Strategy; 2] = [Strategy::Fake, Strategy::FakeMultiDisorder];
 
 /// Чистое решение эскалации: по вердиктам проб (через `probe_fn`) выбирает
 /// итоговую технику и говорит, обнаружена ли заморозка. Без сети и глобалов —
 /// поэтому тестируется. `probe_fn(strategy) -> Verdict`.
-async fn resolve<F, Fut>(
-    chosen: Option<Strategy>,
-    fake_convincing: bool,
-    mut probe_fn: F,
-) -> (Option<Strategy>, bool)
+///
+/// Приманки проверяются самой freeze-пробой, а не по итогам диагностики: та
+/// останавливается на первой прошедшей дешёвой технике и fake обычно не мерит,
+/// и раньше эскалации из-за этого почти не случалось.
+async fn resolve<F, Fut>(chosen: Option<Strategy>, mut probe_fn: F) -> (Option<Strategy>, bool)
 where
     F: FnMut(Strategy) -> Fut,
     Fut: std::future::Future<Output = Verdict>,
@@ -215,11 +235,67 @@ where
     if probe_fn(current).await != Verdict::Frozen {
         return (chosen, false); // дешёвая техника переживает 16 КБ
     }
-    // Заморозка. На сокете decoy — это fake (seqovl без перехвата недоступен).
-    if fake_convincing && probe_fn(Strategy::Fake).await == Verdict::Survived {
-        return (Some(Strategy::Fake), true);
+    for decoy in SOCKET_DECOYS {
+        if probe_fn(decoy).await == Verdict::Survived {
+            return (Some(decoy), true);
+        }
     }
     (chosen, true) // decoy не помог или недоступен — оставляем измеренную технику
+}
+
+/// Где кончается HTTP-ответ. Проба просит `Connection: close`, но сервер
+/// вправе держать соединение, отдав ответ целиком (keep-alive за частью CDN),
+/// и тишина после полного ответа на 1–16 КБ выглядела заморозкой.
+#[derive(Default)]
+struct ResponseEnd {
+    /// Начало потока, пока не найден конец заголовков.
+    head: Vec<u8>,
+    /// Смещение тела от начала потока.
+    body_start: Option<usize>,
+    length: Option<usize>,
+    chunked: bool,
+    /// Последние байты потока: конец chunked-тела — `0\r\n\r\n`.
+    tail: Vec<u8>,
+    total: usize,
+}
+
+impl ResponseEnd {
+    /// Заголовки длиннее — не наш случай, искать конец незачем.
+    const HEAD_MAX: usize = 16 * 1024;
+    const CHUNKED_END: &'static [u8] = b"0\r\n\r\n";
+
+    fn feed(&mut self, data: &[u8]) {
+        self.total += data.len();
+        self.tail.extend_from_slice(data);
+        let excess = self.tail.len().saturating_sub(Self::CHUNKED_END.len());
+        self.tail.drain(..excess);
+
+        if self.body_start.is_some() || self.head.len() >= Self::HEAD_MAX {
+            return;
+        }
+        self.head.extend_from_slice(data);
+        let Some(end) = self.head.windows(4).position(|w| w == b"\r\n\r\n") else { return };
+        self.body_start = Some(end + 4);
+        for line in String::from_utf8_lossy(&self.head[..end]).lines().skip(1) {
+            let Some((name, value)) = line.split_once(':') else { continue };
+            let value = value.trim();
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                self.length = value.parse().ok();
+            } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                self.chunked = value.to_ascii_lowercase().contains("chunked");
+            }
+        }
+        self.head = Vec::new();
+    }
+
+    /// Ответ пришёл целиком.
+    fn complete(&self) -> bool {
+        let Some(start) = self.body_start else { return false };
+        if self.chunked {
+            return self.tail == Self::CHUNKED_END;
+        }
+        self.length.is_some_and(|len| self.total >= start + len)
+    }
 }
 
 /// Минимальный клиент SOCKS5: без аутентификации, CONNECT к `host:port` по имени.
@@ -292,34 +368,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_escalates_only_on_freeze_and_when_fake_survives() {
-        use Strategy::{Fake, TlsRecord};
+    async fn resolve_escalates_only_on_freeze_and_when_a_decoy_survives() {
+        use Strategy::{Fake, FakeMultiDisorder, TlsRecord};
+        use Verdict::{Frozen, Inconclusive, Survived};
         // Прогоняет resolve с заранее заданными вердиктами проб по порядку.
-        async fn go(chosen: Option<Strategy>, fake_conv: bool, verdicts: &[Verdict]) -> (Option<Strategy>, bool) {
+        async fn go(chosen: Option<Strategy>, verdicts: &[Verdict]) -> (Option<Strategy>, bool) {
             let idx = std::cell::Cell::new(0);
-            resolve(chosen, fake_conv, |_s| {
+            let result = resolve(chosen, |_s| {
                 let i = idx.get();
                 idx.set(i + 1);
                 let v = verdicts[i];
                 async move { v }
             })
-            .await
+            .await;
+            assert_eq!(idx.get(), verdicts.len(), "лишние или недостающие пробы");
+            result
         }
         // Нечего эскалировать: нет техники / уже decoy — пробы не запускаются.
-        assert_eq!(go(None, true, &[]).await, (None, false));
-        assert_eq!(go(Some(Fake), true, &[]).await, (Some(Fake), false));
+        assert_eq!(go(None, &[]).await, (None, false));
+        assert_eq!(go(Some(Fake), &[]).await, (Some(Fake), false));
         // Дешёвая техника переживает 16 КБ — оставляем, заморозки нет.
-        assert_eq!(go(Some(TlsRecord), true, &[Verdict::Survived]).await, (Some(TlsRecord), false));
-        // Заморозка + fake проходит → переключаемся на fake, флаг ставится.
-        assert_eq!(go(Some(TlsRecord), true, &[Verdict::Frozen, Verdict::Survived]).await, (Some(Fake), true));
-        // Заморозка, но fake не измерен → остаёмся, но заморозку зафиксировали.
-        assert_eq!(go(Some(TlsRecord), false, &[Verdict::Frozen]).await, (Some(TlsRecord), true));
-        // Заморозка, fake измерен, но тоже морозит → остаёмся, флаг стоит.
-        assert_eq!(go(Some(TlsRecord), true, &[Verdict::Frozen, Verdict::Frozen]).await, (Some(TlsRecord), true));
+        assert_eq!(go(Some(TlsRecord), &[Survived]).await, (Some(TlsRecord), false));
+        // Заморозка + fake проходит → fake, флаг ставится.
+        assert_eq!(go(Some(TlsRecord), &[Frozen, Survived]).await, (Some(Fake), true));
+        // fake не проверился, fake+multidisorder прошёл → он.
+        assert_eq!(go(Some(TlsRecord), &[Frozen, Inconclusive, Survived]).await, (Some(FakeMultiDisorder), true));
+        // Обе приманки морозят → остаёмся, но заморозку зафиксировали.
+        assert_eq!(go(Some(TlsRecord), &[Frozen, Frozen, Frozen]).await, (Some(TlsRecord), true));
     }
 
     #[test]
-    fn only_fake_and_seqovl_are_decoy() {
+    fn response_end_by_length_and_chunked() {
+        let mut fixed = ResponseEnd::default();
+        fixed.feed(b"HTTP/1.1 301 Moved\r\nContent-Length: 5\r\n\r\nab");
+        assert!(!fixed.complete());
+        fixed.feed(b"cde");
+        assert!(fixed.complete());
+
+        let mut chunked = ResponseEnd::default();
+        chunked.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r");
+        assert!(!chunked.complete());
+        chunked.feed(b"\n\r\n");
+        assert!(chunked.complete());
+
+        // Без длины конец не известен — тишина остаётся уликой.
+        let mut open = ResponseEnd::default();
+        open.feed(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>");
+        assert!(!open.complete());
+    }
+
+    #[test]
+    fn only_name_substituting_techniques_are_decoy() {
         assert!(is_decoy(Strategy::Fake));
         assert!(is_decoy(Strategy::Seqovl));
         assert!(!is_decoy(Strategy::TlsRecord));

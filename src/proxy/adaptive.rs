@@ -53,10 +53,18 @@ pub struct Selected {
     /// засчитывается. Иначе провалы программы обновления, временно
     /// взявшей стратегию браузера, сбросили бы рабочую запись браузера.
     pub source: Option<HelloClass>,
+    /// Сеть на момент выбора (`net_state::net_generation`). Сменилась, пока
+    /// соединение жило, — исход относится к прежней сети, и записи новой его
+    /// не засчитывают.
+    pub net: u64,
 }
 
 impl Selected {
-    pub const DIRECT: Selected = Selected { strategy: Strategy::None, source: None };
+    pub const DIRECT: Selected = Selected { strategy: Strategy::None, source: None, net: 0 };
+
+    pub fn new(strategy: Strategy, source: Option<HelloClass>) -> Selected {
+        Selected { strategy, source, net: crate::engine::net_state::net_generation() }
+    }
 }
 
 /// Что нужно для выбора — одно и то же во всех трёх путях.
@@ -107,7 +115,7 @@ fn select_with(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) 
         log_nested_t(ctx.log_tx, LogLevel::Info, key, "strategy", cached.label_key(), vec![
             ("domain", domain.to_string()),
         ]);
-        return Selected { strategy: cached, source: Some(class) };
+        return Selected::new(cached, Some(class));
     }
 
     // Для этого размера измерения нет — ставим его в очередь.
@@ -133,14 +141,14 @@ fn select_with(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) 
             ("domain", domain.to_string()),
             ("bytes", hello_len.to_string()),
         ]);
-        return Selected { strategy: other, source: None };
+        return Selected::new(other, None);
     }
 
     // Под перехватом пакетов до конца диагностики берём seqovl: он подставляет
     // разрешённое имя и снимает заморозку после ~16 КБ там, где спрятать имя
     // мало, — самый надёжный первый выбор именно на пакетном пути.
     let fallback = if packet { Strategy::Seqovl } else { unmeasured_default(class) };
-    Selected { strategy: fallback, source: None }
+    Selected::new(fallback, None)
 }
 
 /// Техника для домена, по которому нет подходящего измерения.
@@ -164,7 +172,10 @@ pub fn record_outcome(ctx: &Context<'_>, domain: &str, selected: Selected, respo
     // вердикт «прямое соединение работает», и он может оказаться ошибочным.
     // Отказ («ничего не помогло») хранилище само не засчитывает.
     let Some(class) = selected.source else { return };
-    if !ctx.strategies.record_outcome(domain, class, responded, ctx.ttl_hours) {
+    if selected.net != crate::engine::net_state::net_generation() {
+        return;
+    }
+    if !ctx.strategies.record_outcome(domain, class, selected.strategy, responded, ctx.ttl_hours) {
         return;
     }
 
@@ -217,11 +228,17 @@ fn spawn_diagnosis(ctx: &Context<'_>, domain: &str, class: HelloClass, hello_len
         // рукопожатие, но замёрзнуть после 16 КБ. freeze-проба это ловит и
         // переключает на fake (сокетный путь; в пакетном seqovl уже подобран).
         let chosen = strategy::choose_from_diagnostics(&result);
-        let chosen = crate::engine::freeze::escalate_on_freeze(&domain, chosen, &result, &log_tx).await;
+        let escalation = crate::engine::freeze::escalate_on_freeze(&domain, chosen, &log_tx).await;
 
-        match chosen {
+        match escalation.strategy {
             Some(chosen) => {
-                store.set(&domain, class, chosen, strategy::confidence_of(&result, chosen));
+                // Приманку, выбранную freeze-пробой, диагностика могла не
+                // мерить: тогда уверенность — по одной прошедшей пробе.
+                let mut confidence = strategy::confidence_of(&result, chosen);
+                if escalation.escalated {
+                    confidence = confidence.max(crate::observability::stats::wilson_lower_bound(1, 1));
+                }
+                store.set(&domain, class, chosen, confidence);
                 log_nested_t(&log_tx, LogLevel::Success, "log.auto_diag_chosen", "strategy", chosen.label_key(), vec![
                     ("domain", domain.clone()),
                     ("bytes", hello_len.to_string()),
