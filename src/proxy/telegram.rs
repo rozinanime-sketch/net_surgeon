@@ -138,6 +138,10 @@ impl Streak {
 /// подряд (сеть без заморозки).
 static FAKE: std::sync::Mutex<Streak> = std::sync::Mutex::new(Streak::FRESH);
 const FAKE_FAILURES_LIMIT: u32 = 3;
+/// Неудачи приманки ближе этого друг к другу — один раунд: Telegram
+/// открывает соединения пачкой, и короткий сбой сети давал бы «три
+/// неудачи подряд» разом. Покрывает попытку с приманкой целиком.
+const FAKE_FAILURE_ROUND: Duration = FAKE_ATTEMPT_TIMEOUT;
 const FAKE_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// TTL приманки до воркера (см. `ws::fake_handshake`).
 const RELAY_FAKE_TTL: u32 = 12;
@@ -273,19 +277,21 @@ pub(crate) fn masked_if_relay(host: &str) -> String {
     }
 }
 
-/// Первая строка, не пустая и не комментарий. Схема и путь, если их
-/// вписали по привычке, отрезаются: нужен только хост.
+/// Первая строка, не пустая и не комментарий. Схема, порт и путь, если их
+/// вписали по привычке, отрезаются: нужен только хост — порты ретранслятор
+/// выбирает сам (443 и 8443).
 fn parse(text: &str) -> Option<String> {
     let line = text
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with('#'))?;
-    let host = line
-        .trim_start_matches("https://")
-        .trim_start_matches("wss://")
-        .split('/')
-        .next()?
-        .trim();
+    let without_scheme = line.split_once("://").map_or(line, |(_, rest)| rest);
+    let authority = without_scheme.split('/').next()?;
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    }
+    .trim();
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
@@ -497,7 +503,7 @@ mod ws {
     /// Неудача приманки. Минута без неё — только после нескольких подряд.
     fn note_fake_failed() {
         if let Ok(mut fake) = FAKE.lock() {
-            fake.fail(FAKE_FAILURES_LIMIT, Duration::ZERO);
+            fake.fail(FAKE_FAILURES_LIMIT, FAKE_FAILURE_ROUND);
         }
     }
 
@@ -562,7 +568,7 @@ mod ws {
                     // Приманка с подписью не ушла: дальше без подписи, а
                     // «ядро без md5sig» — только после нескольких отказов подряд.
                     Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                        if MD5SIG_REFUSALS.lock().is_ok_and(|mut r| r.fail(MD5SIG_REFUSALS_LIMIT, Duration::ZERO)) {
+                        if MD5SIG_REFUSALS.lock().is_ok_and(|mut r| r.fail(MD5SIG_REFUSALS_LIMIT, FAKE_FAILURE_ROUND)) {
                             NO_MD5SIG.store(true, Ordering::Relaxed);
                         }
                         unsigned_needed = true;
@@ -866,6 +872,9 @@ mod tests {
     fn parses_relay_host() {
         assert_eq!(parse("# мой воркер\n\nabc.x.workers.dev\n").as_deref(), Some("abc.x.workers.dev"));
         assert_eq!(parse("https://ABC.x.workers.dev/apiws\n").as_deref(), Some("abc.x.workers.dev"));
+        assert_eq!(parse("HTTPS://abc.x.workers.dev").as_deref(), Some("abc.x.workers.dev"));
+        assert_eq!(parse("http://abc.x.workers.dev:8443/").as_deref(), Some("abc.x.workers.dev"));
+        assert_eq!(parse("abc.x.workers.dev:443").as_deref(), Some("abc.x.workers.dev"));
         assert_eq!(parse("# пусто\n"), None);
         assert_eq!(parse(""), None);
     }

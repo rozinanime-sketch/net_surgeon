@@ -46,6 +46,26 @@ pub async fn handle_connect(
         let _ = cs.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
         return;
     }
+    // Адрес Telegram — через ретранслятор, как в SOCKS5 и прозрачном режиме:
+    // на Windows системный прокси — этот порт, и Telegram Desktop по
+    // умолчанию приходит сюда.
+    if let Ok(addr) = target.parse::<std::net::SocketAddr>()
+        && crate::proxy::telegram::is_telegram(addr.ip(), addr.port())
+        && let Some(relay) = crate::proxy::telegram::relay()
+    {
+        let mut client_stream = client_stream;
+        if client_stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
+            return;
+        }
+        if let Err(e) = crate::proxy::telegram::relay_connection(&mut client_stream, &relay, addr.ip(), addr.port(), &initial_payload, &log_tx, &metrics).await {
+            log_t(&log_tx, LogLevel::Warning, "log.telegram_relay_error", vec![
+                ("addr", addr.to_string()),
+                ("error", e.to_string()),
+            ]);
+        }
+        return;
+    }
+
     let mut needs = needs_bypass(is_enabled, &domain, &bypass_domains);
 
     // Отсчёт с момента начала подключения: TTFB считается от него, потому что

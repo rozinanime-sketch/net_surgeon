@@ -70,6 +70,22 @@ fn ipv6_companion(listen_host: &str) -> Option<&'static str> {
     }
 }
 
+/// Слушатель только на IPv6. Обычный `bind` оставляет IPV6_V6ONLY=0, и в
+/// Linux `[::]` после `0.0.0.0` на том же порту получал EADDRINUSE: такой
+/// сокет претендует и на IPv4.
+fn bind_v6_only(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(true)?;
+    // Как у tokio: иначе после перезапуска порт занят, пока висят TIME_WAIT.
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
+}
+
 /// Строка «слушает» в логе: подсказка, чем включается перехват, у систем
 /// своя.
 #[cfg(not(windows))]
@@ -139,7 +155,7 @@ pub async fn run_transparent_proxy(
     let listener_v6 = match ipv6_companion(listen_host) {
         Some(host) => {
             let addr_v6 = format!("[{}]:{}", host, port);
-            match TcpListener::bind(&addr_v6).await {
+            match bind_v6_only(std::net::SocketAddr::new(host.parse().expect("адрес IPv6"), port)) {
                 Ok(l) => {
                     log_t(&log_tx, LogLevel::Success, LISTENING_KEY, vec![("addr", addr_v6)]);
                     Some(l)
@@ -699,5 +715,23 @@ mod dead_addr_tests {
 
         assert_eq!(result.map(|(_, addr)| addr).ok(), Some(target));
         assert!(!is_dead(target.ip()), "ожившего адреса отметка должна сниматься");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ipv6_listener_coexists_with_ipv4_any() {
+        let v4 = TcpListener::bind("0.0.0.0:0").await.expect("IPv4");
+        let port = v4.local_addr().expect("порт").port();
+        let v6 = std::net::SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port);
+        match bind_v6_only(v6) {
+            Ok(_) => {}
+            // Машина без IPv6 — проверять нечего.
+            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {}
+            Err(e) => panic!("[::]:{port} после 0.0.0.0:{port}: {e}"),
+        }
     }
 }

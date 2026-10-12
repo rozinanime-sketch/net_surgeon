@@ -55,6 +55,9 @@ toml_edit = "0.25.17"
 rust-i18n = "4.2.4"
 libc = "0.2.190"
 reqwest = "0.13.5"
+# Сокеты с параметрами, которых нет в tokio: IPV6_V6ONLY у слушателя
+# прозрачного режима, TTL и OOB на Windows. Уже приходит с tokio.
+socket2 = "0.6"
 # Ретранслятор Telegram (src/proxy/telegram.rs): TLS до воркера Cloudflare.
 # rustls и tokio-rustls уже приходят с reqwest, так что сборка не растёт;
 # корни встроенные — на Android до системного хранилища из Rust не добраться.
@@ -77,9 +80,8 @@ ksni = { version = "0.2", optional = true }
 nfq = "0.2.5"
 
 # Техники обхода на Windows (src/bypass/socket.rs): TTL и OOB через Winsock.
-# Обе библиотеки уже приходят с tokio, так что сборка от них не растёт.
+# Уже приходит с tokio, так что сборка от неё не растёт.
 [target.'cfg(windows)'.dependencies]
-socket2 = "0.6"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",
