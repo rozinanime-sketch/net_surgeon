@@ -24,8 +24,9 @@
 //!   обработчиком консольных событий: система даёт на него несколько секунд.
 //!
 //! Не ловится только принудительное завершение (диспетчер задач). На этот
-//! случай следующий запуск узнаёт свой адрес в настройках и считает, что
-//! до него прокси был выключен.
+//! случай адрес, который прописала программа, записан в файл [`MARKER`]:
+//! следующий запуск узнаёт его в настройках — даже если порт с тех пор
+//! сменили — и считает, что до него прокси был выключен.
 
 use std::io;
 use std::sync::Mutex;
@@ -47,16 +48,25 @@ use windows_sys::Win32::System::Registry::{
 /// администратора запись сюда не требует.
 const SETTINGS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
+/// Файл в каталоге данных с адресом, который программа прописала системным
+/// прокси. Есть — значит, прокси сейчас наш. Раньше след убитого запуска
+/// узнавался только по совпадению с текущим портом: после смены порта
+/// мёртвый адрес запоминался как «настройки пользователя» и возвращался
+/// при выходе.
+const MARKER: &str = ".system_proxy";
+
 /// Настройки до запуска. `None` — значения не было, и при возврате его
 /// нужно удалить, а не записать пустым.
+#[derive(Clone)]
 struct Saved {
     enable: Option<u32>,
     server: Option<String>,
     bypass: Option<String>,
 }
 
-/// Заполняется при первом включении и забирается при возврате, поэтому
-/// повторный `restore` ничего не делает.
+/// Заполняется при первом включении и очищается после удачного возврата,
+/// поэтому повторный `restore` ничего не делает, а неудачный можно
+/// повторить.
 static SAVED: Mutex<Option<Saved>> = Mutex::new(None);
 
 fn wide(s: &str) -> Vec<u16> {
@@ -233,25 +243,44 @@ pub fn enable(port: u16) -> io::Result<String> {
         };
         // Наш же адрес — след прошлого запуска, который убили, не дав
         // убрать за собой. Вернуть его значило бы оставить прокси навсегда.
-        let stale = current.enable == Some(1) && current.server.as_deref() == Some(ours.as_str());
+        let left_by_us = crate::config::paths::read_to_string(MARKER).ok();
+        let stale = current.enable == Some(1)
+            && current.server.as_deref().is_some_and(|s| s == ours || Some(s.trim()) == left_by_us.as_deref().map(str::trim));
         *saved = Some(if stale { Saved { enable: Some(0), server: None, bypass: None } } else { current });
 
         unsafe { SetConsoleCtrlHandler(Some(on_console_event), 1) };
     }
+    let bypass = with_local(saved.as_ref().and_then(|s| s.bypass.as_deref()));
+    drop(saved);
 
     key.set_dword("ProxyEnable", 1)?;
     key.set_string("ProxyServer", &ours)?;
-    // Локальные адреса мимо прокси: роутер, принтер, сама программа.
-    key.set_string("ProxyOverride", "<local>")?;
+    key.set_string("ProxyOverride", &bypass)?;
+    let _ = crate::config::paths::write_atomic(MARKER, &ours);
     notify();
 
     Ok(ours)
 }
 
+/// Исключения прокси: прежние пользователя плюс `<local>` (роутер, принтер,
+/// сама программа). Раньше они затирались одним `<local>`, и на рабочей
+/// машине адреса интранета шли через прокси.
+fn with_local(previous: Option<&str>) -> String {
+    match previous.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) if p.split(';').any(|e| e.trim().eq_ignore_ascii_case("<local>")) => p.to_string(),
+        Some(p) => format!("{p};<local>"),
+        None => "<local>".to_string(),
+    }
+}
+
 /// Возвращает настройки, какими они были до [`enable`]. `Ok(false)` —
 /// возвращать нечего: прокси не включался или уже возвращён.
 pub fn restore() -> io::Result<bool> {
-    let Some(saved) = SAVED.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+    // Забираем только после удачной записи: не открылся ключ или не
+    // записалось значение (выход из системы) — прежние настройки остаются,
+    // и следующий вызов (Drop, обработчик консоли) попробует снова.
+    let mut slot = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(saved) = slot.clone() else {
         return Ok(false);
     };
     let key = Key::open(KEY_WRITE)?;
@@ -268,10 +297,14 @@ pub fn restore() -> io::Result<bool> {
         Some(v) => key.set_string("ProxyOverride", v)?,
         None => key.delete("ProxyOverride")?,
     }
+    *slot = None;
+    drop(slot);
+    let _ = std::fs::remove_file(crate::config::paths::resolve(MARKER));
     notify();
 
     Ok(true)
 }
+
 
 /// Возвращает настройки при выходе из области видимости, в том числе при
 /// панике, которая иначе прошла бы мимо `restore` в конце `main`.
@@ -288,5 +321,18 @@ impl Drop for RestoreOnDrop {
                 rust_i18n::t!("startup.system_proxy_restore_failed", error = e)
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_local;
+
+    #[test]
+    fn user_bypass_list_is_kept() {
+        assert_eq!(with_local(None), "<local>");
+        assert_eq!(with_local(Some("")), "<local>");
+        assert_eq!(with_local(Some("*.corp.local;10.*")), "*.corp.local;10.*;<local>");
+        assert_eq!(with_local(Some("10.*;<LOCAL>")), "10.*;<LOCAL>");
     }
 }

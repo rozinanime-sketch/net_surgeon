@@ -55,7 +55,7 @@ pub mod dns;
 pub mod engine;
 /// Правила прозрачного режима из самой программы (nftables, флаг owner).
 /// На Android перехват делает VpnService, там модуль не нужен.
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(target_os = "linux")]
 pub mod firewall;
 pub mod headless;
 /// Системный прокси Windows: работает и без прав администратора, которые
@@ -201,13 +201,16 @@ fn windows_ui_language() -> Option<String> {
 }
 
 fn language_from(explicit: Option<&str>, system: Option<&str>) -> &'static str {
-    match explicit {
-        Some("ru") => return "ru",
-        Some("en") => return "en",
-        _ => {}
+    // Явное значение — в том же виде, что и системное: `ru_RU.UTF-8`, `RU`.
+    let lang = |v: &str| {
+        let v = v.trim().to_ascii_lowercase();
+        if v.starts_with("ru") { Some("ru") } else if v.starts_with("en") { Some("en") } else { None }
+    };
+    if let Some(l) = explicit.and_then(lang) {
+        return l;
     }
-    match system {
-        Some(v) if v.to_ascii_lowercase().starts_with("ru") => "ru",
+    match system.and_then(lang) {
+        Some("ru") => "ru",
         _ => "en",
     }
 }
@@ -223,6 +226,9 @@ mod language_tests {
         assert_eq!(language_from(None, Some("ru_RU.UTF-8")), "ru");
         assert_eq!(language_from(None, Some("de_DE.UTF-8")), "en");
         assert_eq!(language_from(Some("fr"), Some("ru_RU.UTF-8")), "ru");
+        assert_eq!(language_from(Some("ru_RU.UTF-8"), Some("en_US.UTF-8")), "ru");
+        assert_eq!(language_from(Some("RU"), Some("en_US.UTF-8")), "ru");
+        assert_eq!(language_from(Some("en_GB"), Some("ru_RU.UTF-8")), "en");
         // Без языка системы (LANG=C, пусто) — английский
         assert_eq!(language_from(None, Some("C")), "en");
         assert_eq!(language_from(None, None), "en");

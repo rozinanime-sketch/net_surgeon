@@ -326,6 +326,7 @@ err.no_origdst: "в датаграмме нет IP_ORIGDSTADDR — провер�
 startup.config_read: "Не удалось прочитать %{path}: %{error}"
 startup.config_parse: "Не удалось разобрать config.toml: %{error}"
 startup.transparent_failed: "Прозрачный режим: %{error}"
+startup.firewall_skipped_diagnostics: "режим «только диагностика»: перехват не ставится — слушателей нет, и весь трафик ушёл бы в пустоту"
 startup.tui_error: "Ошибка интерфейса: %{error}"
 startup.tui_hint: "Без терминала запускайте с --headless."
 startup.sigterm: "Получена команда остановки, завершаюсь…"

@@ -25,12 +25,20 @@ use tokio_util::sync::CancellationToken;
 use crate::observability::logging::{self as log, LogLevel, LogPayload};
 use crate::Startup;
 
-/// Язык сообщений в headless-режиме.
-///
-/// Берётся из `NET_SURGEON_LANG`, по умолчанию русский — как и в TUI.
-/// Переключать на лету некому, поэтому значение читается один раз.
-fn language() -> String {
-    crate::default_language().to_string()
+/// Строка в stdout. Не `println!`: тот паникует, если читатель ушёл
+/// (`--headless | head`, упал journald), и выход проходил мимо сохранения
+/// strategies.txt. Без читателя строке просто некуда деться.
+fn out(line: std::fmt::Arguments) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout().lock(), "{line}");
+}
+
+fn report_save_error(lang: &str, e: std::io::Error) {
+    eprintln!(
+        "[{}] {}",
+        crate::observability::glyph::ERROR,
+        crate::observability::i18n::translate(lang, "startup.strategies_save_failed", &[("error".into(), e.to_string())])
+    );
 }
 
 fn level_marker(level: LogLevel) -> String {
@@ -57,7 +65,8 @@ fn render(lang: &str, payload: &LogPayload) -> String {
 
 /// Поднимает слушатели и печатает логи, пока не придёт Ctrl-C.
 pub async fn run(diagnostics_only: bool, startup: Startup) {
-    let lang = language();
+    // Переключать язык на лету некому — читается один раз.
+    let lang = crate::default_language().to_string();
     let (log_tx, mut log_rx) = log::channel();
 
     // Резолвер поднят раньше — канал логов подключается отдельно, иначе
@@ -95,10 +104,10 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
         // трафик нечем. Прогон здесь не запускается — им управляет TUI,
         // а без него единственное осмысленное поведение это сказать,
         // что делать нечего, и выйти.
-        println!(
+        out(format_args!(
             "[!] {}",
             render(&lang, &LogPayload::Translated { key: "log.diagnostics_only_mode".into(), args: vec![] })
-        );
+        ));
         return;
     }
 
@@ -120,6 +129,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
     let flush = {
         let strategies = Arc::clone(&startup.strategies);
         let token = token.clone();
+        let lang = lang.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -128,7 +138,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
                         if strategies.is_dirty()
                             && let Err(e) = strategies.save()
                         {
-                            eprintln!("[{}] {}", crate::observability::glyph::ERROR, crate::observability::i18n::translate(crate::default_language(), "startup.strategies_save_failed", &[("error".into(), e.to_string())]));
+                            report_save_error(&lang, e);
                         }
                     }
                 }
@@ -140,17 +150,22 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
     // ловился только Ctrl-C, и такое завершение убивало процесс без
     // сохранения strategies.txt.
     let mut terminate = terminate_signal();
+    // Одна подписка на Ctrl-C на весь цикл: новая на каждом витке видела
+    // только сигналы после своего создания, и Ctrl-C, пришедший, пока
+    // печаталась строка лога, терялся.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
 
     loop {
         tokio::select! {
             _ = wait_terminate(&mut terminate) => {
-                println!("[i] {}", crate::observability::i18n::translate(&lang, "startup.sigterm", &[]));
+                out(format_args!("[i] {}", crate::observability::i18n::translate(&lang, "startup.sigterm", &[])));
                 token.cancel();
                 break;
             }
-            _ = tokio::signal::ctrl_c() => {
-                println!();
-                println!("[i] {}", crate::observability::i18n::translate(&lang, "startup.exiting", &[]));
+            _ = &mut ctrl_c => {
+                out(format_args!(""));
+                out(format_args!("[i] {}", crate::observability::i18n::translate(&lang, "startup.exiting", &[])));
                 token.cancel();
                 break;
             }
@@ -166,7 +181,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
                 }
 
                 let time = chrono::Local::now().format("%H:%M:%S");
-                println!("{} {} {}", level_marker(msg.level), time, render(&lang, &msg.payload));
+                out(format_args!("{} {} {}", level_marker(msg.level), time, render(&lang, &msg.payload)));
             }
         }
     }
@@ -176,7 +191,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
     if startup.strategies.is_dirty()
         && let Err(e) = startup.strategies.save()
     {
-        eprintln!("[{}] {}", crate::observability::glyph::ERROR, crate::observability::i18n::translate(&lang, "startup.strategies_save_failed", &[("error".into(), e.to_string())]));
+        report_save_error(&lang, e);
     }
 }
 

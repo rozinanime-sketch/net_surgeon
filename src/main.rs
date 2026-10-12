@@ -60,8 +60,15 @@ async fn main() {
 
     // `--firewall` передаёт run.sh: перехват ставит сама программа, и ядро
     // снимет его при любом её завершении (см. src/firewall.rs).
+    // Только если слушатели будут: в режиме «только диагностика» их нет, и
+    // перехват завернул бы весь TCP машины на порт, где никто не слушает.
+    let mode = parse_mode();
     #[cfg(target_os = "linux")]
-    if std::env::args().any(|a| a == "--firewall") {
+    let diagnostics_only = matches!(mode, Mode::DiagnoseOnly) || startup.config.diagnostics_only;
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|a| a == "--firewall") && diagnostics_only {
+        eprintln!("[i] {}", tr("startup.firewall_skipped_diagnostics", &[]));
+    } else if std::env::args().any(|a| a == "--firewall") {
         let cfg = &startup.config;
         // Прямо в главном потоке, а не в spawn_blocking: `nft`, держащий
         // таблицу, умирает вместе с потоком, который его запустил, а поток
@@ -88,7 +95,7 @@ async fn main() {
     #[cfg(windows)]
     let _system_proxy = net_surgeon::system_proxy::RestoreOnDrop;
 
-    match parse_mode() {
+    match mode {
         Mode::Headless => headless::run(false, startup).await,
         Mode::DiagnoseOnly => run_diagnose_only(startup).await,
         Mode::Tui => run_tui(startup),
