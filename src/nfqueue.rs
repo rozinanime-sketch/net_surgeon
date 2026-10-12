@@ -38,8 +38,8 @@ use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 /// Метка на переотправленных пакетах. Правило очереди пропускает их мимо —
@@ -56,6 +56,38 @@ pub const QUEUE_NUM: u16 = 0;
 /// Один рантайм на процесс: очередь нельзя занять дважды. Перезапуск прокси
 /// из интерфейса не поднимает второй цикл, а переиспользует работающий.
 static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Настройки, по которым работает цикл, с номером установки. Цикл живёт до
+/// конца процесса (у NFQUEUE нет чистой отмены), поэтому перезапуск прокси
+/// подменяет настройки, а остановка снимает: без них пакеты идут как есть.
+/// Раньше цикл до выхода из программы обходил по настройкам первого старта.
+static ENV: RwLock<Option<(u64, Arc<LinuxEnv>)>> = RwLock::new(None);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Ставит настройки цикла; номер — для [`uninstall`].
+pub fn install(env: LinuxEnv) -> u64 {
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(mut slot) = ENV.write() {
+        *slot = Some((generation, Arc::new(env)));
+    }
+    if RUNNING.load(Ordering::SeqCst) {
+        crate::bypass::packet_mode::set_active(true);
+    }
+    generation
+}
+
+/// Снимает настройки, если их не успел подменить следующий старт.
+pub fn uninstall(generation: u64) {
+    let Ok(mut slot) = ENV.write() else { return };
+    if slot.as_ref().is_some_and(|(g, _)| *g == generation) {
+        *slot = None;
+        crate::bypass::packet_mode::set_active(false);
+    }
+}
+
+fn current_env() -> Option<Arc<LinuxEnv>> {
+    ENV.read().ok()?.as_ref().map(|(_, env)| Arc::clone(env))
+}
 
 /// Стенд seqovl: перехватывает исходящие ClientHello в очереди `queue_num`,
 /// кладёт перед ними полный поддельный ClientHello Google на номерах до начала
@@ -419,7 +451,9 @@ pub fn process<E: Env, I: Injector>(
 }
 
 /// Продуктовый цикл: гоняет полный `Engine` с автоподбором на очереди
-/// `queue_num`. Блокирующий; возвращается только при ошибке очереди.
+/// `queue_num` по настройкам из [`install`]. Блокирующий; возвращается только
+/// при ошибке очереди или сразу, если цикл уже работает. `on_bound` —
+/// очередь занята, цикл пошёл (или уже шёл).
 ///
 /// Правило заворачивает только исходящие 443 (кроме пакетов с меткой [`MARK`]):
 /// этого хватает, чтобы применить технику. Входящие движок обрабатывать умеет
@@ -428,28 +462,48 @@ pub fn process<E: Env, I: Injector>(
 /// стратегий идёт по сокетным пробам, а не отсюда. Выбор стратегии запускает
 /// диагностику на tokio, поэтому цикл должен работать внутри рантайма
 /// (`Handle::enter` у вызывающего).
-pub fn run(queue_num: u16, env: LinuxEnv) -> io::Result<()> {
+pub fn run(queue_num: u16, on_bound: impl FnOnce()) -> io::Result<()> {
     use nfq::{Queue, Verdict};
 
-    // Инициализация ДО захвата флага: если raw-сокет или очередь не поднялись,
-    // флаг не должен остаться взведённым — иначе повторный старт (перезапуск
-    // прокси) молча ничего не сделает, и пакетный режим уже не включить.
-    let inj = RawInjector::new()?;
-    let mut queue = Queue::open()?;
-    queue.bind(queue_num)?;
+    // Работающий цикл уже держит очередь: второй bind упал бы, а новые
+    // настройки он подхватит сам.
     if RUNNING.swap(true, Ordering::SeqCst) {
-        return Ok(()); // уже работает — повторный старт не нужен
+        on_bound();
+        return Ok(());
     }
+    // Не поднялись raw-сокет или очередь — флаг снимается, иначе повторный
+    // старт (перезапуск прокси) молча ничего не сделал бы.
+    let opened = (|| -> io::Result<_> {
+        let inj = RawInjector::new()?;
+        let mut queue = Queue::open()?;
+        queue.bind(queue_num)?;
+        Ok((inj, queue))
+    })();
+    let (inj, mut queue) = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            RUNNING.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
     let mut engine = Engine::new();
     // Соединения прокси и пробы диагностики должны помечаться с первого же
     // ClientHello — как и на Windows перед стартом потоков перехвата.
-    crate::bypass::packet_mode::set_active(true);
+    if current_env().is_some() {
+        crate::bypass::packet_mode::set_active(true);
+    }
+    on_bound();
 
     let result = (|| -> io::Result<()> {
         loop {
             let mut msg = queue.recv()?;
             let now = Instant::now();
-            let verdict = match process(msg.get_payload(), &mut engine, &env, &inj, now) {
+            // Прокси остановлен — пакеты идут как есть.
+            let processed = match current_env() {
+                Some(env) => process(msg.get_payload(), &mut engine, &*env, &inj, now),
+                None => Ok(Disposition::Accept),
+            };
+            let verdict = match processed {
                 Ok(Disposition::Drop) => Verdict::Drop,
                 Ok(Disposition::Accept) => Verdict::Accept,
                 Err(e) => {

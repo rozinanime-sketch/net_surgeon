@@ -1670,6 +1670,22 @@ pub mod apply {
         Split { first: usize, second: usize },
     }
 
+    impl Applied {
+        /// Что применено, для строки лога; `None` — обхода не было.
+        pub fn detail(&self) -> Option<String> {
+            Some(match self {
+                Applied::None => return None,
+                Applied::TlsRecord { bytes } => format!("tls_record {bytes}"),
+                Applied::SniSplit { first, second } => format!("sni_split {first}+{second}"),
+                Applied::Split { first, second } => format!("split {first}+{second}"),
+                Applied::Disorder { first, second } => format!("disorder {first}+{second}"),
+                Applied::Oob { first, second } => format!("oob {first}+{second}"),
+                Applied::Fake { decoy, real } => format!("fake {decoy}+{real}"),
+                Applied::FakeMultiDisorder { decoy, first, second } => format!("fake+multidisorder {decoy}/{first}+{second}"),
+            })
+        }
+    }
+
     /// Отправляет первый пакет по выбранной стратегии.
     /// `Ok(None)` — запись не удалась, соединение надо закрывать.
     pub async fn first_packet<W>(

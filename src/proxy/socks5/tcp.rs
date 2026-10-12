@@ -12,7 +12,7 @@ use crate::dns::ip_cache::IpDomainCache;
 use crate::observability::logging::{LogSender, log_nested_t, log_t, LogLevel};
 use crate::config::BypassParams;
 use crate::observability::metrics::Metrics;
-use crate::engine::strategy::{apply::Applied, StrategyStore};
+use crate::engine::strategy::StrategyStore;
 use crate::protocol::socks5::parse_socks5_target;
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -423,16 +423,7 @@ async fn handle_connect(
 
             match crate::engine::strategy::apply::first_packet(&mut sw, server_fd, &initial, selected.strategy, bypass_params).await {
                 Ok(applied) => {
-                    let detail = match applied {
-                        Applied::TlsRecord { bytes } => format!("tls_record {}", bytes),
-                        Applied::SniSplit { first, second } => format!("sni_split {}+{}", first, second),
-                        Applied::Split { first, second } => format!("split {}+{}", first, second),
-                        Applied::Disorder { first, second } => format!("disorder {}+{}", first, second),
-                        Applied::Oob { first, second } => format!("oob {}+{}", first, second),
-                        Applied::Fake { decoy, real } => format!("fake {}+{}", decoy, real),
-                        Applied::FakeMultiDisorder { decoy, first, second } => format!("fake+multidisorder {}/{}+{}", decoy, first, second),
-                        Applied::None => "direct".to_string(),
-                    };
+                    let detail = applied.detail().unwrap_or_else(|| "direct".to_string());
                     log_t(log_tx, LogLevel::Success, "log.socks5_hello_sent", vec![
                         ("target", target.clone()),
                         ("detail", detail),

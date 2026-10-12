@@ -298,7 +298,7 @@ fn merge_connect_errors(mut errors: Vec<(SocketAddr, std::io::Error)>) -> std::i
 }
 
 /// Сколько ждать одного адреса, прежде чем перейти к следующему.
-const PER_ADDRESS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+pub(crate) const PER_ADDRESS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Кэш «мёртвых адресов» (negative-cache / circuit breaker).
 ///
@@ -318,7 +318,7 @@ static DEAD_ADDRS: std::sync::Mutex<Option<std::collections::HashMap<std::net::I
     std::sync::Mutex::new(None);
 
 /// Помечен ли адрес недавно не ответившим. Заодно чистит протухшие записи.
-fn addr_is_dead(ip: std::net::IpAddr) -> bool {
+pub(crate) fn addr_is_dead(ip: std::net::IpAddr) -> bool {
     let mut guard = DEAD_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(Default::default);
     let now = std::time::Instant::now();

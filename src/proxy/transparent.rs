@@ -54,7 +54,7 @@ use crate::config::BypassParams;
 use crate::dns::ip_cache::IpDomainCache;
 use crate::observability::logging::{log_t, LogLevel, LogSender};
 use crate::observability::metrics::Metrics;
-use crate::engine::strategy::{apply::Applied, Strategy, StrategyStore};
+use crate::engine::strategy::{Strategy, StrategyStore};
 
 /// Адрес для IPv6-соединений, парный к `listen_host`.
 ///
@@ -118,7 +118,7 @@ pub async fn run_transparent_proxy(
         run_packet_mode(
             is_enabled, bypass_domains, bypass_params, strategy_ttl_hours,
             log_tx, metrics, token, ip_cache, strategies,
-        );
+        ).await;
         return;
     }
     #[cfg(not(target_os = "linux"))]
@@ -263,18 +263,20 @@ pub async fn run_transparent_proxy(
 ///
 /// Поток живёт до конца процесса: у NFQUEUE-цикла нет чистой отмены, а
 /// `nfqueue::run` защищён от повторного старта, так что перезапуск прокси из
-/// интерфейса очередь не пере-биндит. Диагностика выбора стратегии крутится на
-/// tokio, поэтому поток входит в рантайм (`Handle::enter`).
+/// интерфейса очередь не пере-биндит, а подменяет циклу настройки. До отмены
+/// `token` они действуют, после — снимаются, и пакеты идут как есть.
+/// Диагностика выбора стратегии крутится на tokio, поэтому поток входит в
+/// рантайм (`Handle::enter`).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn run_packet_mode(
+async fn run_packet_mode(
     is_enabled: bool,
     bypass_domains: Arc<HashSet<String>>,
     bypass_params: BypassParams,
     strategy_ttl_hours: u64,
     log_tx: LogSender,
     metrics: Arc<Metrics>,
-    _token: CancellationToken,
+    token: CancellationToken,
     ip_cache: Arc<IpDomainCache>,
     strategies: Arc<StrategyStore>,
 ) {
@@ -289,18 +291,23 @@ fn run_packet_mode(
         ip_cache,
         log_tx: log_tx.clone(),
     };
+    let generation = nfqueue::install(env);
     let handle = tokio::runtime::Handle::current();
-    metrics.set_transparent_listening(true);
-    log_t(&log_tx, LogLevel::Success, "log.transparent_listening", vec![
-        ("addr", format!("nfqueue:{QUEUE_NUM}")),
-    ]);
 
     let log = log_tx.clone();
+    let bound_metrics = Arc::clone(&metrics);
     let spawned = std::thread::Builder::new()
         .name("nfqueue-tcp".into())
         .spawn(move || {
             let _rt = handle.enter();
-            if let Err(e) = nfqueue::run(QUEUE_NUM, env) {
+            // «Слушает» — только когда очередь занята, а не до попытки.
+            let on_bound = || {
+                bound_metrics.set_transparent_listening(true);
+                log_t(&log, LogLevel::Success, "log.transparent_listening", vec![
+                    ("addr", format!("nfqueue:{QUEUE_NUM}")),
+                ]);
+            };
+            if let Err(e) = nfqueue::run(QUEUE_NUM, on_bound) {
                 log_t(&log, LogLevel::Error, "log.bind_error", vec![
                     ("addr", format!("nfqueue:{QUEUE_NUM}")),
                     ("error", e.to_string()),
@@ -313,6 +320,10 @@ fn run_packet_mode(
             ("error", e.to_string()),
         ]);
     }
+
+    token.cancelled().await;
+    nfqueue::uninstall(generation);
+    metrics.set_transparent_listening(false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -468,21 +479,11 @@ async fn handle(
     // Первый пакет уходит по выбранной стратегии — здесь и происходит обход.
     match crate::engine::strategy::apply::first_packet(&mut server_writer, server_fd, &payload, strategy, bypass_params).await {
         Ok(applied) => {
-            let detail = match applied {
-                Applied::TlsRecord { bytes } => Some(format!("tls_record {}", bytes)),
-                Applied::SniSplit { first, second } => Some(format!("sni_split {}+{}", first, second)),
-                Applied::Split { first, second } => Some(format!("split {}+{}", first, second)),
-                Applied::Disorder { first, second } => Some(format!("disorder {}+{}", first, second)),
-                Applied::Oob { first, second } => Some(format!("oob {}+{}", first, second)),
-                Applied::Fake { decoy, real } => Some(format!("fake {}+{}", decoy, real)),
-                Applied::FakeMultiDisorder { decoy, first, second } => Some(format!("fake+multidisorder {}/{}+{}", decoy, first, second)),
-                // Без обхода писать нечего: «bypass: false» уже есть в строке
-                // перехвата выше. Иначе каждое постороннее соединение давало
-                // лишнее предупреждение и топило в логе настоящие. Так же
-                // сделано в HTTPS-туннеле.
-                Applied::None => None,
-            };
-            if let Some(detail) = detail {
+            // Без обхода писать нечего: «bypass: false» уже есть в строке
+            // перехвата выше. Иначе каждое постороннее соединение давало
+            // лишнее предупреждение и топило в логе настоящие. Так же
+            // сделано в HTTPS-туннеле.
+            if let Some(detail) = applied.detail() {
                 log_t(log_tx, LogLevel::Warning, "log.transparent_applied", vec![
                     ("domain", domain.clone()),
                     ("detail", detail),
@@ -623,12 +624,9 @@ async fn connect_with_fallback(
     } else {
         // С таймаутом: без него недоступный сервер держал соединение около
         // двух минут, пока ядро повторяет SYN.
-        match crate::dns::resolver::connect_addr(target).await {
+        match try_addr(target).await {
             Ok(s) => return Ok((s, target)),
-            Err(e) => {
-                mark_dead_if_blocked(target.ip(), &e);
-                e
-            }
+            Err(e) => e,
         }
     };
     // Исходный адрес пропущен как мёртвый, а замены не нашлось — последняя
@@ -636,7 +634,13 @@ async fn connect_with_fallback(
     // соединение гарантированно не откроется.
     let last_resort = || async {
         if skipped_target {
-            let stream = crate::dns::resolver::connect_addr(target).await?;
+            // Мимо кэша резолвера: он тоже мог помнить адрес, и попытка
+            // отказала бы сразу.
+            let stream = crate::dns::resolver::connect_without_dead_cache(
+                &[target],
+                crate::dns::resolver::PER_ADDRESS_CONNECT_TIMEOUT,
+            )
+            .await?;
             // Ожил — дальше снова первым пробуется он.
             forget_dead(target.ip());
             Ok((stream, target))
@@ -647,28 +651,39 @@ async fn connect_with_fallback(
 
     let Some(name) = name else { return last_resort().await };
 
-    let Ok(addrs) = tokio::net::lookup_host((name, target.port())).await else {
-        return last_resort().await;
-    };
+    // Через свой резолвер (DoH), а не системный: DNS провайдера отдаёт
+    // адреса заглушек, и «другим адресом сайта» оказалась бы она.
+    let addrs = crate::dns::resolver::resolve_all(&format!("{name}:{}", target.port())).await;
     // Только того же семейства: к IPv6 из IPv4-соединения (и наоборот)
     // может не быть маршрута.
-    for addr in addrs.filter(|a| a.is_ipv4() == target.is_ipv4() && a.ip() != target.ip()) {
+    for addr in addrs.into_iter().filter(|a| a.is_ipv4() == target.is_ipv4() && a.ip() != target.ip()) {
         if is_dead(addr.ip()) {
             continue;
         }
-        match crate::dns::resolver::connect_addr(addr).await {
-            Ok(s) => {
-                log_t(log_tx, LogLevel::Info, "log.transparent_fallback_addr", vec![
-                    ("domain", name.to_string()),
-                    ("dead", target.ip().to_string()),
-                    ("addr", addr.ip().to_string()),
-                ]);
-                return Ok((s, addr));
-            }
-            Err(e) => mark_dead_if_blocked(addr.ip(), &e),
+        if let Ok(s) = try_addr(addr).await {
+            log_t(log_tx, LogLevel::Info, "log.transparent_fallback_addr", vec![
+                ("domain", name.to_string()),
+                ("dead", target.ip().to_string()),
+                ("addr", addr.ip().to_string()),
+            ]);
+            return Ok((s, addr));
         }
     }
     last_resort().await
+}
+
+/// Подключение к одному адресу. Мёртвым он помечается только по своему
+/// таймауту, а не по мгновенному отказу из кэша резолвера: тот помнит адрес
+/// минуту, и его отказ продлевал бы её до десяти.
+async fn try_addr(addr: std::net::SocketAddr) -> std::io::Result<TcpStream> {
+    let cached = crate::dns::resolver::addr_is_dead(addr.ip());
+    let result = crate::dns::resolver::connect_addr(addr).await;
+    if let Err(e) = &result
+        && !cached
+    {
+        mark_dead_if_blocked(addr.ip(), e);
+    }
+    result
 }
 
 #[cfg(test)]
