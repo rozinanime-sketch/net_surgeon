@@ -91,19 +91,54 @@ static RELAY: RwLock<Option<Arc<str>>> = RwLock::new(None);
 /// не доходит, с ней проходят все.
 static FAKE_SNI: RwLock<Option<Arc<str>>> = RwLock::new(None);
 
-/// Когда приманка в этой сети признана бесполезной (см. FAKE_FAILURES_LIMIT).
-/// Минуту после этого её не пробуем: каждая неудача — это таймаут.
-static FAKE_FAILED_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-const FAKE_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Неудачи подряд, после которых что-то признаётся не работающим: общий
+/// счётчик для приманки, порта 8443 и md5sig.
+struct Streak {
+    failures: u32,
+    last_failure: Option<std::time::Instant>,
+    tripped_at: Option<std::time::Instant>,
+}
+impl Streak {
+    const FRESH: Streak = Streak { failures: 0, last_failure: None, tripped_at: None };
+
+    /// Неудача; `true` — набралось `limit` подряд. Неудачи ближе `round`
+    /// друг к другу считаются за одну.
+    fn fail(&mut self, limit: u32, round: Duration) -> bool {
+        let now = std::time::Instant::now();
+        if self.last_failure.is_some_and(|at| now.duration_since(at) < round) {
+            return false;
+        }
+        self.last_failure = Some(now);
+        self.failures += 1;
+        if self.failures < limit {
+            return false;
+        }
+        self.failures = 0;
+        self.tripped_at = Some(now);
+        true
+    }
+
+    fn ok(&mut self) {
+        self.failures = 0;
+        self.last_failure = None;
+    }
+
+    fn tripped_within(&self, d: Duration) -> bool {
+        self.tripped_at.is_some_and(|at| at.elapsed() < d)
+    }
+}
+
 /// Неудачи приманки подряд, после которых сеть считается не требующей её.
+/// Минуту после этого её не пробуем: каждая неудача — это таймаут.
 ///
 /// Откат без приманки в сети с заморозкой бесполезен: соединение
 /// встаёт после пары килобайт. Раньше одна неудача отправляла туда все
 /// соединения на минуту, и Telegram заметно тормозил. Теперь без приманки —
 /// только когда закрыт сам порт 8443 или она не помогла несколько раз
 /// подряд (сеть без заморозки).
-static FAKE_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FAKE: std::sync::Mutex<Streak> = std::sync::Mutex::new(Streak::FRESH);
 const FAKE_FAILURES_LIMIT: u32 = 3;
+const FAKE_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// TTL приманки до воркера (см. `ws::fake_handshake`).
 const RELAY_FAKE_TTL: u32 = 12;
 /// Порт воркера для подключения с приманкой. Cloudflare отдаёт HTTPS и на
@@ -126,20 +161,12 @@ const FAKE_BUDGET: Duration = Duration::from_secs(9);
 /// с запасом на TCP и TLS, то есть на два-три RTT мобильной сети.
 const PLAIN_HEAD_START: Duration = Duration::from_secs(1);
 
-/// Неудачные TCP-подключения к 8443 подряд и когда порт признан закрытым.
-/// Тогда минуту 8443 не пробуем вовсе: каждая проба — это таймаут. Только
-/// после нескольких подряд — в сети, где 443 до воркера закрыт, одна
-/// случайная неудача отправляла бы все соединения туда.
-struct PortState {
-    /// Неудачи подряд — по раундам, а не по попыткам (см. `PORT_FAILURE_ROUND`).
-    failures: u32,
-    last_failure: Option<std::time::Instant>,
-    closed_at: Option<std::time::Instant>,
-}
-impl PortState {
-    const FRESH: PortState = PortState { failures: 0, last_failure: None, closed_at: None };
-}
-static PORT: std::sync::Mutex<PortState> = std::sync::Mutex::new(PortState::FRESH);
+/// Неудачные TCP-подключения к 8443 подряд — по раундам, а не по попыткам
+/// (см. `PORT_FAILURE_ROUND`). Когда порт признан закрытым, минуту 8443 не
+/// пробуем вовсе: каждая проба — это таймаут. Только после нескольких
+/// подряд — в сети, где 443 до воркера закрыт, одна случайная неудача
+/// отправляла бы все соединения туда.
+static PORT: std::sync::Mutex<Streak> = std::sync::Mutex::new(Streak::FRESH);
 const PORT_FAILURES_LIMIT: u32 = 3;
 /// Неудачи ближе этого друг к другу — один раунд и считаются за одну:
 /// подбор TTL открывает девять подключений разом, Telegram — пачку своих,
@@ -154,7 +181,7 @@ static NO_MD5SIG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// приманка, не встал TTL на этом сокете), поэтому «ядро без md5sig»
 /// решается только после нескольких подряд — иначе одна случайность
 /// навсегда переводила ноутбук на слабый режим.
-static MD5SIG_REFUSALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static MD5SIG_REFUSALS: std::sync::Mutex<Streak> = std::sync::Mutex::new(Streak::FRESH);
 const MD5SIG_REFUSALS_LIMIT: u32 = 3;
 /// TTL приманки без md5sig, найденный подбором; сбрасывается, когда
 /// перестаёт работать (сменилась сеть).
@@ -203,15 +230,13 @@ pub fn reload(log_tx: &LogSender, bypass: &crate::config::BypassParams) {
     if let Ok(mut guard) = FAKE_SNI.write() {
         *guard = Some(Arc::from(bypass.fake_sni.as_str()));
     }
-    if let Ok(mut failed) = FAKE_FAILED_AT.lock() {
-        *failed = None;
+    for streak in [&FAKE, &PORT] {
+        if let Ok(mut streak) = streak.lock() {
+            *streak = Streak::FRESH;
+        }
     }
-    FAKE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut ttl) = RELAY_TTL.lock() {
         *ttl = None;
-    }
-    if let Ok(mut port) = PORT.lock() {
-        *port = PortState::FRESH;
     }
     let host = paths::read_to_string(CONFIG_FILE).ok().and_then(|text| parse(&text));
     if let Some(h) = &host {
@@ -403,23 +428,16 @@ mod ws {
         if !crate::bypass::socket::fake_supported() {
             return None;
         }
-        let recently_failed = FAKE_FAILED_AT
-            .lock()
-            .ok()
-            .and_then(|at| *at)
-            .is_some_and(|at| at.elapsed() < FAKE_RETRY_AFTER);
+        let recently_failed = FAKE.lock().is_ok_and(|fake| fake.tripped_within(FAKE_RETRY_AFTER));
         if recently_failed || port_known_closed() {
             return None;
         }
         FAKE_SNI.read().ok()?.clone()
     }
 
-    /// 8443 недавно признан закрытым (см. `PortState`).
+    /// 8443 недавно признан закрытым (см. `PORT`).
     fn port_known_closed() -> bool {
-        PORT.lock()
-            .ok()
-            .and_then(|port| port.closed_at)
-            .is_some_and(|at| at.elapsed() < FAKE_RETRY_AFTER)
+        PORT.lock().is_ok_and(|port| port.tripped_within(FAKE_RETRY_AFTER))
     }
 
     /// Неудачное подключение к 8443. «Сеть недоступна» — не про порт: так
@@ -428,23 +446,14 @@ mod ws {
         if e.kind() == std::io::ErrorKind::NetworkUnreachable {
             return;
         }
-        let Ok(mut port) = PORT.lock() else { return };
-        let now = std::time::Instant::now();
-        if port.last_failure.is_some_and(|at| now.duration_since(at) < PORT_FAILURE_ROUND) {
-            return;
-        }
-        port.last_failure = Some(now);
-        port.failures += 1;
-        if port.failures >= PORT_FAILURES_LIMIT {
-            port.failures = 0;
-            port.closed_at = Some(now);
+        if let Ok(mut port) = PORT.lock() {
+            port.fail(PORT_FAILURES_LIMIT, PORT_FAILURE_ROUND);
         }
     }
 
     fn note_port_open() {
         if let Ok(mut port) = PORT.lock() {
-            port.failures = 0;
-            port.last_failure = None;
+            port.ok();
         }
     }
 
@@ -487,17 +496,15 @@ mod ws {
 
     /// Неудача приманки. Минута без неё — только после нескольких подряд.
     fn note_fake_failed() {
-        use std::sync::atomic::Ordering;
-        if FAKE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1 >= FAKE_FAILURES_LIMIT {
-            FAKE_FAILURES.store(0, Ordering::Relaxed);
-            if let Ok(mut failed) = FAKE_FAILED_AT.lock() {
-                *failed = Some(std::time::Instant::now());
-            }
+        if let Ok(mut fake) = FAKE.lock() {
+            fake.fail(FAKE_FAILURES_LIMIT, Duration::ZERO);
         }
     }
 
     fn note_fake_worked() {
-        FAKE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut fake) = FAKE.lock() {
+            fake.ok();
+        }
     }
 
     /// Порт 8443 недоступен (провайдер закрыл): приманке тут делать нечего.
@@ -525,9 +532,7 @@ mod ws {
     }
 
     async fn attempt(host: &str, params: &crate::config::BypassParams) -> std::io::Result<Stream> {
-        tokio::time::timeout(FAKE_ATTEMPT_TIMEOUT, handshake(host, Some(params)))
-            .await
-            .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+        within(FAKE_ATTEMPT_TIMEOUT, handshake(host, Some(params))).await
     }
 
     /// Рукопожатие с приманкой; `None` — идти без неё.
@@ -548,14 +553,16 @@ mod ws {
             for _ in 0..2 {
                 match attempt(host, &decoy(&sni, RELAY_FAKE_TTL, true)).await {
                     Ok(stream) => {
-                        MD5SIG_REFUSALS.store(0, Ordering::Relaxed);
+                        if let Ok(mut refusals) = MD5SIG_REFUSALS.lock() {
+                            refusals.ok();
+                        }
                         note_fake_worked();
                         return Some(stream);
                     }
                     // Приманка с подписью не ушла: дальше без подписи, а
                     // «ядро без md5sig» — только после нескольких отказов подряд.
                     Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                        if MD5SIG_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1 >= MD5SIG_REFUSALS_LIMIT {
+                        if MD5SIG_REFUSALS.lock().is_ok_and(|mut r| r.fail(MD5SIG_REFUSALS_LIMIT, Duration::ZERO)) {
                             NO_MD5SIG.store(true, Ordering::Relaxed);
                         }
                         unsigned_needed = true;
@@ -686,23 +693,15 @@ mod ws {
     /// готовое рукопожатие. По очереди каждое соединение во второй сети ждало
     /// бы таймаут 8443 целиком, и запомнить это негде: порт-то открыт.
     async fn plain(host: &str) -> std::io::Result<Stream> {
-        let via_443 = async {
-            tokio::time::timeout(CONNECT_TIMEOUT, async {
-                let tcp = crate::dns::resolver::connect(&format!("{host}:443")).await?;
-                let _ = tcp.set_nodelay(true);
-                tls().connect(server_name(host)?, tcp).await
-            })
-            .await
-            .unwrap_or_else(|e| Err(timed_out(e)))
-        };
+        let via_443 = within(CONNECT_TIMEOUT, async {
+            let tcp = crate::dns::resolver::connect(&format!("{host}:443")).await?;
+            let _ = tcp.set_nodelay(true);
+            tls().connect(server_name(host)?, tcp).await
+        });
         if port_known_closed() {
             return via_443.await;
         }
-        let via_8443 = async {
-            tokio::time::timeout(FAKE_ATTEMPT_TIMEOUT, handshake(host, None))
-                .await
-                .unwrap_or_else(|e| Err(timed_out(e)))
-        };
+        let via_8443 = within(FAKE_ATTEMPT_TIMEOUT, handshake(host, None));
         tokio::pin!(via_443, via_8443);
         tokio::select! {
             result = &mut via_8443 => return match result {
@@ -723,8 +722,11 @@ mod ws {
         }
     }
 
-    fn timed_out(_: tokio::time::error::Elapsed) -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, rust_i18n::t!("err.relay_timeout").into_owned())
+    /// `f` с пределом по времени; по истечении — `TimedOut`.
+    async fn within<T>(limit: Duration, f: impl std::future::Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
+        tokio::time::timeout(limit, f).await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, rust_i18n::t!("err.relay_timeout").into_owned()))
+        })
     }
 
     pub async fn connect(host: &str, path: &str) -> std::io::Result<Stream> {
@@ -734,7 +736,7 @@ mod ws {
             Some(stream) => stream,
             None => plain(host).await?,
         };
-        tokio::time::timeout(CONNECT_TIMEOUT, upgrade(stream, host, path)).await.map_err(timed_out)?
+        within(CONNECT_TIMEOUT, upgrade(stream, host, path)).await
     }
 
     /// Рукопожатие WebSocket поверх готового TLS.

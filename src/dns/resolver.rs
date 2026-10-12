@@ -236,7 +236,7 @@ pub async fn resolve_all(target: &str) -> Vec<SocketAddr> {
 pub async fn connect_without_dead_cache(addrs: &[SocketAddr], budget: std::time::Duration) -> std::io::Result<TcpStream> {
     const STAGGER: std::time::Duration = std::time::Duration::from_millis(250);
     let deadline = tokio::time::Instant::now() + budget;
-    let mut queue = addrs.iter().copied();
+    let mut queue = addrs.iter().copied().peekable();
     let mut running = tokio::task::JoinSet::new();
     let mut errors: Vec<(SocketAddr, std::io::Error)> = Vec::new();
     let mut start_next = true;
@@ -260,13 +260,11 @@ pub async fn connect_without_dead_cache(addrs: &[SocketAddr], budget: std::time:
                     errors.push(failed);
                     start_next = true;
                 }
-                Some(Err(e)) => {
-                    errors.push((addrs[0], std::io::Error::other(e)));
-                    start_next = true;
-                }
-                None => break,
+                // Паника задачи с голым connect; `None` невозможен — пустой
+                // набор отсечён выше.
+                _ => start_next = true,
             },
-            _ = tokio::time::sleep(STAGGER) => start_next = true,
+            _ = tokio::time::sleep(STAGGER), if queue.peek().is_some() => start_next = true,
             _ = tokio::time::sleep_until(deadline) => {
                 let listed = addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
                 return Err(std::io::Error::new(
@@ -276,12 +274,17 @@ pub async fn connect_without_dead_cache(addrs: &[SocketAddr], budget: std::time:
             }
         }
     }
-    // Все отказали сами. Причина — по каждому адресу, а вид ошибки — не
-    // «сеть недоступна», если есть другой: мгновенный отказ IPv6 в сети без
-    // IPv6 не должен прятать то, что ответил IPv4.
+    Err(merge_connect_errors(errors))
+}
+
+/// Одна ошибка из отказов по каждому адресу. Причина — по каждому: раньше
+/// отдавалась только последняя, и она прятала настоящую (IPv4 не ответил за
+/// 4 с, следом IPv6 в сети без IPv6 мгновенно дал «Network is unreachable»).
+/// По той же причине вид ошибки — не «сеть недоступна», если есть другой.
+fn merge_connect_errors(mut errors: Vec<(SocketAddr, std::io::Error)>) -> std::io::Error {
     match errors.len() {
-        0 => Err(std::io::Error::new(std::io::ErrorKind::NotFound, rust_i18n::t!("err.no_addresses").into_owned())),
-        1 => Err(errors.pop().expect("ровно одна ошибка").1),
+        0 => std::io::Error::new(std::io::ErrorKind::NotFound, rust_i18n::t!("err.no_addresses").into_owned()),
+        1 => errors.pop().expect("ровно одна ошибка").1,
         _ => {
             let kind = errors
                 .iter()
@@ -289,7 +292,7 @@ pub async fn connect_without_dead_cache(addrs: &[SocketAddr], budget: std::time:
                 .find(|k| *k != std::io::ErrorKind::NetworkUnreachable)
                 .unwrap_or(std::io::ErrorKind::NetworkUnreachable);
             let detail = errors.iter().map(|(a, e)| format!("{}: {e}", a.ip())).collect::<Vec<_>>().join("; ");
-            Err(std::io::Error::new(kind, detail))
+            std::io::Error::new(kind, detail)
         }
     }
 }
@@ -429,18 +432,7 @@ async fn connect_each(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
             Err(e) => errors.push((*addr, e)),
         }
     }
-    // Причина — по каждому адресу. Раньше отдавалась только последняя, и
-    // она прятала настоящую: IPv4 не ответил за 4 с, следом IPv6 в сети без
-    // IPv6 мгновенно дал «Network is unreachable» — и в логе было только это.
-    match errors.len() {
-        0 => Err(std::io::Error::new(std::io::ErrorKind::NotFound, rust_i18n::t!("err.no_addresses").into_owned())),
-        1 => Err(errors.pop().expect("ровно одна ошибка").1),
-        _ => {
-            let kind = errors[0].1.kind();
-            let detail = errors.iter().map(|(a, e)| format!("{}: {e}", a.ip())).collect::<Vec<_>>().join("; ");
-            Err(std::io::Error::new(kind, detail))
-        }
-    }
+    Err(merge_connect_errors(errors))
 }
 
 /// Резолв системным резолвером и перебор адресов с таймаутом на каждый.
