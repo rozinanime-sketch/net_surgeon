@@ -60,17 +60,42 @@ pub async fn run_doh_relay(
         }
     };
 
+    // Второй сокет — на IPv6 той же петли: перехват (src/firewall.rs)
+    // заворачивает сюда и DNS к IPv6-резолверам. Не поднялся — не беда,
+    // IPv4 работает и без него.
+    let socket_v6 = match ipv6_companion(&listen_address) {
+        Some(addr) => match bind_v6_only(addr) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                log_t(&log_tx, LogLevel::Info, "log.transparent_ipv6_unavailable", vec![
+                    ("addr", addr.to_string()),
+                    ("error", e.to_string()),
+                ]);
+                None
+            }
+        },
+        None => None,
+    };
+
     // 65535, а не 4096: recv_from не сообщает об усечении — лишние байты
     // просто пропадают, и запрос уходит провайдеру обрезанным.
     let mut buffer = [0u8; 65535];
+    let mut buffer_v6 = [0u8; 65535];
     loop {
+        let recv_v6 = async {
+            match &socket_v6 {
+                Some(s) => s.recv_from(&mut buffer_v6).await.map(|(len, from)| (buffer_v6[..len].to_vec(), from, Arc::clone(s))),
+                None => std::future::pending().await,
+            }
+        };
+        let recv_v4 = async {
+            socket.recv_from(&mut buffer).await.map(|(len, from)| (buffer[..len].to_vec(), from, Arc::clone(&socket)))
+        };
         tokio::select! {
             _ = token.cancelled() => break,
-            recv_result = socket.recv_from(&mut buffer) => {
+            recv_result = async { tokio::select! { r = recv_v4 => r, r = recv_v6 => r } } => {
                 match recv_result {
-                    Ok((len, client_addr)) => {
-                        let query = buffer[..len].to_vec();
-                        let socket = Arc::clone(&socket);
+                    Ok((query, client_addr, socket)) => {
                         let client = client.clone();
                         let doh_provider = doh_provider.clone();
                         let log_tx = log_tx.clone();
@@ -162,6 +187,30 @@ pub async fn run_doh_relay(
     }
 
     metrics.set_udp_listening(false);
+}
+
+/// Адрес IPv6-сокета рядом с `listen_address`: петля к петле, «все адреса»
+/// к «всем адресам». Иначе — нет.
+fn ipv6_companion(listen_address: &str) -> Option<std::net::SocketAddr> {
+    let (host, port) = listen_address.rsplit_once(':')?;
+    let port = port.parse().ok()?;
+    let ip: std::net::IpAddr = match host {
+        "127.0.0.1" | "localhost" => std::net::Ipv6Addr::LOCALHOST.into(),
+        "0.0.0.0" => std::net::Ipv6Addr::UNSPECIFIED.into(),
+        _ => return None,
+    };
+    Some(std::net::SocketAddr::new(ip, port))
+}
+
+/// UDP только на IPv6: обычный bind `[::]` в Linux претендует и на IPv4 и
+/// не встал бы рядом с `0.0.0.0` на том же порту.
+fn bind_v6_only(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    tokio::net::UdpSocket::from_std(socket.into())
 }
 
 async fn resolve_via_doh(client: &reqwest::Client, provider: &str, dns_query: &[u8]) -> Result<Vec<u8>, String> {

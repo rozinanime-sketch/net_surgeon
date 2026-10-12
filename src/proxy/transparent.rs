@@ -110,16 +110,17 @@ pub async fn run_transparent_proxy(
     ip_cache: Arc<IpDomainCache>,
     strategies: Arc<StrategyStore>,
 ) {
-    // Пакетный режим на Linux: TCP/443 обходится прямо на пакетах через
-    // NFQUEUE (crate::nfqueue), сокетный слушатель для него не нужен. QUIC и
-    // DNS по-прежнему идут своими путями (transparent_udp, правило nftables).
+    // Пакетный режим на Linux: IPv4 TCP/443 обходится прямо на пакетах через
+    // NFQUEUE (crate::nfqueue). Слушатель поднимается всё равно: IPv6 очередь
+    // не переотправит, и правило nftables заворачивает его сюда, как в
+    // сокетном режиме. QUIC и DNS по-прежнему идут своими путями
+    // (transparent_udp, правило nftables).
     #[cfg(target_os = "linux")]
     if packet_mode {
-        run_packet_mode(
-            is_enabled, bypass_domains, bypass_params, strategy_ttl_hours,
-            log_tx, metrics, token, ip_cache, strategies,
-        ).await;
-        return;
+        tokio::spawn(run_packet_mode(
+            is_enabled, Arc::clone(&bypass_domains), bypass_params.clone(), strategy_ttl_hours,
+            log_tx.clone(), Arc::clone(&metrics), token.clone(), Arc::clone(&ip_cache), Arc::clone(&strategies),
+        ));
     }
     #[cfg(not(target_os = "linux"))]
     let _ = packet_mode;

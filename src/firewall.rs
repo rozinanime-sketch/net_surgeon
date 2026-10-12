@@ -67,13 +67,29 @@ pub struct Plan {
     /// Пакетный режим: TCP/443 не заворачивается на слушатель, а уходит в
     /// очередь NFQUEUE (`crate::nfqueue`). QUIC и DNS — по-прежнему.
     pub packet: bool,
+    /// Узнавать ClientHello по началу данных (`@ih`, nftables ≥ 1.0.1), а не
+    /// по флагам TCP. Старый nft этого не умеет — тогда прежнее правило.
+    pub hello_by_payload: bool,
 }
+
+/// ClientHello по началу данных: запись Handshake (0x16 0x03) с сообщением
+/// ClientHello (тип 1 в шестом байте) — как фильтр WinDivert. Только первый
+/// сегмент ClientHello и его повторы, а не каждый сегмент данных.
+///
+/// Раньше в очередь шли пакеты с PSH+ACK. ClientHello, разрезанный на
+/// несколько сегментов (постквантовый, ~1,8 КБ, без GSO на интерфейсе),
+/// несёт PSH только в последнем, и первый — с SNI — уходил мимо очереди
+/// необработанным. А любой другой сегмент с PSH (загрузки, HTTP/2,
+/// WebSocket) всё время жизни соединения гонялся через userspace впустую.
+const HELLO_BY_PAYLOAD: &str = "tcp dport 443 @ih,0,16 0x1603 @ih,40,8 0x01";
+/// Прежний признак для nft без `@ih`.
+const HELLO_BY_FLAGS: &str = "tcp dport 443 tcp flags & (fin | syn | rst | psh | ack) == (psh | ack)";
 
 /// Команды для `nft`, по одной на строку: так их понимает и `nft -f`,
 /// и `nft -i`.
 pub fn ruleset(plan: &Plan) -> String {
     let t = format!("inet {TABLE}");
-    let Plan { gid, port, dns_port, quic, calls, packet } = *plan;
+    let Plan { gid, port, dns_port, quic, calls, packet, hello_by_payload } = *plan;
     let mut s = String::new();
     let mut add = |line: String| {
         s.push_str(&line);
@@ -90,8 +106,8 @@ pub fn ruleset(plan: &Plan) -> String {
     if packet {
         // Пакетный режим: TCP/443 в очередь NFQUEUE вместо разворота на
         // слушатель. Только IPv4 (raw-сокет переотправки отдаёт IP-заголовок
-        // сам лишь для v4) и только пакет с данными: по флагам PSH+ACK, но не
-        // SYN — иначе SYN занял бы метку/поток раньше самого ClientHello.
+        // сам лишь для v4) и только ClientHello (см. HELLO_BY_PAYLOAD): SYN
+        // занял бы метку/поток раньше самого ClientHello.
         //
         // Флаг `bypass` — предохранитель «нет читателя → пропустить»: если
         // процесс не смог занять очередь (нет CAP_NET_RAW, упал), ядро по
@@ -99,7 +115,10 @@ pub fn ruleset(plan: &Plan) -> String {
         // С bypass такой пакет просто идёт дальше без обхода — связь цела.
         let reinject = crate::bypass::packet_mode::REINJECT_FWMARK;
         let probe = crate::bypass::packet_mode::PROBE_FWMARK;
-        let hello = "meta nfproto ipv4 tcp dport 443 tcp flags & (fin | syn | rst | psh | ack) == (psh | ack)";
+        let hello = format!(
+            "meta nfproto ipv4 {}",
+            if hello_by_payload { HELLO_BY_PAYLOAD } else { HELLO_BY_FLAGS }
+        );
         add(format!("add chain {t} queue_out {{ type filter hook output priority 0; }}"));
         // Свои переотправленные сегменты — мимо очереди.
         add(format!("add rule {t} queue_out meta mark {reinject:#x} return"));
@@ -109,14 +128,22 @@ pub fn ruleset(plan: &Plan) -> String {
         add(format!("add rule {t} queue_out meta skgid {gid} return"));
         // ClientHello приложений.
         add(format!("add rule {t} queue_out {hello} queue num {NFQ_QUEUE} bypass"));
+        // IPv6 очередь не переотправит — его на слушатель, как в сокетном
+        // режиме. Раньше IPv6 HTTPS в пакетном режиме шёл без обхода вовсе.
+        add(format!("add rule {t} nat_out meta nfproto ipv6 tcp dport 443 redirect to :{port}"));
     } else {
         add(format!("add rule {t} nat_out tcp dport 443 redirect to :{port}"));
     }
     if dns_port > 0 {
         // Локальные резолверы (systemd-resolved на 127.0.0.53) не трогаем:
         // наружу они ходят на настоящий адрес, там их и поймает правило.
+        // IPv6-резолвер (от провайдера по RA) — тоже в релей: он слушает и
+        // [::1]. DNS по TCP не заворачивается: релей принимает только UDP.
         add(format!(
             "add rule {t} nat_out ip daddr != 127.0.0.0/8 udp dport 53 redirect to :{dns_port}"
+        ));
+        add(format!(
+            "add rule {t} nat_out ip6 daddr != ::1 udp dport 53 redirect to :{dns_port}"
         ));
     }
 
@@ -125,9 +152,15 @@ pub fn ruleset(plan: &Plan) -> String {
     // помеченное на lo, и в PREROUTING его подхватывает tproxy. Механика
     // подробно — в run.sh.
     if quic {
+        // Метка — только пакету без своей (чужие fwmark не затираем) и от
+        // сокета пользовательского процесса. `meta skgid` у сокетов ядра
+        // (WireGuard) не определён, и условие с ним для них ложно: раньше
+        // рукопожатие WireGuard на 51820 попадало под порты звонков, теряло
+        // свою метку и уходило по кругу через lo — VPN ложился.
+        let ours = format!("meta mark 0 meta skgid != {gid}");
         add(format!("add chain {t} mark_out {{ type route hook output priority mangle; }}"));
         add(format!("add rule {t} mark_out meta skgid {gid} return"));
-        add(format!("add rule {t} mark_out meta nfproto ipv4 udp dport 443 meta mark set {MARK:#x}"));
+        add(format!("add rule {t} mark_out {ours} meta nfproto ipv4 udp dport 443 meta mark set {MARK:#x}"));
         // Звонки — той же дорогой: прозрачный UDP-слушатель сам решит,
         // слать ли мусор (session::is_call_flow). Тот же набор портов и
         // сетей перехватывает WinDivert в Windows.
@@ -143,7 +176,7 @@ pub fn ruleset(plan: &Plan) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             add(format!(
-                "add rule {t} mark_out ip daddr != {{ {local} }} udp dport {{ {ports} }} meta mark set {MARK:#x}"
+                "add rule {t} mark_out {ours} ip daddr != {{ {local} }} udp dport {{ {ports} }} meta mark set {MARK:#x}"
             ));
             let nets = crate::proxy::telegram::networks_v4()
                 .map(|(ip, bits)| format!("{ip}/{bits}"))
@@ -151,7 +184,7 @@ pub fn ruleset(plan: &Plan) -> String {
                 .join(", ");
             // DNS к ним не трогаем: он уже заворачивается в DoH-релей.
             add(format!(
-                "add rule {t} mark_out ip daddr {{ {nets} }} udp dport != 53 meta mark set {MARK:#x}"
+                "add rule {t} mark_out {ours} ip daddr {{ {nets} }} udp dport != 53 meta mark set {MARK:#x}"
             ));
         }
         add(format!("add chain {t} tproxy_pre {{ type filter hook prerouting priority mangle; }}"));
@@ -174,7 +207,47 @@ struct Held {
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
+/// Отравленный замок не повод терять держателя: без него таблица исчезла
+/// бы, а пользователь видел бы «перехват включён».
+fn held() -> std::sync::MutexGuard<'static, Option<Held>> {
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Маршрутная пара, снимаемая при выходе из `install` с ошибкой, — на любом
+/// пути, в том числе через `?`. Раньше снятие было вписано вручную в три
+/// места, а на трёх других пара оставалась висеть.
+struct RoutingGuard {
+    armed: bool,
+}
+
+impl RoutingGuard {
+    /// Установка удалась — пара остаётся и снимется в `release`.
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RoutingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            del_routing();
+        }
+    }
+}
+
+/// Остановить `nft` и дождаться его, чтобы не оставлять зомби.
+fn stop(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Ставит перехват. Возвращает, что включено, для сообщения пользователю.
+///
+/// Звать из потока, который живёт до конца программы, — из главного.
+/// `nft` умирает вместе с потоком, который его запустил (PDEATHSIG
+/// привязан к потоку, а не к процессу), и с ним — таблица. Из пула
+/// `spawn_blocking` правила пропадали через ~10 с, когда tokio убирал
+/// простаивающий поток.
 pub fn install(port: u16, dns_port: u16, calls: bool, packet: bool) -> Result<String, String> {
     if port == 0 {
         return Err(rust_i18n::t!("fw.no_port").into_owned());
@@ -185,12 +258,10 @@ pub fn install(port: u16, dns_port: u16, calls: bool, packet: bool) -> Result<St
     // пользователь запустил, и перехват молча ничего бы не делал.
     let (gid, egid) = unsafe { (libc::getgid(), libc::getegid()) };
     if gid == egid {
-        return Err("процесс не в отдельной группе. Запускайте через ./run.sh: \
-                    он выдаёт бинарю группу nsproxy"
-            .into());
+        return Err(rust_i18n::t!("fw.no_group").into_owned());
     }
 
-    if HELD.lock().map(|h| h.is_some()).unwrap_or(false) {
+    if held().is_some() {
         return Err(rust_i18n::t!("fw.already_on").into_owned());
     }
 
@@ -209,27 +280,31 @@ pub fn install(port: u16, dns_port: u16, calls: bool, packet: bool) -> Result<St
     }
 
     let routing = add_routing();
-    let plan = Plan { gid: egid, port, dns_port, quic: routing, calls, packet };
-    let rules = ruleset(&plan);
+    let guard = RoutingGuard { armed: routing };
+    let plan = |hello_by_payload| Plan { gid: egid, port, dns_port, quic: routing, calls, packet, hello_by_payload };
 
     // `nft -i` не сообщает об ошибках кодом выхода — он продолжает читать
-    // stdin. Поэтому сначала пробный прогон с тем же текстом.
-    let dry = run_with_cap_stdin("nft", &["-c", "-f", "-"], &rules).map_err(|e| nft_missing(&e))?;
+    // stdin. Поэтому сначала пробный прогон с тем же текстом. Старый nft не
+    // знает `@ih` — тогда правило пакетного режима по флагам TCP.
+    let check = |rules: &str| run_with_cap_stdin("nft", &["-c", "-f", "-"], rules).map_err(|e| nft_missing(&e));
+    let mut rules = ruleset(&plan(true));
+    let mut dry = check(&rules)?;
+    if !dry.status.success() && packet {
+        rules = ruleset(&plan(false));
+        dry = check(&rules)?;
+    }
     if !dry.status.success() {
-        if routing {
-            del_routing();
-        }
         return Err(rust_i18n::t!("fw.rejected", error = stderr_line(&dry)).into_owned());
     }
 
     let mut child = spawn_with_cap("nft", &["-i"])
         .map_err(|e| nft_missing(&e))?;
-    let mut stdin = child.stdin.take().ok_or_else(|| rust_i18n::t!("fw.no_stdin").into_owned())?;
+    let Some(mut stdin) = child.stdin.take() else {
+        stop(child);
+        return Err(rust_i18n::t!("fw.no_stdin").into_owned());
+    };
     if let Err(e) = stdin.write_all(rules.as_bytes()).and_then(|_| stdin.flush()) {
-        let _ = child.kill();
-        if routing {
-            del_routing();
-        }
+        stop(child);
         return Err(rust_i18n::t!("fw.send_failed", error = e).into_owned());
     }
 
@@ -243,16 +318,12 @@ pub fn install(port: u16, dns_port: u16, calls: bool, packet: bool) -> Result<St
         std::thread::sleep(Duration::from_millis(50));
     }
     if !present {
-        let _ = child.kill();
-        if routing {
-            del_routing();
-        }
+        stop(child);
         return Err(rust_i18n::t!("fw.table_missing").into_owned());
     }
 
-    if let Ok(mut h) = HELD.lock() {
-        *h = Some(Held { child, stdin, routing });
-    }
+    *held() = Some(Held { child, stdin, routing });
+    guard.keep();
 
     let mut what = vec!["TCP/443".to_string()];
     if routing {
@@ -270,8 +341,8 @@ pub fn install(port: u16, dns_port: u16, calls: bool, packet: bool) -> Result<St
 /// Штатное снятие. Таблицу ядро убрало бы и само, а маршрутную пару —
 /// нет, поэтому зовётся при выходе из `main`.
 pub fn release() {
-    let held = HELD.lock().ok().and_then(|mut h| h.take());
-    if let Some(mut h) = held {
+    let taken = held().take();
+    if let Some(mut h) = taken {
         drop(h.stdin);
         let _ = h.child.wait();
         if h.routing {
@@ -354,8 +425,10 @@ fn run_with_cap_stdin(program: &str, args: &[&str], input: &str) -> io::Result<O
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // Ошибку записи не возвращаем: если nft вышел раньше, чем дочитал
+    // (отверг первую же строку), она — EPIPE, а причина — в его stderr.
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
+        let _ = stdin.write_all(input.as_bytes());
     }
     child.wait_with_output()
 }
@@ -431,7 +504,7 @@ mod tests {
 
     #[test]
     fn full_ruleset() {
-        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 1053, quic: true, calls: true, packet: false });
+        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 1053, quic: true, calls: true, packet: false, hello_by_payload: true });
         assert!(r.starts_with("add table inet net_surgeon { flags owner; }\n"));
         assert!(r.contains("nat_out meta skgid 951 return"));
         assert!(r.contains("tcp dport 443 redirect to :1083"));
@@ -439,6 +512,10 @@ mod tests {
         assert!(r.contains("meta mark set 0x1"));
         assert!(r.contains("tproxy ip to 127.0.0.1:1083 accept"));
         assert!(r.contains("udp dport { 3478-3481, 19294-19344, 50000-65535 } meta mark set 0x1"));
+        // Метка — только своему трафику пользователя: не сокетам ядра
+        // (WireGuard) и не пакетам с чужой меткой.
+        assert!(r.lines().filter(|l| l.contains("meta mark set")).all(|l| l.contains("meta mark 0 meta skgid != 951")));
+        assert!(r.contains("ip6 daddr != ::1 udp dport 53 redirect to :1053"));
         assert!(r.contains("ip daddr != { 127.0.0.0/8, "), "локальные адреса по портам звонков не трогаем");
         assert!(r.contains("ip daddr { 149.154.160.0/20, "));
         // Исключение своей группы должно идти раньше перехвата в каждой цепочке.
@@ -450,7 +527,7 @@ mod tests {
 
     #[test]
     fn without_dns_and_quic() {
-        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 0, quic: false, calls: true, packet: false });
+        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 0, quic: false, calls: true, packet: false, hello_by_payload: true });
         assert!(!r.contains("dport 53"));
         assert!(!r.contains("tproxy"));
         assert!(!r.contains("mark_out"));
@@ -463,12 +540,18 @@ mod tests {
     #[test]
     fn packet_mode_queues_tcp_instead_of_redirect() {
         use crate::bypass::packet_mode::{PROBE_FWMARK, REINJECT_FWMARK};
-        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 1053, quic: false, calls: false, packet: true });
-        assert!(!r.contains("tcp dport 443 redirect"), "разворота на слушатель нет");
+        let r = ruleset(&Plan { gid: 951, port: 1083, dns_port: 1053, quic: false, calls: false, packet: true, hello_by_payload: true });
+        assert!(!r.contains("nat_out tcp dport 443 redirect"), "IPv4 на слушатель не разворачивается");
         assert!(r.contains(&format!("queue num {NFQ_QUEUE}")));
         assert!(r.contains("udp dport 53 redirect to :1053"), "DNS по-прежнему заворачивается");
-        // Только пакет с данными, не SYN.
-        assert!(r.contains("tcp flags & (fin | syn | rst | psh | ack) == (psh | ack)"));
+        // Только ClientHello — по началу данных, а не по флагам.
+        assert!(r.contains(&format!("meta nfproto ipv4 {HELLO_BY_PAYLOAD} queue num")));
+        assert!(!r.contains("tcp flags"));
+        // IPv6 — на слушатель.
+        assert!(r.contains("nat_out meta nfproto ipv6 tcp dport 443 redirect to :1083"));
+        // Старый nft — прежнее правило по флагам.
+        let old = ruleset(&Plan { gid: 951, port: 1083, dns_port: 0, quic: false, calls: false, packet: true, hello_by_payload: false });
+        assert!(old.contains(&format!("meta nfproto ipv4 {HELLO_BY_FLAGS} queue num")));
         // Переотправленные сегменты — мимо; пробы (по своей метке) — в очередь.
         assert!(r.contains(&format!("queue_out meta mark {REINJECT_FWMARK:#x} return")));
         assert!(r.contains(&format!("queue_out meta mark {PROBE_FWMARK:#x}")));

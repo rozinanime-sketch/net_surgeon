@@ -63,15 +63,16 @@ async fn main() {
     #[cfg(target_os = "linux")]
     if std::env::args().any(|a| a == "--firewall") {
         let cfg = &startup.config;
-        // Установка правил синхронная и ждёт применения nft со `sleep` (до ~1с).
-        // На async-рантайме это блокировало бы воркер, поэтому — spawn_blocking.
-        let (tp, udp, calls, packet) =
-            (cfg.transparent_port, cfg.udp_port, cfg.enabled && cfg.socks5_junk.calls, cfg.packet_mode);
-        let installed = tokio::task::spawn_blocking(move || {
-            net_surgeon::firewall::install(tp, udp, calls, packet)
-        })
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()));
+        // Прямо в главном потоке, а не в spawn_blocking: `nft`, держащий
+        // таблицу, умирает вместе с потоком, который его запустил, а поток
+        // пула tokio убирает через ~10 с простоя — и перехват исчезал.
+        // Установка ждёт nft до ~1 с; на старте больше ждать нечего.
+        let installed = net_surgeon::firewall::install(
+            cfg.transparent_port,
+            cfg.udp_port,
+            cfg.enabled && cfg.socks5_junk.calls,
+            cfg.packet_mode,
+        );
         match installed {
             Ok(msg) => eprintln!("[{}] {}", glyph::OK, msg),
             Err(e) => {
