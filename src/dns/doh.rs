@@ -150,12 +150,7 @@ pub async fn run_doh_relay(
 }
 
 async fn resolve_via_doh(client: &reqwest::Client, provider: &str, dns_query: &[u8]) -> Result<Vec<u8>, String> {
-    let response = client
-        .post(provider)
-        .header("content-type", "application/dns-message")
-        .header("accept", "application/dns-message")
-        .body(dns_query.to_vec())
-        .send()
+    let response = super::post_dns(client, provider, dns_query)
         .await
         .map_err(|e| super::error_chain(&e))?;
 

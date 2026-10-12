@@ -217,31 +217,81 @@ pub async fn resolve_all(target: &str) -> Vec<SocketAddr> {
     lookup_system(target).await.unwrap_or_default()
 }
 
-/// Как [`connect`], но без negative-кэша и со своим таймаутом — для пробных
-/// подключений на нестандартный порт (ретранслятор Telegram на 8443).
+/// Как [`connect`], но без negative-кэша, по готовым адресам и с общим
+/// пределом `budget` на все — для пробных подключений на нестандартный порт
+/// (ретранслятор Telegram на 8443).
 ///
 /// Таймаут там значит «порт закрыт», а не «адрес мёртв». Кэш же ведётся по
 /// IP без порта: пометка закрыла бы на минуту и 443 того же адреса, а за
 /// ним — откат ретранслятора и все сайты на этом адресе Cloudflare.
-pub async fn connect_without_dead_cache(target: &str, timeout: std::time::Duration) -> std::io::Result<TcpStream> {
-    let addrs = resolve_all(target).await;
-    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, rust_i18n::t!("err.no_addresses").into_owned());
-    for addr in addrs {
-        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                crate::bypass::packet_mode::mark(&stream, crate::bypass::packet_mode::Mark::Own);
-                return Ok(stream);
-            }
-            Ok(Err(e)) => last = e,
-            Err(_) => {
-                last = std::io::Error::new(
+///
+/// Адреса резолвит вызывающий (`resolve_all`), и в `budget` резолв не
+/// входит: запрос к DoH на холодном кэше бывает дольше всего предела, и
+/// живой порт считался бы закрытым.
+///
+/// Адреса пробуются внахлёст, как в Happy Eyeballs (RFC 8305): следующий
+/// стартует через [`STAGGER`] или сразу после отказа предыдущего. По очереди
+/// под общим пределом первый же молчащий адрес (AAAA при неработающем
+/// IPv6) съедал бы всё время, и до остальных дело не доходило.
+pub async fn connect_without_dead_cache(addrs: &[SocketAddr], budget: std::time::Duration) -> std::io::Result<TcpStream> {
+    const STAGGER: std::time::Duration = std::time::Duration::from_millis(250);
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut queue = addrs.iter().copied();
+    let mut running = tokio::task::JoinSet::new();
+    let mut errors: Vec<(SocketAddr, std::io::Error)> = Vec::new();
+    let mut start_next = true;
+    loop {
+        if std::mem::take(&mut start_next)
+            && let Some(addr) = queue.next()
+        {
+            running.spawn(async move { TcpStream::connect(addr).await.map_err(|e| (addr, e)) });
+        }
+        if running.is_empty() {
+            break;
+        }
+        tokio::select! {
+            joined = running.join_next() => match joined {
+                Some(Ok(Ok(stream))) => {
+                    crate::bypass::packet_mode::mark(&stream, crate::bypass::packet_mode::Mark::Own);
+                    // Остальные попытки снимает JoinSet при выходе.
+                    return Ok(stream);
+                }
+                Some(Ok(Err(failed))) => {
+                    errors.push(failed);
+                    start_next = true;
+                }
+                Some(Err(e)) => {
+                    errors.push((addrs[0], std::io::Error::other(e)));
+                    start_next = true;
+                }
+                None => break,
+            },
+            _ = tokio::time::sleep(STAGGER) => start_next = true,
+            _ = tokio::time::sleep_until(deadline) => {
+                let listed = addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    rust_i18n::t!("err.connect_timeout", addr = addr, secs = timeout.as_secs()).into_owned(),
-                );
+                    rust_i18n::t!("err.connect_timeout", addr = listed, secs = format!("{:.1}", budget.as_secs_f64())).into_owned(),
+                ));
             }
         }
     }
-    Err(last)
+    // Все отказали сами. Причина — по каждому адресу, а вид ошибки — не
+    // «сеть недоступна», если есть другой: мгновенный отказ IPv6 в сети без
+    // IPv6 не должен прятать то, что ответил IPv4.
+    match errors.len() {
+        0 => Err(std::io::Error::new(std::io::ErrorKind::NotFound, rust_i18n::t!("err.no_addresses").into_owned())),
+        1 => Err(errors.pop().expect("ровно одна ошибка").1),
+        _ => {
+            let kind = errors
+                .iter()
+                .map(|(_, e)| e.kind())
+                .find(|k| *k != std::io::ErrorKind::NetworkUnreachable)
+                .unwrap_or(std::io::ErrorKind::NetworkUnreachable);
+            let detail = errors.iter().map(|(a, e)| format!("{}: {e}", a.ip())).collect::<Vec<_>>().join("; ");
+            Err(std::io::Error::new(kind, detail))
+        }
+    }
 }
 
 /// Сколько ждать одного адреса, прежде чем перейти к следующему.
@@ -572,15 +622,7 @@ impl Resolver {
     }
 
     async fn query_provider(&self, query: Vec<u8>, host: &str) -> Result<Vec<IpAddr>, ()> {
-        let response = self
-            .client
-            .post(&self.provider)
-            .header("content-type", "application/dns-message")
-            .header("accept", "application/dns-message")
-            .body(query)
-            .send()
-            .await
-            .map_err(|_| ())?;
+        let response = super::post_dns(&self.client, &self.provider, &query).await.map_err(|_| ())?;
 
         if !response.status().is_success() {
             return Err(());
@@ -711,6 +753,24 @@ mod tests {
         assert_eq!(q[24], 0);
         // QTYPE=A, QCLASS=IN
         assert_eq!(&q[25..29], &[0x00, 0x01, 0x00, 0x01]);
+    }
+
+    /// Первый адрес молчит (192.0.2.1 — TEST-NET, ответа оттуда не бывает;
+    /// без сети отказ мгновенный) — второй всё равно пробуется, не дожидаясь
+    /// общего предела. По очереди под общим пределом до него не доходило.
+    #[tokio::test]
+    async fn silent_first_address_does_not_starve_the_rest() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alive = listener.local_addr().unwrap();
+        let silent: SocketAddr = "192.0.2.1:9".parse().unwrap();
+
+        let started = Instant::now();
+        let stream = connect_without_dead_cache(&[silent, alive], Duration::from_secs(3)).await;
+        assert!(stream.is_ok(), "{stream:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "ждали {:?}", started.elapsed());
+
+        let none = connect_without_dead_cache(&[], Duration::from_secs(3)).await;
+        assert_eq!(none.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
 
     /// Провайдер принимает соединение и молчит — так выглядит DoH,

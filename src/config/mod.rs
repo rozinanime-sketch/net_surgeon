@@ -255,7 +255,7 @@ fn default_reward_reliability() -> f64 { 1.0 }
 fn default_reward_latency() -> f64 { 0.3 }
 fn default_probe_gap_min() -> u64 { 250 }
 fn default_probe_gap_max() -> u64 { 700 }
-fn default_doh_provider() -> String { "https://cloudflare-dns.com/dns-query".to_string() }
+fn default_doh_provider() -> String { "https://dns11.quad9.net/dns-query".to_string() }
 
 pub fn load_config() -> Result<Config, String> {
     // В сообщении — полный путь, по которому искали. Иначе «файл не найден»
@@ -271,7 +271,7 @@ pub fn load_config() -> Result<Config, String> {
 
 /// Умный DNS, сменивший закрытый Xbox DNS и переставший работать Comss.
 const GEOHIDE_DNS: &str = "https://geohide.ru/dns-query";
-const GEOHIDE_DNS_IP: [u8; 4] = [159, 194, 200, 33];
+const GEOHIDE_DNS_IP: [u8; 4] = [193, 233, 112, 67];
 
 /// Умные DNS, которые больше не открывают нейросети.
 const DEAD_SMART_DNS: &[&str] = &["xbox-dns.ru", "dns.comss.one"];
@@ -377,8 +377,12 @@ mod tests {
 
     #[test]
     fn empty_bootstrap_address_means_unset() {
-        let text = shipped_config().replace("doh_bootstrap_ip = \"1.1.1.1\"", "doh_bootstrap_ip = \"\"")
-            .replace("doh_bootstrap_ip = \"8.8.8.8\"", "doh_bootstrap_ip = \"\"");
+        // По ключу, а не по значению: адрес меняется вместе с провайдером.
+        let text = shipped_config()
+            .lines()
+            .map(|l| if l.split('=').next().map(str::trim) == Some("doh_bootstrap_ip") { "doh_bootstrap_ip = \"\"" } else { l })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("doh_bootstrap_ip = \"\""));
         let config: Config = toml::from_str(&text).expect("пустой адрес должен разбираться");
         assert_eq!(config.doh_bootstrap_ip, None);

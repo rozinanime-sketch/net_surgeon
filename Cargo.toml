@@ -45,16 +45,16 @@ tui = ["dep:ratatui", "dep:crossterm"]
 tray = ["dep:ksni"]
 
 [dependencies]
-rand = "0.10.1"
-serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.52.3", features = ["full"] }
-toml = "1.1.2"
-tokio-util = "0.7.18"
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.2", features = ["full"] }
+toml = "1.1.8"
+tokio-util = "0.7.20"
 chrono = "0.4.45"
-toml_edit = "0.25.12"
-rust-i18n = "4.1.0"
-libc = "0.2.186"
-reqwest = "0.13.4"
+toml_edit = "0.25.17"
+rust-i18n = "4.2.4"
+libc = "0.2.190"
+reqwest = "0.13.5"
 # Ретранслятор Telegram (src/proxy/telegram.rs): TLS до воркера Cloudflare.
 # rustls и tokio-rustls уже приходят с reqwest, так что сборка не растёт;
 # корни встроенные — на Android до системного хранилища из Rust не добраться.

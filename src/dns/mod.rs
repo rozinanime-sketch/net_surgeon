@@ -81,7 +81,16 @@ pub fn doh_client(
     bootstrap: Option<IpAddr>,
     timeout: Duration,
 ) -> reqwest::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    // Одно соединение HTTP/2 несёт все запросы, и если сеть его молча
+    // оборвала (шлюзы фильтрации так делают с простаивающими), на нём
+    // падала разом целая пачка запросов. Пинги замечают обрыв заранее,
+    // а простаивающее соединение не живёт дольше, чем его терпят шлюзы.
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .http2_keep_alive_timeout(Duration::from_secs(5))
+        .http2_keep_alive_while_idle(true);
 
     if let Some(ip) = bootstrap
         && let Some((host, port)) = provider_endpoint(provider)
@@ -99,6 +108,30 @@ pub fn doh_client(
     }
 
     builder.build()
+}
+
+/// DNS-запрос к DoH-провайдеру.
+///
+/// Запрос, упавший на уже открытом соединении (сброс, GOAWAY, обрыв по
+/// пингу), — один повтор: пул это соединение уже выбросил, и повтор идёт по
+/// новому. Без этого обрыв одного соединения HTTP/2 оборачивался пачкой
+/// отказов DNS разом. Отказ при установке соединения (порт закрыт, чужой
+/// сертификат от шлюза) и таймаут не повторяются: новое соединение упрётся
+/// в то же самое, а ответ, пришедший через вторые 5 с, клиенту DNS уже не
+/// нужен. Соединение, оборванное молча, замечают пинги в `doh_client`.
+pub async fn post_dns(client: &reqwest::Client, provider: &str, query: &[u8]) -> reqwest::Result<reqwest::Response> {
+    let send = || {
+        client
+            .post(provider)
+            .header("content-type", "application/dns-message")
+            .header("accept", "application/dns-message")
+            .body(query.to_vec())
+            .send()
+    };
+    match send().await {
+        Err(e) if e.is_request() && !e.is_connect() && !e.is_timeout() => send().await,
+        other => other,
+    }
 }
 
 #[cfg(target_os = "android")]

@@ -46,7 +46,13 @@ use crate::observability::metrics::Metrics;
 
 const CONFIG_FILE: &str = "telegram_relay.txt";
 
-/// Сколько ждать подключения к воркеру вместе с TLS и рукопожатием WebSocket.
+/// Сколько ждать подключения к воркеру на 443 вместе с TLS, и отдельно —
+/// рукопожатия WebSocket.
+///
+/// Время на приманку и пробу 8443 сюда не входит: у них свои пределы
+/// (`FAKE_BUDGET`, `FAKE_ATTEMPT_TIMEOUT`). Раньше одно общее окно
+/// покрывало всё, и две неудачные попытки приманки по 4 с оставляли
+/// откату 2 с — соединение отваливалось по таймауту.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Предел одного кадра от воркера. Воркер шлёт то, что прочитал из TCP, —
@@ -91,11 +97,11 @@ static FAKE_FAILED_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync:
 const FAKE_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Неудачи приманки подряд, после которых сеть считается не требующей её.
 ///
-/// Откат на 443 без приманки в сети с заморозкой бесполезен: соединение
+/// Откат без приманки в сети с заморозкой бесполезен: соединение
 /// встаёт после пары килобайт. Раньше одна неудача отправляла туда все
-/// соединения на минуту, и Telegram заметно тормозил. Теперь 443 — только
-/// когда закрыт сам порт 8443 или приманка не помогла несколько раз подряд
-/// (сеть без заморозки, где 443 как раз работает).
+/// соединения на минуту, и Telegram заметно тормозил. Теперь без приманки —
+/// только когда закрыт сам порт 8443 или она не помогла несколько раз
+/// подряд (сеть без заморозки).
 static FAKE_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const FAKE_FAILURES_LIMIT: u32 = 3;
 /// TTL приманки до воркера (см. `ws::fake_handshake`).
@@ -109,8 +115,36 @@ const RELAY_FAKE_PORT: u16 = 8443;
 /// повтором после приманки, и на мобильном интернете с его RTO 3 с не
 /// хватало: удачные попытки обрывались.
 const FAKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
-/// Сколько ждать TCP до 8443. Меньше FAKE_ATTEMPT_TIMEOUT: остаток — на TLS.
+/// Сколько ждать TCP до 8443 по всем адресам воркера вместе. Меньше
+/// FAKE_ATTEMPT_TIMEOUT: остаток — на TLS.
 const FAKE_CONNECT_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Предел на все попытки приманки одного соединения, включая очередь на
+/// подбор TTL (`SWEEP`): Telegram открывает соединения пачками, и без него
+/// последние в очереди ждали десятки секунд.
+const FAKE_BUDGET: Duration = Duration::from_secs(9);
+/// Фора 8443 перед 443 при подключении без приманки (см. `ws::plain`):
+/// с запасом на TCP и TLS, то есть на два-три RTT мобильной сети.
+const PLAIN_HEAD_START: Duration = Duration::from_secs(1);
+
+/// Неудачные TCP-подключения к 8443 подряд и когда порт признан закрытым.
+/// Тогда минуту 8443 не пробуем вовсе: каждая проба — это таймаут. Только
+/// после нескольких подряд — в сети, где 443 до воркера закрыт, одна
+/// случайная неудача отправляла бы все соединения туда.
+struct PortState {
+    /// Неудачи подряд — по раундам, а не по попыткам (см. `PORT_FAILURE_ROUND`).
+    failures: u32,
+    last_failure: Option<std::time::Instant>,
+    closed_at: Option<std::time::Instant>,
+}
+impl PortState {
+    const FRESH: PortState = PortState { failures: 0, last_failure: None, closed_at: None };
+}
+static PORT: std::sync::Mutex<PortState> = std::sync::Mutex::new(PortState::FRESH);
+const PORT_FAILURES_LIMIT: u32 = 3;
+/// Неудачи ближе этого друг к другу — один раунд и считаются за одну:
+/// подбор TTL открывает девять подключений разом, Telegram — пачку своих,
+/// и один сбой сети давал бы «три неудачи подряд» за миллисекунду.
+const PORT_FAILURE_ROUND: Duration = FAKE_CONNECT_TIMEOUT;
 
 /// Ядро без `CONFIG_TCP_MD5SIG` (так на части Android): приманка уходит
 /// без подписи, и TTL уже нельзя брать с запасом — дошедшая до сервера
@@ -172,8 +206,12 @@ pub fn reload(log_tx: &LogSender, bypass: &crate::config::BypassParams) {
     if let Ok(mut failed) = FAKE_FAILED_AT.lock() {
         *failed = None;
     }
+    FAKE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut ttl) = RELAY_TTL.lock() {
         *ttl = None;
+    }
+    if let Ok(mut port) = PORT.lock() {
+        *port = PortState::FRESH;
     }
     let host = paths::read_to_string(CONFIG_FILE).ok().and_then(|text| parse(&text));
     if let Some(h) = &host {
@@ -245,9 +283,8 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let path = format!("/apiws?dst={ip}&port={port}");
-    let ws = tokio::time::timeout(CONNECT_TIMEOUT, ws::connect(relay_host, &path))
+    let ws = ws::connect(relay_host, &path)
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, rust_i18n::t!("err.relay_timeout").into_owned()))?
         // Ошибка идёт в лог, а в тексте бывает полный адрес воркера
         // («host:443: подключение не установилось…»).
         .map_err(|e| std::io::Error::new(e.kind(), e.to_string().replace(relay_host, &masked(relay_host))))?;
@@ -371,10 +408,66 @@ mod ws {
             .ok()
             .and_then(|at| *at)
             .is_some_and(|at| at.elapsed() < FAKE_RETRY_AFTER);
-        if recently_failed {
+        if recently_failed || port_known_closed() {
             return None;
         }
         FAKE_SNI.read().ok()?.clone()
+    }
+
+    /// 8443 недавно признан закрытым (см. `PortState`).
+    fn port_known_closed() -> bool {
+        PORT.lock()
+            .ok()
+            .and_then(|port| port.closed_at)
+            .is_some_and(|at| at.elapsed() < FAKE_RETRY_AFTER)
+    }
+
+    /// Неудачное подключение к 8443. «Сеть недоступна» — не про порт: так
+    /// бывает при смене сети, и закрытым порт от этого не считается.
+    fn note_port_failed(e: &std::io::Error) {
+        if e.kind() == std::io::ErrorKind::NetworkUnreachable {
+            return;
+        }
+        let Ok(mut port) = PORT.lock() else { return };
+        let now = std::time::Instant::now();
+        if port.last_failure.is_some_and(|at| now.duration_since(at) < PORT_FAILURE_ROUND) {
+            return;
+        }
+        port.last_failure = Some(now);
+        port.failures += 1;
+        if port.failures >= PORT_FAILURES_LIMIT {
+            port.failures = 0;
+            port.closed_at = Some(now);
+        }
+    }
+
+    fn note_port_open() {
+        if let Ok(mut port) = PORT.lock() {
+            port.failures = 0;
+            port.last_failure = None;
+        }
+    }
+
+    /// TCP до 8443. Ошибка — всегда `HostUnreachable`: по ней `port_closed`
+    /// отличает закрытый порт от неудачной приманки.
+    async fn connect_fake_port(host: &str) -> std::io::Result<TcpStream> {
+        let unreachable = |e: Box<dyn std::error::Error + Send + Sync>| std::io::Error::new(std::io::ErrorKind::HostUnreachable, e);
+        // Резолв — до предела на подключение и не в счёт закрытого порта:
+        // медленный DNS на холодном кэше — не повод считать порт закрытым.
+        let addrs = crate::dns::resolver::resolve_all(&format!("{host}:{RELAY_FAKE_PORT}")).await;
+        if addrs.is_empty() {
+            return Err(unreachable(rust_i18n::t!("err.no_addresses").into_owned().into()));
+        }
+        match crate::dns::resolver::connect_without_dead_cache(&addrs, FAKE_CONNECT_TIMEOUT).await {
+            Ok(tcp) => {
+                note_port_open();
+                Ok(tcp)
+            }
+            Err(e) => {
+                note_port_failed(&e);
+                Err(unreachable(e.into()))
+            }
+        }
     }
 
     /// Параметры для `split_with_fake`: он берёт из них только имя, TTL и
@@ -416,9 +509,18 @@ mod ws {
         RELAY_TTL.lock().ok().and_then(|ttl| *ttl)
     }
 
-    fn remember_ttl(ttl: Option<u32>) {
+    fn remember_ttl(ttl: u32) {
         if let Ok(mut slot) = RELAY_TTL.lock() {
-            *slot = ttl;
+            *slot = Some(ttl);
+        }
+    }
+
+    /// Забыть TTL, если это всё ещё он: соседний подбор мог уже найти новый.
+    fn forget_ttl(ttl: u32) {
+        if let Ok(mut slot) = RELAY_TTL.lock()
+            && *slot == Some(ttl)
+        {
+            *slot = None;
         }
     }
 
@@ -441,7 +543,7 @@ mod ws {
         let sni = fake_sni()?;
         if !NO_MD5SIG.load(Ordering::Relaxed) {
             // Вторая попытка — потому что неудача бывает и разовой (потерялся
-            // пакет), а откат на 443 в сети с заморозкой хуже ожидания.
+            // пакет), а откат без приманки в сети с заморозкой хуже ожидания.
             let mut unsigned_needed = false;
             for _ in 0..2 {
                 match attempt(host, &decoy(&sni, RELAY_FAKE_TTL, true)).await {
@@ -469,29 +571,37 @@ mod ws {
             }
         }
 
-        if let Some(ttl) = remembered_ttl() {
-            if let Ok(stream) = attempt(host, &decoy(&sni, ttl, false)).await {
-                note_fake_worked();
-                return Some(stream);
-            }
-            // Сеть сменилась: подбираем заново прямо сейчас, а не отдаём
-            // это соединение на 443, где оно замёрзнет.
-            remember_ttl(None);
-        }
         sweep(host, &sni).await
     }
 
-    /// Подбор TTL без md5sig: все кандидаты разом, берётся наибольший с
-    /// живым рукопожатием. Один на всех (`SWEEP`): кто ждал, сначала
-    /// пробует то, что нашёл подбор перед ним.
+    /// Рукопожатие без md5sig: с найденным TTL, а нет его — подбор. Подбор —
+    /// все кандидаты разом, берётся наибольший с живым рукопожатием.
+    ///
+    /// Подбор один на всех (`SWEEP`). Кто ждал, пробует то, что нашёл подбор
+    /// перед ним, — уже без замка: под замком ждущие шли бы по одному, на
+    /// рукопожатие каждый, и последние в пачке упирались бы в `FAKE_BUDGET`.
     async fn sweep(host: &str, sni: &Arc<str>) -> Option<Stream> {
-        let _guard = SWEEP.lock().await;
-        if let Some(ttl) = remembered_ttl() {
-            if let Ok(stream) = attempt(host, &decoy(sni, ttl, false)).await {
-                return Some(stream);
+        let mut tried = None;
+        let _guard = loop {
+            if let Some(ttl) = remembered_ttl().filter(|&ttl| tried != Some(ttl)) {
+                if let Ok(stream) = attempt(host, &decoy(sni, ttl, false)).await {
+                    note_fake_worked();
+                    return Some(stream);
+                }
+                // Сеть сменилась: подбираем заново прямо сейчас, а не отдаём
+                // это соединение без приманки, где оно замёрзнет.
+                forget_ttl(ttl);
+                tried = Some(ttl);
+                continue;
             }
-            remember_ttl(None);
-        }
+            let guard = SWEEP.lock().await;
+            // Пока ждали, подборы перед нами могли признать приманку
+            // бесполезной или найти новый TTL.
+            fake_sni()?;
+            if remembered_ttl().is_none_or(|ttl| tried == Some(ttl)) {
+                break guard;
+            }
+        };
 
         let mut set = tokio::task::JoinSet::new();
         for &ttl in RELAY_TTL_SWEEP {
@@ -513,6 +623,9 @@ mod ws {
             if let Ok((ttl, Ok(stream))) = joined
                 && best.as_ref().is_none_or(|(b, _)| ttl > *b)
             {
+                // Сразу, а не в конце: если `FAKE_BUDGET` оборвёт подбор
+                // во время SWEEP_GRACE, найденное не пропадёт.
+                remember_ttl(ttl);
                 best = Some((ttl, stream));
                 if ttl == RELAY_TTL_SWEEP[0] {
                     break;
@@ -521,11 +634,10 @@ mod ws {
             }
         }
         // Оставшиеся попытки не нужны: JoinSet снимает их при выходе.
-        let Some((ttl, stream)) = best else {
+        let Some((_, stream)) = best else {
             note_fake_failed();
             return None;
         };
-        remember_ttl(Some(ttl));
         note_fake_worked();
         Some(stream)
     }
@@ -535,17 +647,9 @@ mod ws {
     /// по второму дескриптору того же сокета; дальше рукопожатие ведёт
     /// tokio-rustls как обычно.
     async fn handshake(host: &str, fake: Option<&crate::config::BypassParams>) -> std::io::Result<Stream> {
-        let tcp = match fake {
-            Some(_) => {
-                crate::dns::resolver::connect_without_dead_cache(&format!("{host}:{RELAY_FAKE_PORT}"), FAKE_CONNECT_TIMEOUT)
-                    .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::HostUnreachable, e))?
-            }
-            None => crate::dns::resolver::connect(&format!("{host}:443")).await?,
-        };
+        let tcp = connect_fake_port(host).await?;
         let _ = tcp.set_nodelay(true);
-        let name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let name = server_name(host)?;
         let Some(params) = fake else {
             return tls().connect(name, tcp).await;
         };
@@ -568,14 +672,73 @@ mod ws {
         pending.await
     }
 
+    fn server_name(host: &str) -> std::io::Result<rustls::pki_types::ServerName<'static>> {
+        rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    }
+
+    /// TLS до воркера без приманки — на 8443 и 443 внахлёст.
+    ///
+    /// Бывают сети, где до воркера на 443 не подключиться вовсе, а 8443
+    /// открыт, и сети, где 8443 принимает TCP, а TLS на нём виснет (там, где
+    /// DPI нет, 443 работает). Поэтому 8443 стартует первым, 443 — через
+    /// `PLAIN_HEAD_START` или сразу, как 8443 отказал, и берётся первое
+    /// готовое рукопожатие. По очереди каждое соединение во второй сети ждало
+    /// бы таймаут 8443 целиком, и запомнить это негде: порт-то открыт.
+    async fn plain(host: &str) -> std::io::Result<Stream> {
+        let via_443 = async {
+            tokio::time::timeout(CONNECT_TIMEOUT, async {
+                let tcp = crate::dns::resolver::connect(&format!("{host}:443")).await?;
+                let _ = tcp.set_nodelay(true);
+                tls().connect(server_name(host)?, tcp).await
+            })
+            .await
+            .unwrap_or_else(|e| Err(timed_out(e)))
+        };
+        if port_known_closed() {
+            return via_443.await;
+        }
+        let via_8443 = async {
+            tokio::time::timeout(FAKE_ATTEMPT_TIMEOUT, handshake(host, None))
+                .await
+                .unwrap_or_else(|e| Err(timed_out(e)))
+        };
+        tokio::pin!(via_443, via_8443);
+        tokio::select! {
+            result = &mut via_8443 => return match result {
+                Ok(stream) => Ok(stream),
+                Err(_) => via_443.await,
+            },
+            _ = tokio::time::sleep(PLAIN_HEAD_START) => {}
+        }
+        tokio::select! {
+            result = &mut via_8443 => match result {
+                Ok(stream) => Ok(stream),
+                Err(_) => via_443.await,
+            },
+            result = &mut via_443 => match result {
+                Ok(stream) => Ok(stream),
+                Err(e) => via_8443.await.map_err(|_| e),
+            },
+        }
+    }
+
+    fn timed_out(_: tokio::time::error::Elapsed) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, rust_i18n::t!("err.relay_timeout").into_owned())
+    }
+
     pub async fn connect(host: &str, path: &str) -> std::io::Result<Stream> {
         // Приманка не дала рукопожатия (TTL не тот, порт закрыт): без неё
-        // на 443 соединение хотя бы установится.
-        let mut stream = match fake_handshake(host).await {
+        // соединение хотя бы установится там, где DPI нет.
+        let stream = match tokio::time::timeout(FAKE_BUDGET, fake_handshake(host)).await.ok().flatten() {
             Some(stream) => stream,
-            None => handshake(host, None).await?,
+            None => plain(host).await?,
         };
+        tokio::time::timeout(CONNECT_TIMEOUT, upgrade(stream, host, path)).await.map_err(timed_out)?
+    }
 
+    /// Рукопожатие WebSocket поверх готового TLS.
+    async fn upgrade(mut stream: Stream, host: &str, path: &str) -> std::io::Result<Stream> {
         let key = base64::engine::general_purpose::STANDARD.encode(crate::bypass::random::bytes(16));
         let request = format!(
             "GET {path} HTTP/1.1\r\n\

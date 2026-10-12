@@ -48,9 +48,11 @@ enabled = true
 # оптимальным для Cloudflare, а не для вас: на проверке x.com и meduza.io
 # переставали открываться именно поэтому.
 #
-# Google Public DNS, наоборот, опирается на ECS для геолокации: с ним
-# resolve_via_doh надёжнее.
-doh_provider = "https://cloudflare-dns.com/dns-query"
+# Google Public DNS опирается на ECS, но в части сетей его HTTPS
+# перехватывают шлюзы фильтрации, подставляя свой сертификат, и запросы
+# отвергаются. Quad9 в варианте dns11 (9.9.9.11) тоже передаёт ECS и стоит
+# не в сетях Google.
+doh_provider = "https://dns11.quad9.net/dns-query"
 
 # Адрес самого DoH-провайдера. Пустая строка (или отсутствие строки) —
 # обычное поведение: имя провайдера резолвит система.
@@ -61,8 +63,8 @@ doh_provider = "https://cloudflare-dns.com/dns-query"
 # релею надо узнать адрес провайдера — у самого себя. Здесь этот адрес задан
 # заранее, и круг разрывается.
 #
-# Узнать адрес: getent ahostsv4 cloudflare-dns.com
-doh_bootstrap_ip = "1.1.1.1"
+# Узнать адрес: getent ahostsv4 dns11.quad9.net
+doh_bootstrap_ip = "9.9.9.11"
 
 # Умный DNS — только для доменов из smart_dns_domains.txt: нейросетей,
 # которые сами закрыты для России по IP. Он отвечает на них адресами своих
@@ -73,7 +75,7 @@ doh_bootstrap_ip = "1.1.1.1"
 smart_dns_provider = "https://geohide.ru/dns-query"
 # Адрес умного DNS, по той же причине, что doh_bootstrap_ip.
 # Узнать адрес: getent ahostsv4 geohide.ru
-smart_dns_bootstrap_ip = "159.194.200.33"
+smart_dns_bootstrap_ip = "193.233.112.67"
 
 # Дописывать в списки доменов (bypass_domains.txt, smart_dns_domains.txt)
 # те, что появились в новой версии программы. Только добавляет в конец,
