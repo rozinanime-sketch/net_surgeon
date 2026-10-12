@@ -38,9 +38,9 @@ use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+use crate::observability::metrics::Metrics;
 
 /// Метка на переотправленных пакетах. Правило очереди пропускает их мимо —
 /// иначе мы бесконечно перехватывали бы собственные сегменты. Единый источник
@@ -53,40 +53,91 @@ pub const DECOY_SNI: &str = "www.google.com";
 /// Номер очереди NFQUEUE. Тот же указывает правило nftables (`firewall.rs`).
 pub const QUEUE_NUM: u16 = 0;
 
-/// Один рантайм на процесс: очередь нельзя занять дважды. Перезапуск прокси
-/// из интерфейса не поднимает второй цикл, а переиспользует работающий.
-static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Состояние цикла очереди — всё под одним замком.
+///
+/// Цикл один на процесс (очередь нельзя занять дважды) и живёт до его конца:
+/// у NFQUEUE нет чистой отмены. Перезапуск прокси подменяет циклу настройки,
+/// остановка снимает их, и без них пакеты идут как есть.
+///
+/// Флаг «пакетный режим активен» (`packet_mode::is_active`) и индикатор
+/// «слушает» выводятся отсюда же, в [`Loop::sync`], а не выставляются из
+/// разных мест. Раньше их меняли четыре места без общей синхронизации, и флаг
+/// мог остаться `true` без работающего цикла: сокетный путь выключал защиту
+/// от заморозки, а пробы диагностики получали метки впустую — ложный
+/// «ничего не помогло».
+struct Loop {
+    /// Поток цикла запущен (возможно, ещё занимает очередь).
+    running: bool,
+    /// Очередь занята, пакеты идут через цикл.
+    bound: bool,
+    /// Настройки и номер их установки.
+    env: Option<(u64, Arc<LinuxEnv>)>,
+    generation: u64,
+    /// Установка, о которой уже сказано «слушает».
+    announced: Option<u64>,
+}
 
-/// Настройки, по которым работает цикл, с номером установки. Цикл живёт до
-/// конца процесса (у NFQUEUE нет чистой отмены), поэтому перезапуск прокси
-/// подменяет настройки, а остановка снимает: без них пакеты идут как есть.
-/// Раньше цикл до выхода из программы обходил по настройкам первого старта.
-static ENV: RwLock<Option<(u64, Arc<LinuxEnv>)>> = RwLock::new(None);
-static GENERATION: AtomicU64 = AtomicU64::new(0);
+static LOOP: Mutex<Loop> = Mutex::new(Loop { running: false, bound: false, env: None, generation: 0, announced: None });
+
+fn state() -> MutexGuard<'static, Loop> {
+    LOOP.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Loop {
+    /// Сводит флаг активности и индикатор «слушает» с состоянием.
+    fn sync(&mut self) {
+        crate::bypass::packet_mode::set_active(self.bound && self.env.is_some());
+        match &self.env {
+            Some((generation, env)) if self.bound => {
+                if self.announced != Some(*generation) {
+                    self.announced = Some(*generation);
+                    env.metrics.set_transparent_listening(true);
+                    log_t(&env.log_tx, LogLevel::Success, "log.transparent_listening", vec![
+                        ("addr", format!("nfqueue:{QUEUE_NUM}")),
+                    ]);
+                }
+            }
+            Some((_, env)) => {
+                env.metrics.set_transparent_listening(false);
+                self.announced = None;
+            }
+            None => self.announced = None,
+        }
+    }
+}
 
 /// Ставит настройки цикла; номер — для [`uninstall`].
 pub fn install(env: LinuxEnv) -> u64 {
-    let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    if let Ok(mut slot) = ENV.write() {
-        *slot = Some((generation, Arc::new(env)));
-    }
-    if RUNNING.load(Ordering::SeqCst) {
-        crate::bypass::packet_mode::set_active(true);
-    }
+    let mut s = state();
+    s.generation += 1;
+    let generation = s.generation;
+    s.env = Some((generation, Arc::new(env)));
+    s.sync();
     generation
 }
 
 /// Снимает настройки, если их не успел подменить следующий старт.
 pub fn uninstall(generation: u64) {
-    let Ok(mut slot) = ENV.write() else { return };
-    if slot.as_ref().is_some_and(|(g, _)| *g == generation) {
-        *slot = None;
-        crate::bypass::packet_mode::set_active(false);
+    let mut s = state();
+    if s.env.as_ref().is_some_and(|(g, _)| *g == generation) {
+        if let Some((_, env)) = s.env.take() {
+            env.metrics.set_transparent_listening(false);
+        }
+        s.sync();
     }
 }
 
-fn current_env() -> Option<Arc<LinuxEnv>> {
-    ENV.read().ok()?.as_ref().map(|(_, env)| Arc::clone(env))
+fn current_env() -> Option<(u64, Arc<LinuxEnv>)> {
+    state().env.as_ref().map(|(g, env)| (*g, Arc::clone(env)))
+}
+
+/// Ошибка цикла — в лог программы, а не только в stderr: в интерфейсе
+/// stderr не видно, и причина, по которой обход перестал работать, терялась.
+fn log_error(error: &io::Error) {
+    match current_env() {
+        Some((_, env)) => log_t(&env.log_tx, LogLevel::Warning, "log.nfqueue_error", vec![("error", error.to_string())]),
+        None => eprintln!("nfqueue: {error}"),
+    }
 }
 
 /// Стенд seqovl: перехватывает исходящие ClientHello в очереди `queue_num`,
@@ -155,29 +206,14 @@ pub fn open_raw_v4() -> io::Result<RawFd> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mark = MARK;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_MARK,
-            std::ptr::addr_of!(mark).cast(),
-            std::mem::size_of::<u32>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        let e = io::Error::last_os_error();
+    if let Err(e) = set_mark(fd, MARK) {
         unsafe { libc::close(fd) };
         return Err(e);
     }
     Ok(fd)
 }
 
-/// Ставит соединению-пробе fwmark, по которой правило заворачивает её в
-/// очередь несмотря на исключение группы прокси. Иначе проба ушла бы мимо
-/// перехвата и мерила бы прямое соединение вместо техники.
-pub fn set_probe_mark(fd: RawFd) -> io::Result<()> {
-    let mark = crate::bypass::packet_mode::PROBE_FWMARK;
+fn set_mark(fd: RawFd, mark: u32) -> io::Result<()> {
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -191,6 +227,13 @@ pub fn set_probe_mark(fd: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Ставит соединению-пробе fwmark, по которой правило заворачивает её в
+/// очередь несмотря на исключение группы прокси. Иначе проба ушла бы мимо
+/// перехвата и мерила бы прямое соединение вместо техники.
+pub fn set_probe_mark(fd: RawFd) -> io::Result<()> {
+    set_mark(fd, crate::bypass::packet_mode::PROBE_FWMARK)
 }
 
 /// Отправляет готовый IPv4-пакет. Порт в адресе для raw-сокета игнорируется,
@@ -293,6 +336,8 @@ pub struct LinuxEnv {
     pub bypass_domains: Arc<HashSet<String>>,
     pub ip_cache: Arc<IpDomainCache>,
     pub log_tx: LogSender,
+    /// Индикатор «слушает» (см. `Loop::sync`).
+    pub metrics: Arc<Metrics>,
 }
 
 impl LinuxEnv {
@@ -387,8 +432,9 @@ impl RawInjector {
 
 impl Injector for RawInjector {
     fn send(&self, pkt: &[u8]) -> io::Result<()> {
+        // Не молчаливый «успех»: иначе оригинал отбросили бы без замены.
         if pkt.len() < 20 {
-            return Ok(());
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "packet shorter than an IPv4 header"));
         }
         let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
         send_v4(self.fd, pkt, dst)
@@ -401,9 +447,16 @@ impl Drop for RawInjector {
     }
 }
 
+/// Отправить замену до конца не удалось: что делать с оригиналом и почему.
+#[derive(Debug)]
+pub struct Failed {
+    pub disposition: Disposition,
+    pub error: io::Error,
+}
+
 /// Прогоняет один пакет из очереди через общий движок — Linux-двойник тела
 /// виндового `run_tcp`. Переписанные пакеты уходят через `inj`, а вердикт для
-/// оригинала возвращается вызывающему.
+/// оригинала возвращается вызывающему — и при неудаче тоже (см. [`Failed`]).
 ///
 /// Направление берётся из порта: к 443 — исходящий ClientHello (движок решает
 /// технику и отдаёт сегменты), от 443 — ответ сервера (движку для учёта
@@ -414,11 +467,18 @@ pub fn process<E: Env, I: Injector>(
     env: &E,
     inj: &I,
     now: Instant,
-) -> io::Result<Disposition> {
+) -> Result<Disposition, Failed> {
+    // Только IPv4: raw-сокет переотправки отдаёт заголовок сам лишь для v4.
+    // От IPv6 в очереди бережёт правило nft, но если он туда всё же попадёт,
+    // переотправка исказила бы пакет, а оригинал был бы отброшен.
+    if pkt.first().map(|b| b >> 4) != Some(4) {
+        return Ok(Disposition::Accept);
+    }
     let Some(t) = desync::parse(pkt) else { return Ok(Disposition::Accept) };
     if t.dport == HTTPS_PORT {
         // Только ClientHello, как фильтр WinDivert (tcp.Payload[0]==22, [1]==3,
-        // [5]==1). Правило nft ловит все PSH+ACK на 443, поэтому сузим здесь:
+        // [5]==1). Правило nft отбирает так же, но на старом nft (без `@ih`)
+        // ловит все PSH+ACK на 443, поэтому сузим и здесь:
         // иначе движок переписывал бы и каждый последующий пакет данных
         // (аплоады) — впустую гоняя их через userspace и (для seqovl) добавляя
         // приманку к каждому. Поток уже известен, и `outbound` повторил бы
@@ -428,17 +488,26 @@ pub fn process<E: Env, I: Injector>(
         }
         match engine.outbound(pkt, now, env) {
             Outbound::Send(parts) => {
-                for mut p in parts {
+                for (i, mut p) in parts.into_iter().enumerate() {
                     fixup_v4(&mut p);
-                    inj.send(&p)?;
+                    if let Err(error) = inj.send(&p) {
+                        // Ничего не ушло — пусть идёт оригинал. Часть уже
+                        // ушла (приманка) — оригинал поверх неё дал бы
+                        // полутехнику с дублем данных; ядро само повторит
+                        // его, и повтор снова пройдёт через очередь.
+                        let disposition = if i == 0 { Disposition::Accept } else { Disposition::Drop };
+                        return Err(Failed { disposition, error });
+                    }
                 }
                 Ok(Disposition::Drop)
             }
             Outbound::Reset(mut rst) => {
                 // Сброс приложению: адреса в пакете уже развёрнуты на локальный,
-                // raw-сокет доставит его в местный стек.
+                // raw-сокет доставит его в местный стек. Не ушёл — оригинал
+                // всё равно не пропускаем: это ClientHello заблокированного
+                // домена.
                 fixup_v4(&mut rst);
-                inj.send(&rst)?;
+                inj.send(&rst).map_err(|error| Failed { disposition: Disposition::Drop, error })?;
                 Ok(Disposition::Drop)
             }
         }
@@ -450,10 +519,25 @@ pub fn process<E: Env, I: Injector>(
     }
 }
 
+/// Ошибок очереди подряд, после которых цикл сдаётся. Разовые (EINTR,
+/// ENOBUFS при всплеске) не должны выключать обход до ручного перезапуска.
+const MAX_QUEUE_ERRORS_IN_ROW: u32 = 50;
+
+/// Ошибка очереди: в лог и короткая пауза. `Some` — подряд их слишком много,
+/// цикл сдаётся.
+fn queue_error(e: io::Error, errors_in_row: &mut u32) -> Option<io::Error> {
+    *errors_in_row += 1;
+    log_error(&e);
+    if *errors_in_row >= MAX_QUEUE_ERRORS_IN_ROW {
+        return Some(e);
+    }
+    std::thread::sleep(Duration::from_millis(10));
+    None
+}
+
 /// Продуктовый цикл: гоняет полный `Engine` с автоподбором на очереди
-/// `queue_num` по настройкам из [`install`]. Блокирующий; возвращается только
-/// при ошибке очереди или сразу, если цикл уже работает. `on_bound` —
-/// очередь занята, цикл пошёл (или уже шёл).
+/// `queue_num` по настройкам из [`install`]. Блокирующий; возвращается при
+/// стойкой ошибке очереди или сразу, если цикл уже работает.
 ///
 /// Правило заворачивает только исходящие 443 (кроме пакетов с меткой [`MARK`]):
 /// этого хватает, чтобы применить технику. Входящие движок обрабатывать умеет
@@ -462,14 +546,17 @@ pub fn process<E: Env, I: Injector>(
 /// стратегий идёт по сокетным пробам, а не отсюда. Выбор стратегии запускает
 /// диагностику на tokio, поэтому цикл должен работать внутри рантайма
 /// (`Handle::enter` у вызывающего).
-pub fn run(queue_num: u16, on_bound: impl FnOnce()) -> io::Result<()> {
+pub fn run(queue_num: u16) -> io::Result<()> {
     use nfq::{Queue, Verdict};
 
     // Работающий цикл уже держит очередь: второй bind упал бы, а новые
     // настройки он подхватит сам.
-    if RUNNING.swap(true, Ordering::SeqCst) {
-        on_bound();
-        return Ok(());
+    {
+        let mut s = state();
+        if s.running {
+            return Ok(());
+        }
+        s.running = true;
     }
     // Не поднялись raw-сокет или очередь — флаг снимается, иначе повторный
     // старт (перезапуск прокси) молча ничего не сделал бы.
@@ -477,50 +564,81 @@ pub fn run(queue_num: u16, on_bound: impl FnOnce()) -> io::Result<()> {
         let inj = RawInjector::new()?;
         let mut queue = Queue::open()?;
         queue.bind(queue_num)?;
+        // Переполнилась очередь (цикл ненадолго задумался, а браузер открыл
+        // пачку соединений) — ядро пропускает пакеты как есть, а не
+        // выбрасывает. Флаг `bypass` в правиле покрывает лишь «читателя нет».
+        // Старое ядро этого не умеет — работаем и без.
+        let _ = queue.set_fail_open(queue_num, true);
         Ok((inj, queue))
     })();
     let (inj, mut queue) = match opened {
         Ok(opened) => opened,
         Err(e) => {
-            RUNNING.store(false, Ordering::SeqCst);
+            let mut s = state();
+            s.running = false;
+            s.sync();
             return Err(e);
         }
     };
-    let mut engine = Engine::new();
     // Соединения прокси и пробы диагностики должны помечаться с первого же
     // ClientHello — как и на Windows перед стартом потоков перехвата.
-    if current_env().is_some() {
-        crate::bypass::packet_mode::set_active(true);
+    {
+        let mut s = state();
+        s.bound = true;
+        s.sync();
     }
-    on_bound();
 
-    let result = (|| -> io::Result<()> {
-        loop {
-            let mut msg = queue.recv()?;
-            let now = Instant::now();
-            // Прокси остановлен — пакеты идут как есть.
-            let processed = match current_env() {
-                Some(env) => process(msg.get_payload(), &mut engine, &*env, &inj, now),
-                None => Ok(Disposition::Accept),
-            };
-            let verdict = match processed {
-                Ok(Disposition::Drop) => Verdict::Drop,
-                Ok(Disposition::Accept) => Verdict::Accept,
-                Err(e) => {
-                    eprintln!("nfqueue: ошибка обработки, пропускаю пакет: {e}");
-                    Verdict::Accept
+    // Движок — заново на каждую установку настроек: потоки, решённые по
+    // прежним (домен убрали из списка, обход выключили), иначе повторяли бы
+    // старую технику на повторах ClientHello.
+    let mut engine = Engine::new();
+    let mut engine_for = None;
+    let mut errors_in_row = 0u32;
+    let result = loop {
+        let mut msg = match queue.recv() {
+            Ok(msg) => msg,
+            Err(e) => match queue_error(e, &mut errors_in_row) {
+                Some(e) => break Err(e),
+                None => continue,
+            },
+        };
+        let now = Instant::now();
+        // Прокси остановлен — пакеты идут как есть.
+        let processed = match current_env() {
+            Some((generation, env)) => {
+                if engine_for != Some(generation) {
+                    engine = Engine::new();
+                    engine_for = Some(generation);
                 }
-            };
-            msg.set_verdict(verdict);
-            queue.verdict(msg)?;
+                process(msg.get_payload(), &mut engine, &*env, &inj, now)
+            }
+            None => Ok(Disposition::Accept),
+        };
+        let disposition = processed.unwrap_or_else(|failed| {
+            log_error(&failed.error);
+            failed.disposition
+        });
+        msg.set_verdict(match disposition {
+            Disposition::Drop => Verdict::Drop,
+            Disposition::Accept => Verdict::Accept,
+        });
+        match queue.verdict(msg) {
+            Ok(()) => errors_in_row = 0,
+            Err(e) => {
+                if let Some(e) = queue_error(e, &mut errors_in_row) {
+                    break Err(e);
+                }
+            }
         }
-    })();
+    };
 
-    // Сюда попадаем только при ошибке очереди. Снимаем флаги, чтобы перезапуск
-    // прокси мог поднять пакетный режим заново, а сокетный путь снова считал
-    // себя главным (is_active → false включает его freeze-эскалацию).
-    RUNNING.store(false, Ordering::SeqCst);
-    crate::bypass::packet_mode::set_active(false);
+    // Цикл сдался. Флаги снимаются, чтобы перезапуск прокси мог поднять
+    // пакетный режим заново, а сокетный путь снова считал себя главным
+    // (is_active → false включает его freeze-эскалацию).
+    let mut s = state();
+    s.running = false;
+    s.bound = false;
+    s.sync();
     result
 }
 
@@ -642,6 +760,72 @@ mod tests {
         let sent = inj.0.borrow();
         assert_eq!(sent.len(), 1, "без обхода — один пакет");
         assert!(verifies(&sent[0]), "переотправленный пакет с верными суммами");
+    }
+
+    /// Отказывает начиная с отправки номер `fail_from` (с нуля).
+    struct FailingInjector {
+        fail_from: usize,
+        sent: std::cell::Cell<usize>,
+    }
+    impl Injector for FailingInjector {
+        fn send(&self, _: &[u8]) -> io::Result<()> {
+            let n = self.sent.get();
+            self.sent.set(n + 1);
+            if n >= self.fail_from { Err(io::Error::from(io::ErrorKind::PermissionDenied)) } else { Ok(()) }
+        }
+    }
+
+    /// Обход для любого домена техникой disorder — два сегмента.
+    struct DisorderEnv;
+    impl Env for DisorderEnv {
+        fn take_mark(&self, _: u16, _: std::net::IpAddr) -> Option<Mark> {
+            None
+        }
+        fn is_blocked(&self, _: &str) -> bool {
+            false
+        }
+        fn needs_bypass(&self, _: &str) -> bool {
+            true
+        }
+        fn select(&self, _: &str, _: usize) -> Selected {
+            Selected::new(crate::engine::strategy::Strategy::Disorder, None)
+        }
+        fn record(&self, _: &str, _: Selected, _: bool) {}
+        fn remember(&self, _: IpAddr, _: &str) {}
+        fn lookup(&self, _: IpAddr) -> Option<String> {
+            None
+        }
+        fn decoy(&self, len: usize) -> Vec<u8> {
+            vec![0; len]
+        }
+        fn log_intercepted(&self, _: &str, _: IpAddr, _: bool) {}
+        fn log_applied(&self, _: &str, _: &str) {}
+        fn log_blocked(&self, _: &str) {}
+    }
+
+    /// Замена не ушла вовсе — оригинал пропускается; ушла частично —
+    /// оригинал не идёт поверх неё.
+    #[test]
+    fn failed_reinjection_decides_by_what_already_left() {
+        let pkt = v4_tcp(&tls::build_client_hello_sized("discord.com", 517));
+
+        let none_sent = FailingInjector { fail_from: 0, sent: std::cell::Cell::new(0) };
+        let failed = process(&pkt, &mut Engine::new(), &DisorderEnv, &none_sent, Instant::now()).unwrap_err();
+        assert_eq!(failed.disposition, Disposition::Accept);
+
+        let first_sent = FailingInjector { fail_from: 1, sent: std::cell::Cell::new(0) };
+        let failed = process(&pkt, &mut Engine::new(), &DisorderEnv, &first_sent, Instant::now()).unwrap_err();
+        assert_eq!(failed.disposition, Disposition::Drop);
+    }
+
+    #[test]
+    fn ipv6_is_passed_through_untouched() {
+        let mut pkt = v4_tcp(&tls::build_client_hello_sized("discord.com", 517));
+        pkt[0] = 0x60;
+        let inj = VecInjector(std::cell::RefCell::new(Vec::new()));
+        let disp = process(&pkt, &mut Engine::new(), &DisorderEnv, &inj, Instant::now()).unwrap();
+        assert_eq!(disp, Disposition::Accept);
+        assert!(inj.0.borrow().is_empty());
     }
 
     #[test]

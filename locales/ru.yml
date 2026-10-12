@@ -245,6 +245,7 @@ log.live_disagreement: "%{domain}: %{strategy} обещала увереннос
 log.socks5_udp_forward_error: "SOCKS5 UDP: не удалось переслать пакет на %{addr}: %{error}"
 log.socks5_udp_reply_error: "SOCKS5 UDP: не удалось вернуть ответ клиенту %{addr}: %{error}"
 log.transparent_listening: "Прозрачный режим слушает: %{addr} (нужно правило iptables)"
+log.nfqueue_error: "пакетный режим: %{error}"
 log.transparent_no_dst: "Прозрачный режим: не удалось узнать исходный адрес — проверьте правило iptables"
 log.transparent_tunnel: "Перехвачено: %{domain} -> %{addr} (bypass: %{bypass})"
 log.transparent_fallback_addr: "%{domain}: адрес %{dead} не отвечает, подключаюсь к %{addr}"

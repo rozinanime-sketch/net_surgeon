@@ -291,24 +291,19 @@ async fn run_packet_mode(
         bypass_domains,
         ip_cache,
         log_tx: log_tx.clone(),
+        // «Слушает» выставляет сам цикл — когда очередь занята и настройки
+        // стоят (см. nfqueue::Loop::sync).
+        metrics,
     };
     let generation = nfqueue::install(env);
     let handle = tokio::runtime::Handle::current();
 
     let log = log_tx.clone();
-    let bound_metrics = Arc::clone(&metrics);
     let spawned = std::thread::Builder::new()
         .name("nfqueue-tcp".into())
         .spawn(move || {
             let _rt = handle.enter();
-            // «Слушает» — только когда очередь занята, а не до попытки.
-            let on_bound = || {
-                bound_metrics.set_transparent_listening(true);
-                log_t(&log, LogLevel::Success, "log.transparent_listening", vec![
-                    ("addr", format!("nfqueue:{QUEUE_NUM}")),
-                ]);
-            };
-            if let Err(e) = nfqueue::run(QUEUE_NUM, on_bound) {
+            if let Err(e) = nfqueue::run(QUEUE_NUM) {
                 log_t(&log, LogLevel::Error, "log.bind_error", vec![
                     ("addr", format!("nfqueue:{QUEUE_NUM}")),
                     ("error", e.to_string()),
@@ -324,7 +319,6 @@ async fn run_packet_mode(
 
     token.cancelled().await;
     nfqueue::uninstall(generation);
-    metrics.set_transparent_listening(false);
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -245,6 +245,7 @@ log.live_disagreement: "%{domain}: %{strategy} promised confidence %{predicted},
 log.socks5_udp_forward_error: "SOCKS5 UDP: failed to forward packet to %{addr}: %{error}"
 log.socks5_udp_reply_error: "SOCKS5 UDP: failed to return reply to client %{addr}: %{error}"
 log.transparent_listening: "Transparent mode listening: %{addr} (iptables rule required)"
+log.nfqueue_error: "packet mode: %{error}"
 log.transparent_no_dst: "Transparent mode: could not determine original destination — check the iptables rule"
 log.transparent_tunnel: "Intercepted: %{domain} -> %{addr} (bypass: %{bypass})"
 log.transparent_fallback_addr: "%{domain}: %{dead} does not answer, connecting to %{addr}"
