@@ -335,8 +335,8 @@ mod imp {
     }
 
     impl Env for WinEnv {
-        fn take_mark(&self, local_port: u16) -> Option<crate::bypass::packet_mode::Mark> {
-            crate::bypass::packet_mode::take(local_port)
+        fn take_mark(&self, local_port: u16, remote: std::net::IpAddr) -> Option<crate::bypass::packet_mode::Mark> {
+            crate::bypass::packet_mode::take(local_port, remote)
         }
         fn is_blocked(&self, domain: &str) -> bool {
             crate::block::is_blocked(domain)

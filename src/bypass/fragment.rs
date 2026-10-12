@@ -105,16 +105,16 @@ where
     }
     .await;
 
-    // Пауза ПЕРЕД восстановлением TTL — не для DPI, а из-за гонки с ядром.
-    // `flush()` у TCP-сокета ничего не гарантирует: write_all лишь скопировал
-    // данные в буфер ядра, а момент передачи выбирает оно само. Если вернуть
-    // обычный TTL раньше, чем сегмент ушёл, он уйдёт с нормальным TTL, дойдёт
-    // до сервера, и disorder молча выродится в обычный сплит.
-    //
-    // Несколько миллисекунд достаточно для передачи и несопоставимо меньше
-    // RTO (сотни миллисекунд), поэтому ретрансмит всё равно получит
-    // восстановленный TTL.
-    tokio::time::sleep(Duration::from_millis(3)).await;
+    // Ждём ухода сегмента ПЕРЕД восстановлением TTL — не для DPI, а из-за
+    // гонки с ядром. `flush()` у TCP-сокета ничего не гарантирует: write_all
+    // лишь скопировал данные в буфер ядра, а момент передачи выбирает оно
+    // само (пейсинг, занятый воркер). Если вернуть обычный TTL раньше, чем
+    // сегмент ушёл, он уйдёт с нормальным TTL, дойдёт до сервера, и disorder
+    // молча выродится в обычный сплит. Поэтому не пауза наугад, а очередь
+    // сокета; если ядро о ней не отвечает — прежние несколько миллисекунд.
+    if !socket::wait_sent(fd, DISORDER_SEND_WAIT).await {
+        tokio::time::sleep(Duration::from_millis(3)).await;
+    }
 
     // TTL возвращаем в любом случае: ретрансмит первой половины должен уйти
     // с нормальным TTL, иначе он тоже не дойдёт и соединение зависнет.
@@ -130,6 +130,10 @@ where
 
     Ok(Some(SplitInfo { first: split_pos, second: data.len() - split_pos }))
 }
+
+/// Сколько disorder ждёт ухода первой половины с низким TTL. Обычно это
+/// доли миллисекунды: буфер сокета в начале соединения пуст.
+const DISORDER_SEND_WAIT: Duration = Duration::from_millis(500);
 
 /// Возвращает сокету обычный TTL после низкого.
 ///
@@ -193,21 +197,39 @@ pub async fn split_with_fake<W>(
 where
     W: tokio::io::AsyncWriteExt + Unpin,
 {
+    let Some(decoy) = send_decoy(server_writer, fd, data, params).await? else {
+        return Ok(None);
+    };
+    Ok(Some(FakeInfo { decoy, real: data.len() }))
+}
+
+/// Общая часть fake и fake + disorder: приманка на номерах `real`, которые
+/// потом займёт ретрансмит настоящих данных. Возвращает размер приманки;
+/// `Ok(None)` — техника здесь неприменима, ничего не отправлено.
+async fn send_decoy<W>(
+    server_writer: &mut W,
+    fd: RawSock,
+    real: &[u8],
+    params: &crate::config::BypassParams,
+) -> std::io::Result<Option<usize>>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
     if !socket::fake_supported() {
         return Ok(None);
     }
-    // Приманка обязана занять ровно столько номеров, сколько настоящий
-    // пакет: ретрансмит повторяет их байт в байт.
-    let Some(decoy) = super::tls::build_decoy_hello(&params.fake_sni, data.len()) else {
+    // Приманка обязана занять ровно столько номеров, сколько настоящие
+    // данные: ретрансмит повторяет их байт в байт.
+    let Some(decoy) = super::tls::build_decoy_hello(&params.fake_sni, real.len()) else {
         return Ok(None);
     };
 
     // Всё записанное раньше должно уйти до приманки, мимо подмены.
     server_writer.flush().await?;
-    if !socket::send_fake(fd, &decoy, data, params.fake_ttl, params.fake_md5sig).await? {
+    if !socket::send_fake(fd, &decoy, real, params.fake_ttl, params.fake_md5sig).await? {
         return Ok(None);
     }
-    Ok(Some(FakeInfo { decoy: decoy.len(), real: data.len() }))
+    Ok(Some(decoy.len()))
 }
 
 /// Как прошла техника fake + disorder — для лога вызывающей стороны.
@@ -263,23 +285,17 @@ where
     let (first, second) = data.split_at(pos);
 
     // Приманка ровно в размер первой половины: ретрансмит повторит её номера
-    // байт в байт настоящей первой половиной.
-    let Some(decoy) = super::tls::build_decoy_hello(&params.fake_sni, first.len()) else {
+    // байт в байт настоящей первой половиной. Возвращает управление, как
+    // только приманка ушла: TTL уже восстановлен, а настоящая первая половина
+    // ждёт ретрансмита на `[S, pos)`.
+    let Some(decoy) = send_decoy(server_writer, fd, first, params).await? else {
         return Ok(None);
     };
-
-    // Всё записанное раньше должно уйти до приманки, мимо подмены.
-    server_writer.flush().await?;
-    // send_fake возвращает управление, как только приманка ушла: TTL уже
-    // восстановлен, а настоящая первая половина ждёт ретрансмита на `[S, pos)`.
-    if !socket::send_fake(fd, &decoy, first, params.fake_ttl, params.fake_md5sig).await? {
-        return Ok(None);
-    }
     // Вторая половина — с обычным TTL и номером S+pos: доходит раньше ретрансмита.
     server_writer.write_all(second).await?;
     server_writer.flush().await?;
 
-    Ok(Some(FakeDisorderInfo { decoy: decoy.len(), first: first.len(), second: second.len() }))
+    Ok(Some(FakeDisorderInfo { decoy, first: first.len(), second: second.len() }))
 }
 
 /// OOB: между половинами ClientHello вставляется мусорный байт с флагом URG.

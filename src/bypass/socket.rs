@@ -171,17 +171,52 @@ pub fn set_ttl(fd: RawSock, ttl: u32) -> bool {
     };
 
     let value = ttl as libc::c_int;
-    let rc = unsafe {
+    let set = |level, name| unsafe {
         libc::setsockopt(
             fd,
             level,
             name,
             &value as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
+        ) == 0
     };
 
-    rc == 0
+    let ok = set(level, name);
+    // IPv6-сокет к IPv4-mapped адресу шлёт обычный IPv4, а у него TTL берётся
+    // из IP_TTL — IPV6_UNICAST_HOPS на такой пакет не действует, и приманка
+    // ушла бы с обычным TTL. Ставится заодно и без проверки: на чистом IPv6
+    // опция ни на что не влияет.
+    if ok && domain == libc::AF_INET6 {
+        set(libc::IPPROTO_IP, libc::IP_TTL);
+    }
+    ok
+}
+
+/// Ждёт, пока все записанные в сокет байты уйдут в сеть хотя бы раз
+/// (`SIOCOUTQNSD` = 0), но не дольше `max`. `false` — ядро не отвечает на
+/// запрос: узнать, ушли ли данные, нельзя.
+///
+/// Нужна там, где опции сокета (TTL, MD5) меняются на время одного
+/// сегмента: опция берётся в момент передачи, а не записи в очередь.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub async fn wait_sent(fd: RawSock, max: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + max;
+    loop {
+        match unsent_bytes(fd) {
+            None => return false,
+            Some(0) => return true,
+            Some(_) if std::time::Instant::now() >= deadline => return true,
+            Some(_) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+        }
+    }
+}
+
+/// Без `SIOCOUTQNSD` узнать нельзя — пауза в несколько миллисекунд, которой
+/// на свежем соединении обычно хватает.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub async fn wait_sent(_fd: RawSock, _max: std::time::Duration) -> bool {
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    true
 }
 
 /// Отправляет один байт как out-of-band (флаг URG).
@@ -256,7 +291,15 @@ pub fn get_ttl(sock: RawSock) -> Option<u32> {
 #[cfg(windows)]
 pub fn set_ttl(sock: RawSock, ttl: u32) -> bool {
     with_sock(sock, |s| match is_ipv6(&s) {
-        Some(true) => s.set_unicast_hops_v6(ttl).is_ok(),
+        Some(true) => {
+            let ok = s.set_unicast_hops_v6(ttl).is_ok();
+            // IPv4-mapped соединение идёт по IPv4 и берёт TTL из IP_TTL
+            // (см. версию для Linux); на чистом IPv6 опция не влияет.
+            if ok {
+                let _ = s.set_ttl_v4(ttl);
+            }
+            ok
+        }
         Some(false) => s.set_ttl_v4(ttl).is_ok(),
         None => false,
     })
@@ -390,6 +433,13 @@ pub async fn send_fake(fd: RawSock, decoy: &[u8], real: &[u8], ttl: u32, md5sig:
     if decoy.len() != real.len() || decoy.is_empty() {
         return Ok(false);
     }
+    // Без SIOCOUTQNSD не узнать, ушла ли приманка (так бывает на Android,
+    // где SELinux режет ioctl сокета). Вернуть TTL наугад нельзя: приманка
+    // ушла бы с обычным TTL, дошла до сервера, и настоящий ClientHello он
+    // выбросил бы как повтор. Лучше откатиться на другую технику.
+    if unsent_bytes(fd).is_none() {
+        return Ok(false);
+    }
     let Some(page) = FakePage::new(decoy) else {
         return Ok(false);
     };
@@ -409,10 +459,7 @@ pub async fn send_fake(fd: RawSock, decoy: &[u8], real: &[u8], ttl: u32, md5sig:
     if sent.is_ok() {
         // TTL берётся в момент передачи, а не записи в очередь: вернуть его
         // раньше — и приманка уйдёт с обычным и дойдёт до сервера.
-        let deadline = std::time::Instant::now() + FAKE_SEND_WAIT;
-        while unsent_bytes(fd).is_some_and(|n| n > 0) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
+        wait_sent(fd, FAKE_SEND_WAIT).await;
     }
     // Если приманка так и не ушла, подмена безвредна: уйдут сразу настоящие
     // данные, просто без обмана DPI.
@@ -528,9 +575,14 @@ async fn splice_page(fd: RawSock, page: &FakePage) -> std::io::Result<()> {
             }
             continue;
         }
+        if n == 0 {
+            // Ни байта и без ошибки: errno здесь от чужого вызова, отдавать
+            // его нельзя.
+            break;
+        }
         let err = std::io::Error::last_os_error();
         // Сокет неблокирующий: буфер занят — уступаем рантайму и пробуем снова.
-        if n < 0 && err.kind() == std::io::ErrorKind::WouldBlock {
+        if err.kind() == std::io::ErrorKind::WouldBlock {
             tokio::task::yield_now().await;
             continue;
         }

@@ -15,6 +15,7 @@
 //! обрастают условиями компиляции, а без перехвата ничего не делают.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -48,8 +49,15 @@ const MARK_TTL: Duration = Duration::from_secs(60);
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-fn marks() -> &'static Mutex<HashMap<u16, (Mark, Instant)>> {
-    static MARKS: OnceLock<Mutex<HashMap<u16, (Mark, Instant)>>> = OnceLock::new();
+/// Ключ метки: локальный порт и адрес сервера. Одного порта мало — ядро
+/// отдаёт тот же эфемерный порт соединениям к разным адресам, и чужое
+/// соединение с совпавшим портом забрало бы метку прокси. Адрес приводится
+/// к каноническому виду: у сокета он может быть IPv4-mapped, а в пакете —
+/// чистый IPv4.
+type Key = (u16, IpAddr);
+
+fn marks() -> &'static Mutex<HashMap<Key, (Mark, Instant)>> {
+    static MARKS: OnceLock<Mutex<HashMap<Key, (Mark, Instant)>>> = OnceLock::new();
     MARKS.get_or_init(Default::default)
 }
 
@@ -65,25 +73,35 @@ pub fn set_active(active: bool) {
     }
 }
 
-/// Помечает соединение по его локальному порту. Звать до первой записи.
+/// Помечает соединение по локальному порту и адресу сервера. Звать до
+/// первой записи.
 pub fn mark(stream: &tokio::net::TcpStream, mark: Mark) {
     if !is_active() {
         return;
     }
-    let Ok(local) = stream.local_addr() else { return };
-    mark_port(local.port(), mark);
+    let (Ok(local), Ok(peer)) = (stream.local_addr(), stream.peer_addr()) else { return };
+    mark_port(local.port(), peer.ip(), mark);
 }
 
-fn mark_port(port: u16, mark: Mark) {
+fn mark_port(port: u16, remote: IpAddr, mark: Mark) {
     let now = Instant::now();
     let mut marks = marks().lock().unwrap_or_else(|e| e.into_inner());
     marks.retain(|_, (_, at)| now.duration_since(*at) < MARK_TTL);
-    marks.insert(port, (mark, now));
+    marks.insert((port, remote.to_canonical()), (mark, now));
 }
 
-/// Забирает метку локального порта: для перехвата, увидевшего ClientHello.
-pub fn take(port: u16) -> Option<Mark> {
-    marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&port).map(|(m, _)| m)
+/// Забирает метку соединения: для перехвата, увидевшего ClientHello.
+///
+/// Просроченная метка не отдаётся. Чистка в `mark_port` идёт только при
+/// новой метке, и без этой проверки метка соединения, закрытого без
+/// ClientHello, досталась бы чужому соединению, занявшему порт хоть через
+/// час.
+pub fn take(port: u16, remote: IpAddr) -> Option<Mark> {
+    let (mark, at) = marks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(port, remote.to_canonical()))?;
+    (at.elapsed() < MARK_TTL).then_some(mark)
 }
 
 /// Доступна ли техника на уровне пакетов. Две TLS-записи и OOB меняют
@@ -99,9 +117,39 @@ mod tests {
 
     #[test]
     fn marks_are_taken_once() {
-        mark_port(40001, Mark::Probe(Strategy::Fake));
-        assert_eq!(take(40001), Some(Mark::Probe(Strategy::Fake)));
-        assert_eq!(take(40001), None);
+        let server: IpAddr = [192, 0, 2, 1].into();
+        mark_port(40001, server, Mark::Probe(Strategy::Fake));
+        assert_eq!(take(40001, server), Some(Mark::Probe(Strategy::Fake)));
+        assert_eq!(take(40001, server), None);
+    }
+
+    #[test]
+    fn mark_belongs_to_its_server_only() {
+        let ours: IpAddr = [192, 0, 2, 2].into();
+        let other: IpAddr = [198, 51, 100, 2].into();
+        mark_port(40002, ours, Mark::Own);
+        assert_eq!(take(40002, other), None, "чужое соединение с тем же портом");
+        assert_eq!(take(40002, ours), Some(Mark::Own));
+    }
+
+    #[test]
+    fn mapped_and_plain_ipv4_are_one_server() {
+        let mapped: IpAddr = "::ffff:192.0.2.3".parse().unwrap();
+        let plain: IpAddr = [192, 0, 2, 3].into();
+        mark_port(40003, mapped, Mark::Own);
+        assert_eq!(take(40003, plain), Some(Mark::Own));
+    }
+
+    #[test]
+    fn expired_mark_is_not_handed_out() {
+        let server: IpAddr = [192, 0, 2, 4].into();
+        let stale = Instant::now().checked_sub(MARK_TTL + Duration::from_secs(1));
+        let Some(stale) = stale else { return };
+        marks()
+            .lock()
+            .unwrap()
+            .insert((40004, server), (Mark::Own, stale));
+        assert_eq!(take(40004, server), None);
     }
 
     #[test]

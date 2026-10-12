@@ -275,8 +275,8 @@ impl LinuxEnv {
 }
 
 impl Env for LinuxEnv {
-    fn take_mark(&self, local_port: u16) -> Option<Mark> {
-        crate::bypass::packet_mode::take(local_port)
+    fn take_mark(&self, local_port: u16, remote: std::net::IpAddr) -> Option<Mark> {
+        crate::bypass::packet_mode::take(local_port, remote)
     }
     fn is_blocked(&self, domain: &str) -> bool {
         crate::block::is_blocked(domain)
@@ -544,7 +544,7 @@ mod tests {
     /// Хватает, чтобы проверить направление и вердикты `process`.
     struct FakeEnv;
     impl Env for FakeEnv {
-        fn take_mark(&self, _: u16) -> Option<Mark> {
+        fn take_mark(&self, _: u16, _: std::net::IpAddr) -> Option<Mark> {
             None
         }
         fn is_blocked(&self, _: &str) -> bool {

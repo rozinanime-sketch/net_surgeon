@@ -293,13 +293,7 @@ pub fn build_client_hello_sized(sni: &str, target: usize) -> Vec<u8> {
     let mut ext = Vec::new();
 
     // server_name — то, ради чего всё и затевается
-    let sni_bytes = sni.as_bytes();
-    let mut sni_ext = Vec::new();
-    sni_ext.extend_from_slice(&((sni_bytes.len() + 3) as u16).to_be_bytes());
-    sni_ext.push(0x00);
-    sni_ext.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
-    sni_ext.extend_from_slice(sni_bytes);
-    push_ext(&mut ext, 0x0000, &sni_ext);
+    push_ext(&mut ext, 0x0000, &server_name_ext(sni));
 
     // ec_point_formats: uncompressed
     push_ext(&mut ext, 0x000b, &[0x01, 0x00]);
@@ -353,13 +347,28 @@ pub fn build_client_hello_sized(sni: &str, target: usize) -> Vec<u8> {
     body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
     body.extend_from_slice(&ext);
 
-    let mut handshake = vec![0x01];
-    handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..4]);
-    handshake.extend_from_slice(&body);
+    wrap_client_hello(&body)
+}
 
-    let mut record = vec![0x16, 0x03, 0x01];
-    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-    record.extend_from_slice(&handshake);
+/// Данные расширения server_name: list_len(2) entry_type(1) name_len(2) name.
+fn server_name_ext(sni: &str) -> Vec<u8> {
+    let name = sni.as_bytes();
+    let mut out = Vec::with_capacity(5 + name.len());
+    out.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+    out.push(0x00);
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name);
+    out
+}
+
+/// Оборачивает тело ClientHello в заголовок handshake и TLS-запись.
+fn wrap_client_hello(body: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(9 + body.len());
+    record.extend_from_slice(&[0x16, 0x03, 0x01]);
+    record.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+    record.push(0x01);
+    record.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..4]);
+    record.extend_from_slice(body);
     record
 }
 
@@ -378,14 +387,8 @@ pub fn build_decoy_hello(sni: &str, target: usize) -> Option<Vec<u8>> {
         return Some(full);
     }
 
-    let sni_bytes = sni.as_bytes();
-    let mut sni_ext = Vec::new();
-    sni_ext.extend_from_slice(&((sni_bytes.len() + 3) as u16).to_be_bytes());
-    sni_ext.push(0x00);
-    sni_ext.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
-    sni_ext.extend_from_slice(sni_bytes);
     let mut ext = Vec::new();
-    push_ext(&mut ext, 0x0000, &sni_ext);
+    push_ext(&mut ext, 0x0000, &server_name_ext(sni));
     push_ext(&mut ext, 0x002b, &[0x04, 0x03, 0x04, 0x03, 0x03]);
 
     let suites: &[u8] = &[0x13, 0x01, 0x13, 0x02, 0xc0, 0x2b, 0xc0, 0x2f];
@@ -410,12 +413,7 @@ pub fn build_decoy_hello(sni: &str, target: usize) -> Option<Vec<u8>> {
     body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
     body.extend_from_slice(&ext);
 
-    let mut handshake = vec![0x01];
-    handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..4]);
-    handshake.extend_from_slice(&body);
-    let mut record = vec![0x16, 0x03, 0x01];
-    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-    record.extend_from_slice(&handshake);
+    let record = wrap_client_hello(&body);
     (record.len() == target).then_some(record)
 }
 

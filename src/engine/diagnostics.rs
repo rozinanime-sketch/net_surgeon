@@ -451,10 +451,25 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
     let write_result: std::io::Result<()> = match strategy {
         _ if packet_mode => writer.write_all(hello).await,
         FragStrategy::None => writer.write_all(hello).await,
-        FragStrategy::SniSplit => fragment::split_at_sni(&mut writer, hello, bypass_params.split_delay_ms).await.map(|_| ()),
-        FragStrategy::TlsRecord => fragment::tls_record_split(&mut writer, hello, bypass_params.split_delay_ms).await.map(|_| ()),
-        FragStrategy::Disorder => fragment::split_with_disorder(&mut writer, fd, hello, bypass_params.disorder_ttl).await.map(|_| ()),
-        FragStrategy::Oob => fragment::split_with_oob(&mut writer, fd, hello).await.map(|_| ()),
+        // `Ok(None)` у техник ниже — ничего не отправлено (нет SNI, ядро
+        // отказало в смене TTL). Тогда ClientHello уходит как есть, иначе
+        // проба молча ждала бы ответа на ничего и записала бы блокировку.
+        FragStrategy::SniSplit => match fragment::split_at_sni(&mut writer, hello, bypass_params.split_delay_ms).await {
+            Ok(None) => writer.write_all(hello).await,
+            r => r.map(|_| ()),
+        },
+        FragStrategy::TlsRecord => match fragment::tls_record_split(&mut writer, hello, bypass_params.split_delay_ms).await {
+            Ok(None) => writer.write_all(hello).await,
+            r => r.map(|_| ()),
+        },
+        FragStrategy::Disorder => match fragment::split_with_disorder(&mut writer, fd, hello, bypass_params.disorder_ttl).await {
+            Ok(None) => writer.write_all(hello).await,
+            r => r.map(|_| ()),
+        },
+        FragStrategy::Oob => match fragment::split_with_oob(&mut writer, fd, hello).await {
+            Ok(None) => writer.write_all(hello).await,
+            r => r.map(|_| ()),
+        },
         // Приманку не отправить (Windows) — ClientHello уходит как есть,
         // иначе проба молча ждала бы ответа на ничего.
         FragStrategy::Fake => match fragment::split_with_fake(&mut writer, fd, hello, bypass_params).await {

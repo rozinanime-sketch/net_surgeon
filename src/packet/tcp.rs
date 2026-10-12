@@ -74,7 +74,7 @@ pub fn filter(port: u16, telegram: Option<&[(Ipv4Addr, u8)]>) -> String {
 
 /// Всё, что перехвату нужно от остальной программы.
 pub trait Env {
-    fn take_mark(&self, local_port: u16) -> Option<Mark>;
+    fn take_mark(&self, local_port: u16, remote: IpAddr) -> Option<Mark>;
     fn is_blocked(&self, domain: &str) -> bool;
     fn needs_bypass(&self, domain: &str) -> bool;
     fn select(&self, domain: &str, hello_len: usize) -> Selected;
@@ -154,7 +154,7 @@ impl Engine {
         }
 
         let payload = t.payload(pkt);
-        let (kind, technique) = match env.take_mark(t.sport) {
+        let (kind, technique) = match env.take_mark(t.sport, t.dst) {
             Some(Mark::Own) => (Kind::Own, Technique::Pass),
             Some(Mark::Probe(strategy)) => (Kind::Plain, technique_for(strategy, payload, env)),
             None => match self.decide(pkt, &t, now, env) {
@@ -310,7 +310,7 @@ mod tests {
     }
 
     impl Env for FakeEnv {
-        fn take_mark(&self, port: u16) -> Option<Mark> {
+        fn take_mark(&self, port: u16, _: IpAddr) -> Option<Mark> {
             self.marks.borrow_mut().remove(&port)
         }
         fn is_blocked(&self, _: &str) -> bool {
