@@ -304,7 +304,6 @@ startup.system_proxy_restored: "Windows system proxy restored to previous settin
 startup.system_proxy_restore_failed: "Could not restore the Windows system proxy: %{error} — turn it off in Settings → Network & Internet → Proxy"
 startup.config_reloaded: "Config and domain list reloaded"
 startup.config_reload_failed: "Config not reloaded, keeping the previous one: %{error}"
-startup.resolver_restart_needed: "resolve_via_doh, doh_provider and smart_dns_provider for outgoing connections apply only after restarting the program"
 log.telegram_relay_active: "Telegram via relay %{host}"
 log.telegram_relayed: "Telegram → relay: %{addr}"
 log.telegram_relay_error: "Telegram relay unreachable (%{addr}): %{error}"

@@ -86,9 +86,14 @@ pub fn apply() -> Vec<ListUpdate> {
 }
 
 fn apply_offer(offer: &Offer) -> Option<ListUpdate> {
-    let offered: HashSet<String> = paths::read_to_string(offer.mark)
-        .map(|t| t.lines().map(|l| l.trim().to_string()).collect())
-        .unwrap_or_default();
+    // «Ещё ничего не предлагали» — только если метки нет. Не читается по
+    // другой причине — не дописываем: иначе вернулись бы домены, которые
+    // пользователь из списка сам удалил.
+    let offered: HashSet<String> = match paths::read_to_string(offer.mark) {
+        Ok(text) => text.lines().map(|l| l.trim().to_string()).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+        Err(e) => return Some(ListUpdate { file: offer.file, result: Err(e.to_string()) }),
+    };
     let fresh: Vec<&str> = offer.domains.iter().copied().filter(|d| !offered.contains(*d)).collect();
     if fresh.is_empty() {
         return None;
@@ -108,7 +113,10 @@ fn apply_offer(offer: &Offer) -> Option<ListUpdate> {
     mark.extend(&fresh);
     mark.sort_unstable();
     if let Err(e) = paths::write_atomic(offer.mark, &(mark.join("\n") + "\n")) {
-        return fail(e);
+        // Список уже дописан — так и сообщаем, а не «не удалось».
+        if added.is_empty() {
+            return fail(e);
+        }
     }
 
     (!added.is_empty()).then_some(ListUpdate { file: offer.file, result: Ok(added) })

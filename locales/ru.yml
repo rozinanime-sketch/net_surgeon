@@ -304,7 +304,6 @@ startup.system_proxy_restored: "Системный прокси Windows возв
 startup.system_proxy_restore_failed: "Не удалось вернуть системный прокси Windows: %{error} — выключите его в «Параметры → Сеть и Интернет → Прокси-сервер»"
 startup.config_reloaded: "Конфиг и список доменов перечитаны"
 startup.config_reload_failed: "Конфиг не перечитан, работаю со старым: %{error}"
-startup.resolver_restart_needed: "resolve_via_doh, doh_provider и smart_dns_provider для исходящих подключений применятся только после перезапуска программы"
 log.telegram_relay_active: "Telegram через ретранслятор %{host}"
 log.telegram_relayed: "Telegram → ретранслятор: %{addr}"
 log.telegram_relay_error: "Ретранслятор Telegram недоступен (%{addr}): %{error}"

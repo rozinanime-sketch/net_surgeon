@@ -22,8 +22,11 @@
 //! 3. каталог исполняемого файла и его родители — для `target/release/…`
 //!    и для установленного бинаря, лежащего рядом со своим конфигом.
 //!
-//! Признак нужного каталога — наличие `config.toml`: без него программа всё
-//! равно не стартует, так что он и есть естественный маркер.
+//! Признак нужного каталога — `config.toml` рядом с `bypass_domains.txt`.
+//! Один `config.toml` — слишком частое имя: запущенный из чужого проекта
+//! (Hugo, Netlify) бинарь брал его конфиг и писал туда свои файлы. Если
+//! такой пары нет нигде, у каталога исполняемого файла хватает и одного
+//! `config.toml` — это своя установка, где список могли удалить.
 //!
 //! # Почему запись через временный файл
 //!
@@ -39,6 +42,8 @@ use std::sync::OnceLock;
 
 /// Файл-маркер каталога данных.
 const ANCHOR: &str = "config.toml";
+/// Второй маркер: файл, который есть только у net_surgeon.
+const COMPANION: &str = "bypass_domains.txt";
 
 /// Насколько высоко подниматься в поисках якоря.
 ///
@@ -51,11 +56,16 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Ищет каталог с файлом `name`, начиная с `start` и поднимаясь вверх.
 fn find_upwards(start: &Path, name: &str, limit: usize) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .take(limit + 1)
-        .find(|dir| dir.join(name).exists())
-        .map(Path::to_path_buf)
+    find_dir_upwards(start, limit, |dir| dir.join(name).exists())
+}
+
+fn find_dir_upwards(start: &Path, limit: usize, is_data_dir: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    start.ancestors().take(limit + 1).find(|dir| is_data_dir(dir)).map(Path::to_path_buf)
+}
+
+/// Каталог данных net_surgeon, а не любой с `config.toml`.
+fn is_ours(dir: &Path) -> bool {
+    dir.join(ANCHOR).exists() && dir.join(COMPANION).exists()
 }
 
 /// Каталог, относительно которого лежат все файлы данных.
@@ -78,18 +88,14 @@ pub fn data_dir() -> &'static Path {
             return PathBuf::from(dir);
         }
 
-        let from_cwd = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| find_upwards(&cwd, ANCHOR, MAX_ANCESTORS));
-        if let Some(dir) = from_cwd {
-            return dir;
-        }
-
-        let from_exe = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_path_buf))
-            .and_then(|dir| find_upwards(&dir, ANCHOR, MAX_ANCESTORS));
-        if let Some(dir) = from_exe {
+        let cwd = std::env::current_dir().ok();
+        let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+        let found = cwd
+            .as_deref()
+            .and_then(|cwd| find_dir_upwards(cwd, MAX_ANCESTORS, is_ours))
+            .or_else(|| exe_dir.as_deref().and_then(|dir| find_dir_upwards(dir, MAX_ANCESTORS, is_ours)))
+            .or_else(|| exe_dir.as_deref().and_then(|dir| find_upwards(dir, ANCHOR, MAX_ANCESTORS)));
+        if let Some(dir) = found {
             return dir;
         }
 
@@ -116,8 +122,16 @@ pub fn read_to_string(name: &str) -> io::Result<String> {
 ///
 /// Временный файл создаётся именно РЯДОМ, а не в /tmp: `rename` между разными
 /// файловыми системами не работает, а /tmp сплошь и рядом отдельный tmpfs.
+///
+/// Перед `rename` данные сбрасываются на диск (`sync_all`): без этого после
+/// пропажи питания на части файловых систем (XFS) переименование уже на
+/// диске, а содержимое — нет, и `config.toml` оставался пустым. Права
+/// прежнего файла сохраняются (`chmod 600` не сбрасывался в 644), а
+/// симлинк не подменяется обычным файлом: пишется файл, на который он
+/// указывает.
 pub fn write_atomic(name: &str, contents: &str) -> io::Result<()> {
     let target = resolve(name);
+    let target = std::fs::canonicalize(&target).unwrap_or(target);
 
     let mut tmp = target.clone();
     let file_name = target
@@ -135,13 +149,27 @@ pub fn write_atomic(name: &str, contents: &str) -> io::Result<()> {
 
     // Мусор не остаётся даже при ошибке записи: временный файл убирается
     // на любом неуспешном пути.
-    if let Err(e) = std::fs::write(&tmp, contents) {
+    let written = (|| {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        if let Ok(meta) = std::fs::metadata(&target) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&tmp, &target)
+    })();
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp, &target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    // Каталог — тоже, чтобы на диске оказалось и само переименование.
+    // Не вышло — не беда: файл уже на месте.
+    #[cfg(unix)]
+    if let Some(dir) = target.parent()
+        && let Ok(dir) = std::fs::File::open(dir)
+    {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -191,6 +219,34 @@ mod tests {
 
         assert!(find_upwards(&root.join("a/b/c/d/e"), ANCHOR, 2).is_none());
         assert!(find_upwards(&root.join("a/b/c/d/e"), ANCHOR, 5).is_some());
+    }
+
+    /// Чужой проект с `config.toml` — не наш каталог данных.
+    #[test]
+    fn foreign_config_toml_is_not_ours() {
+        let root = scratch("foreign");
+        std::fs::write(root.join(ANCHOR), "").unwrap();
+        assert!(!is_ours(&root));
+        std::fs::write(root.join(COMPANION), "").unwrap();
+        assert!(is_ours(&root));
+    }
+
+    /// Запись сохраняет права файла и не подменяет симлинк.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_permissions_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let real = data_dir().join("paths_real.txt");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = data_dir().join("paths_link.txt");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomic("paths_link.txt", "new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

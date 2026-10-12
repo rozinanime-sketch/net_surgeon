@@ -591,14 +591,8 @@ pub fn run(
 fn reload(app: &mut App, config: &mut Arc<Config>, domains: &mut Arc<HashSet<String>>) {
     match crate::config::load_config() {
         Ok(fresh) => {
-            // Резолвер — синглтон, инициализированный при старте (OnceLock),
-            // переинициализировать его на лету нельзя. Честно предупреждаем.
-            if fresh.resolve_via_doh != config.resolve_via_doh
-                || fresh.doh_provider != config.doh_provider
-                || fresh.smart_dns_provider != config.smart_dns_provider
-            {
-                app.push_log_t(LogLevel::Warning, "startup.resolver_restart_needed", vec![]);
-            }
+            // Резолверы пересобирает сам перезапуск прокси (run_all →
+            // dns::resolver::init), предупреждать не о чем.
             *config = Arc::new(fresh);
         }
         Err(e) => {

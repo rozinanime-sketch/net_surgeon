@@ -175,15 +175,16 @@ pub struct Config {
     pub probe_gap_max_ms: u64,
     /// Разрешать ли адреса для исходящих подключений через DoH.
     ///
-    /// По умолчанию выключено, и это вывод из измерений, а не осторожность.
-    /// Cloudflare DoH принципиально не поддерживает EDNS Client Subnet и
-    /// отвечает со своей точки зрения, а не с точки зрения клиента. Для
-    /// CDN-доменов это даёт другой anycast-узел: на проверке x.com и
-    /// meduza.io перестали открываться, хотя с адресами от системного
-    /// резолвера работали через две TLS-записи.
+    /// По умолчанию выключено: DNS провайдера отдаёт адреса CDN рядом с
+    /// клиентом, а DoH — со своей точки зрения. Так было измерено на
+    /// Cloudflare DoH, который не передаёт EDNS Client Subnet: x.com и
+    /// meduza.io получали чужой anycast-узел и переставали открываться.
+    /// Провайдер по умолчанию теперь Quad9 dns11, он ECS передаёт, но
+    /// перемерять это пока не перемеряли.
     ///
     /// Включать имеет смысл, если провайдер подменяет DNS-ответы — тогда
-    /// системному резолверу доверять нельзя, и чужой узел лучше подмены.
+    /// системному резолверу доверять нельзя. Выключенный DoH всё равно
+    /// остаётся запасным: им переспрашиваются имена, которые система не нашла.
     #[serde(default)]
     pub resolve_via_doh: bool,
     #[serde(default = "default_doh_provider")]
@@ -199,17 +200,20 @@ pub struct Config {
     /// и резолв имени провайдера не выполняется вообще.
     ///
     /// Пустое поле — обычное поведение, имя провайдера резолвится системой.
-    #[serde(default, deserialize_with = "empty_as_none")]
+    /// Ключа нет вовсе — адрес провайдера по умолчанию, как в config.toml
+    /// (см. `drop_foreign_bootstrap`).
+    #[serde(default = "default_doh_bootstrap_ip", deserialize_with = "empty_as_none")]
     pub doh_bootstrap_ip: Option<std::net::IpAddr>,
 
-    /// «Умный» DoH (например, xbox-dns.ru) для доменов из
-    /// smart_dns_domains.txt — сервисов, закрытых для России по IP.
-    /// Остальные имена идут через `doh_provider`. Пусто — выключено.
-    #[serde(default)]
+    /// «Умный» DoH (GeoHide) для доменов из smart_dns_domains.txt —
+    /// сервисов, закрытых для России по IP. Остальные имена идут через
+    /// `doh_provider`. Пусто — выключено; ключа нет — GeoHide, как в
+    /// config.toml.
+    #[serde(default = "default_smart_dns_provider")]
     pub smart_dns_provider: String,
 
     /// То же, что `doh_bootstrap_ip`, но для `smart_dns_provider`.
-    #[serde(default, deserialize_with = "empty_as_none")]
+    #[serde(default = "default_smart_dns_bootstrap_ip", deserialize_with = "empty_as_none")]
     pub smart_dns_bootstrap_ip: Option<std::net::IpAddr>,
 
     /// Дописывать в списки доменов те, что появились в новой версии.
@@ -255,7 +259,14 @@ fn default_reward_reliability() -> f64 { 1.0 }
 fn default_reward_latency() -> f64 { 0.3 }
 fn default_probe_gap_min() -> u64 { 250 }
 fn default_probe_gap_max() -> u64 { 700 }
-fn default_doh_provider() -> String { "https://dns11.quad9.net/dns-query".to_string() }
+fn default_doh_provider() -> String { DEFAULT_DOH_PROVIDER.to_string() }
+fn default_doh_bootstrap_ip() -> Option<std::net::IpAddr> { Some(std::net::IpAddr::from(DEFAULT_DOH_IP)) }
+fn default_smart_dns_provider() -> String { GEOHIDE_DNS.to_string() }
+fn default_smart_dns_bootstrap_ip() -> Option<std::net::IpAddr> { Some(std::net::IpAddr::from(GEOHIDE_DNS_IP)) }
+
+/// Провайдер DoH по умолчанию и его адрес — те же, что в config.toml.
+const DEFAULT_DOH_PROVIDER: &str = "https://dns11.quad9.net/dns-query";
+const DEFAULT_DOH_IP: [u8; 4] = [9, 9, 9, 11];
 
 pub fn load_config() -> Result<Config, String> {
     // В сообщении — полный путь, по которому искали. Иначе «файл не найден»
@@ -266,12 +277,16 @@ pub fn load_config() -> Result<Config, String> {
     let mut config: Config = toml::from_str(&contents)
         .map_err(|e| rust_i18n::t!("startup.config_parse", error = e).into_owned())?;
     config.replace_dead_smart_dns();
+    config.drop_foreign_bootstrap();
     Ok(config)
 }
 
 /// Умный DNS, сменивший закрытый Xbox DNS и переставший работать Comss.
 const GEOHIDE_DNS: &str = "https://geohide.ru/dns-query";
 const GEOHIDE_DNS_IP: [u8; 4] = [193, 233, 112, 67];
+/// Прежние адреса GeoHide: config.toml с ними поставлялся раньше и при
+/// обновлении не перезаписывается.
+const OLD_GEOHIDE_DNS_IPS: &[[u8; 4]] = &[[159, 194, 200, 33]];
 
 /// Умные DNS, которые больше не открывают нейросети.
 const DEAD_SMART_DNS: &[&str] = &["xbox-dns.ru", "dns.comss.one"];
@@ -287,12 +302,34 @@ impl Config {
             let host = host.trim_end_matches('.');
             DEAD_SMART_DNS.iter().any(|d| host.eq_ignore_ascii_case(d))
         });
-        if dead {
+        let geohide_old_ip = provider_host_is(&self.smart_dns_provider, GEOHIDE_DNS)
+            && self
+                .smart_dns_bootstrap_ip
+                .is_some_and(|ip| OLD_GEOHIDE_DNS_IPS.iter().any(|old| ip == std::net::IpAddr::from(*old)));
+        if dead || geohide_old_ip {
             self.smart_dns_provider = GEOHIDE_DNS.to_string();
             self.smart_dns_bootstrap_ip = Some(std::net::IpAddr::from(GEOHIDE_DNS_IP));
             self.smart_dns_replaced = true;
         }
     }
+
+    /// Адрес по умолчанию подставляется, когда ключа нет. Но он — адрес
+    /// провайдера по умолчанию: если провайдер в конфиге другой, такой адрес
+    /// увёл бы его запросы не на тот сервер. Тогда имя резолвится как обычно.
+    fn drop_foreign_bootstrap(&mut self) {
+        if self.doh_bootstrap_ip == default_doh_bootstrap_ip() && !provider_host_is(&self.doh_provider, DEFAULT_DOH_PROVIDER) {
+            self.doh_bootstrap_ip = None;
+        }
+        if self.smart_dns_bootstrap_ip == default_smart_dns_bootstrap_ip() && !provider_host_is(&self.smart_dns_provider, GEOHIDE_DNS) {
+            self.smart_dns_bootstrap_ip = None;
+        }
+    }
+}
+
+/// Тот же ли хост у двух адресов DoH (регистр и точка в конце не важны).
+fn provider_host_is(url: &str, other: &str) -> bool {
+    let host = |u: &str| crate::dns::provider_endpoint(u).map(|(h, _)| h.trim_end_matches('.').to_string());
+    host(url).is_some_and(|h| Some(h) == host(other))
 }
 
 /// Список доменов для обхода.
@@ -308,12 +345,9 @@ pub fn load_bypass_domains() -> (HashSet<String>, Option<String>) {
         Err(e) => return (HashSet::new(), Some(e.to_string())),
     };
 
-    let set = text
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-        .map(|l| l.trim().to_lowercase())
-        .collect();
-    (set, None)
+    // Тот же разбор, что у остальных списков: со своим точка в конце
+    // («youtube.com.») не отрезалась, и домен оставался без обхода.
+    (crate::block::parse(&text), None)
 }
 
 #[cfg(test)]
@@ -326,6 +360,40 @@ mod tests {
     fn shipped_config() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
         std::fs::read_to_string(path).expect("config.toml должен читаться")
+    }
+
+    #[test]
+    fn old_geohide_address_is_updated() {
+        let mut config: Config = toml::from_str(&shipped_config()).expect("config.toml должен разбираться");
+        config.smart_dns_bootstrap_ip = Some(std::net::IpAddr::from([159, 194, 200, 33]));
+        config.replace_dead_smart_dns();
+        assert_eq!(config.smart_dns_bootstrap_ip, Some(std::net::IpAddr::from(GEOHIDE_DNS_IP)));
+        assert!(config.smart_dns_replaced);
+    }
+
+    /// Ключей DNS нет вовсе — значения как в config.toml; адрес по умолчанию
+    /// не прикрепляется к чужому провайдеру.
+    #[test]
+    fn missing_dns_keys_default_like_the_shipped_config() {
+        let minimal: String = shipped_config()
+            .lines()
+            .filter(|l| !["doh_provider", "doh_bootstrap_ip", "smart_dns_provider", "smart_dns_bootstrap_ip"]
+                .contains(&l.split('=').next().unwrap_or("").trim()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut config: Config = toml::from_str(&minimal).expect("config.toml без ключей DNS");
+        config.drop_foreign_bootstrap();
+        let shipped: Config = toml::from_str(&shipped_config()).unwrap();
+        assert_eq!(config.doh_provider, shipped.doh_provider);
+        assert_eq!(config.doh_bootstrap_ip, shipped.doh_bootstrap_ip);
+        assert_eq!(config.smart_dns_provider, shipped.smart_dns_provider);
+        assert_eq!(config.smart_dns_bootstrap_ip, shipped.smart_dns_bootstrap_ip);
+
+        // В начало: в конце файла ключ попал бы в последнюю таблицу TOML.
+        let own = format!("doh_provider = \"https://dns.example.org/dns-query\"\n{minimal}");
+        let mut config: Config = toml::from_str(&own).unwrap();
+        config.drop_foreign_bootstrap();
+        assert_eq!(config.doh_bootstrap_ip, None, "адрес Quad9 к чужому провайдеру не прикрепляется");
     }
 
     #[test]
