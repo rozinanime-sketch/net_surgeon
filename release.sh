@@ -82,17 +82,35 @@ APK=android/app/build/outputs/apk/release/app-release.apk
 # воркера Telegram тратил бы лимит чужого аккаунта Cloudflare.
 say "Проверка на личные данные"
 RELAY=""
+# Адрес воркера и его секрет (строка `token: …`) — ни то ни другое не
+# должно попасть в публичные файлы.
+SECRETS=()
 if [[ -f telegram_relay.txt ]]; then
-    RELAY=$(grep -v '^[[:space:]]*#' telegram_relay.txt | sed 's#^[a-z]*://##; s#/.*##' | grep -m1 . || true)
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z $line || $line == \#* ]] && continue
+        if [[ $line =~ ^token[[:space:]]*[:=][[:space:]]*(.+)$ ]]; then
+            SECRETS+=("${BASH_REMATCH[1]}")
+        else
+            SECRETS+=("$(sed 's#^[a-zA-Z]*://##; s#[/:].*##' <<<"$line")")
+        fi
+    done < telegram_relay.txt
 fi
 for f in "$LINUX_BIN" "$TRAY_BIN" "$WIN_BIN" "$APK"; do
     if grep -aq "$HOME" "$f"; then die "в $f есть путь $HOME"; fi
-    if [[ -n $RELAY ]] && { grep -aqF "$RELAY" "$f" || unzip -p "$f" 2>/dev/null | grep -aqF "$RELAY"; }; then
-        die "в $f адрес своего воркера Telegram"
-    fi
+    for secret in "${SECRETS[@]}"; do
+        [[ -n $secret ]] || continue
+        if grep -aqF "$secret" "$f" || unzip -p "$f" 2>/dev/null | grep -aqF "$secret"; then
+            die "в $f адрес или секрет своего воркера Telegram"
+        fi
+    done
 done
 APKSIGNER=$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/build-tools/* | sort -V | tail -n1)/apksigner
-"$APKSIGNER" verify --print-certs "$APK" | grep -q "Android Debug" \
+# Вывод — целиком, потом проверка: с `| grep -q` и pipefail провал самого
+# apksigner (APK не подписан или битый) или его SIGPIPE после раннего выхода
+# grep пропускали APK в релиз молча.
+CERTS=$("$APKSIGNER" verify --print-certs "$APK") || die "apksigner не принял APK: он не подписан или повреждён"
+grep -q "Android Debug" <<<"$CERTS" \
     && die "APK подписан отладочным ключом: обновление у пользователей не встанет"
 
 say "Упаковка"

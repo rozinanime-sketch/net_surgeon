@@ -105,7 +105,10 @@ RULE_PAT="fwmark ${MARK} lookup ${RT_TABLE}( |\$)"
 # (udp_port = 0), и тогда заворачивать DNS некуда.
 DNS_PORT="$(sed -nE 's/^[[:space:]]*udp_port[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' config.toml | head -n1)"
 DNS_PORT="${DNS_PORT:-0}"
-DNS_PAT="--dport 53 .*-j REDIRECT --to-ports ${DNS_PORT}( |\$)"
+# Правило DNS узнаётся по форме (UDP/53 с исключением группы прокси), а не
+# по порту из конфига: порт могли сменить после того, как правило осталось,
+# и тогда `off` и `status` его не видели.
+DNS_PAT="--dport 53 .*--gid-owner [0-9]+ -j REDIRECT --to-ports [0-9]+( |\$)"
 DOH_PROVIDER="$(sed -nE 's/^[[:space:]]*doh_provider[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' config.toml | head -n1)"
 DOH_BOOTSTRAP="$(sed -nE 's/^[[:space:]]*doh_bootstrap_ip[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' config.toml | head -n1)"
 
@@ -193,12 +196,10 @@ enable_dns() {
 }
 
 dns_rule_present() {
-    [[ $DNS_PORT -gt 0 ]] || return 1
     sudo iptables -t nat -S OUTPUT 2>/dev/null | grep -qE -- "$DNS_PAT"
 }
 
 sweep_dns_rules() {
-    [[ $DNS_PORT -gt 0 ]] || return 0
     local spec
     while IFS= read -r spec; do
         [[ -n $spec ]] || continue
@@ -370,7 +371,14 @@ cleanup() {
 
     stop_helpers
 }
-trap cleanup EXIT INT TERM HUP QUIT
+# По сигналу — снять и выйти. Раньше обработчик возвращался, и скрипт
+# продолжал настройку после уборки: ставил правило DNS, которое потом уже
+# никто не снимал (CLEANED=1).
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 131' QUIT
 
 # --- сборка ----------------------------------------------------------------
 
@@ -391,6 +399,54 @@ build() {
     fi
 }
 
+# --- порт в конфиге и права бинаря -----------------------------------------
+#
+# Нужны и обычному запуску, и установке службы — поэтому здесь, до них.
+
+ensure_config_port() {
+    # Порт в конфиге — правим сами, чтобы не заставлять лезть в редактор.
+    # Но config.toml принадлежит пользователю, поэтому: трогаем его только
+    # когда значение действительно другое, и вслух говорим, что поменяли.
+    if grep -qE '^[[:space:]]*transparent_port[[:space:]]*=' config.toml; then
+        CURRENT_PORT="$(sed -nE 's/^[[:space:]]*transparent_port[[:space:]]*=[[:space:]]*([^#[:space:]]*).*/\1/p' config.toml | head -n1)"
+        if [[ $CURRENT_PORT != "$PORT" ]]; then
+            sed -i -E "s/^([[:space:]]*transparent_port[[:space:]]*=).*/\1 $PORT/" config.toml
+            warn "В config.toml изменён transparent_port: ${CURRENT_PORT:-пусто} -> $PORT"
+        fi
+    else
+        # Перед первой [таблицей], а не в конец файла: в TOML ключ после
+        # заголовка таблицы принадлежит ей, и строка в конце попадала в
+        # [socks5_junk] — настоящий порт оставался 0, и прокси не стартовал.
+        local tmp
+        tmp="$(mktemp config.toml.XXXXXX)"
+        awk -v line="transparent_port = $PORT" '
+            !done && /^[[:space:]]*\[/ { print line; print ""; done = 1 }
+            { print }
+            END { if (!done) print line }
+        ' config.toml > "$tmp" && mv "$tmp" config.toml
+        warn "В config.toml добавлена строка transparent_port = $PORT"
+    fi
+}
+
+bin_privileged() {
+    [[ $(stat -c %G "$BIN" 2>/dev/null) == "$GROUP" ]] || return 1
+    [[ -g $BIN ]] || return 1
+    getcap "$BIN" 2>/dev/null | grep -q cap_net_raw || return 1
+}
+
+# Группа nsproxy + setgid + полномочия на файле, если их ещё нет.
+grant_privileges() {
+    bin_privileged && return 0
+    say "Выдаю программе права на перехват (один раз после сборки, нужен sudo)."
+    sudo -v || die "Без sudo прозрачный режим не настроить. Попробуйте: ./run.sh plain"
+    getent group "$GROUP" >/dev/null || sudo groupadd --system "$GROUP"
+    # Порядок важен: chgrp сбрасывает и бит setgid, и полномочия файла.
+    sudo chgrp "$GROUP" "$BIN"
+    sudo chmod 2755 "$BIN"
+    sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw+ep "$BIN"
+    bin_privileged || die "Права выдать не удалось. Каталог на разделе с nosuid? Тогда: NET_SURGEON_LEGACY=1 ./run.sh"
+}
+
 # --- аварийное снятие и статус ---------------------------------------------
 #
 # Отдельные команды нужны как раз для случая, когда правило уже осталось
@@ -398,12 +454,19 @@ build() {
 # — худший момент для изучения синтаксиса.
 
 if [[ $MODE == off || $MODE == --off ]]; then
+    # Служба — первой: иначе systemd (Restart=on-failure) сочтёт убийство
+    # ниже сбоем и через 3 с поднимет её снова вместе с перехватом.
+    if command -v systemctl >/dev/null && systemctl --user is-active --quiet net_surgeon.service 2>/dev/null; then
+        say "Останавливаю службу net_surgeon (запустить снова: systemctl --user start net_surgeon)."
+        systemctl --user stop net_surgeon.service || true
+    fi
     # Перехват нового образца (nftables, owner) живёт ровно столько, сколько
     # процесс: остановить его — и ядро снимет таблицу само, без root.
     if pgrep -x net_surgeon >/dev/null; then
         say "Останавливаю net_surgeon — перехват снимется вместе с ним."
         pkill -x net_surgeon || true
-        sleep 1
+        # Штатный выход сохраняет стратегии — даём ему время, как и systemd.
+        for _ in $(seq 1 15); do pgrep -x net_surgeon >/dev/null || break; sleep 1; done
         pgrep -x net_surgeon >/dev/null && pkill -9 -x net_surgeon
     fi
     say "Нужны права root, чтобы снять перехват."
@@ -461,17 +524,11 @@ if [[ $MODE == install || $MODE == --install ]]; then
     build
     [[ -x $BIN ]] || die "Бинарь не собран: $BIN"
 
-    # Права как в обычном запуске (см. раздел выдачи прав ниже): группа +
-    # setgid + file caps. Без них служба не поставит nftables и не привяжет 443.
-    if [[ $(stat -c %G "$BIN" 2>/dev/null) != "$GROUP" ]] || [[ ! -g $BIN ]] \
-        || ! getcap "$BIN" 2>/dev/null | grep -q cap_net_raw; then
-        say "Выдаю программе права (один раз после сборки, нужен sudo)."
-        sudo -v || die "Без sudo права не выдать."
-        getent group "$GROUP" >/dev/null || sudo groupadd --system "$GROUP"
-        sudo chgrp "$GROUP" "$BIN"
-        sudo chmod 2755 "$BIN"
-        sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw+ep "$BIN"
-    fi
+    # Те же порт и права, что в обычном запуске. Без проверки служба на
+    # разделе с nosuid или с transparent_port = 0 перезапускалась бы каждые
+    # 3 с, а скрипт сообщал «Готово».
+    ensure_config_port
+    grant_privileges
 
     if pgrep -x net_surgeon >/dev/null && ! systemctl --user is-active --quiet "$SERVICE_NAME"; then
         warn "net_surgeon уже запущен вручную — закройте его, иначе два процесса будут спорить за порты."
@@ -496,8 +553,14 @@ WantedBy=default.target
 EOF
 
     systemctl --user daemon-reload
-    systemctl --user enable --now "$SERVICE_NAME" \
+    systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    # restart, а не enable --now: уже работающая служба иначе так и осталась
+    # бы на старом бинаре после пересборки.
+    systemctl --user restart "$SERVICE_NAME" \
         || die "Служба не запустилась. Смотрите: systemctl --user status $SERVICE_NAME; journalctl --user -u $SERVICE_NAME -e"
+    sleep 2
+    systemctl --user is-active --quiet "$SERVICE_NAME" \
+        || die "Служба упала сразу после запуска. Смотрите: journalctl --user -u $SERVICE_NAME -e"
     say "Готово: служба работает и стартует при входе."
     say "Статус:     systemctl --user status $SERVICE_NAME"
     say "Логи:       journalctl --user -u $SERVICE_NAME -f"
@@ -539,9 +602,10 @@ fi
 
 if [[ $MODE == tray ]]; then
     command -v systemctl >/dev/null || die "Нет systemd (systemctl) — трею нечем управлять."
-    # Есть cargo — соберём (трей не входит в обычную сборку, он за feature
-    # `tray`). Нет cargo (распакованный релиз) — используем готовый бинарь.
-    if command -v cargo >/dev/null; then
+    # Исходники и cargo — соберём (трей не входит в обычную сборку, он за
+    # feature `tray`). Распакованный релиз — готовый бинарь, даже если cargo
+    # на машине есть: исходников в архиве нет, и сборка упала бы.
+    if [[ -f Cargo.toml ]] && command -v cargo >/dev/null; then
         say "Собираю трей (если нужно)…"
         RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~" \
             cargo build --release --features tray --bin net_surgeon-tray || die "Сборка трея не удалась."
@@ -663,41 +727,9 @@ build
 #
 # Пересборка заменяет файл, и всё это с него слетает — тогда спросим снова.
 # Без nft (или с NET_SURGEON_LEGACY=1) — старый путь через iptables ниже.
-ensure_config_port() {
-    # Порт в конфиге — правим сами, чтобы не заставлять лезть в редактор.
-    # Но config.toml принадлежит пользователю, поэтому: трогаем его только
-    # когда значение действительно другое, и вслух говорим, что поменяли.
-    if grep -qE '^[[:space:]]*transparent_port[[:space:]]*=' config.toml; then
-        CURRENT_PORT="$(sed -nE 's/^[[:space:]]*transparent_port[[:space:]]*=[[:space:]]*([^#[:space:]]*).*/\1/p' config.toml | head -n1)"
-        if [[ $CURRENT_PORT != "$PORT" ]]; then
-            sed -i -E "s/^([[:space:]]*transparent_port[[:space:]]*=).*/\1 $PORT/" config.toml
-            warn "В config.toml изменён transparent_port: ${CURRENT_PORT:-пусто} -> $PORT"
-        fi
-    else
-        printf '\ntransparent_port = %s\n' "$PORT" >> config.toml
-        warn "В config.toml добавлена строка transparent_port = $PORT"
-    fi
-}
-
-bin_privileged() {
-    [[ $(stat -c %G "$BIN" 2>/dev/null) == "$GROUP" ]] || return 1
-    [[ -g $BIN ]] || return 1
-    getcap "$BIN" 2>/dev/null | grep -q cap_net_raw || return 1
-}
-
 if command -v nft >/dev/null && command -v getcap >/dev/null && [[ -z ${NET_SURGEON_LEGACY:-} ]]; then
     ensure_config_port
-
-    if ! bin_privileged; then
-        say "Выдаю программе права на перехват (один раз после сборки, нужен sudo)."
-        sudo -v || die "Без sudo прозрачный режим не настроить. Попробуйте: ./run.sh plain"
-        getent group "$GROUP" >/dev/null || sudo groupadd --system "$GROUP"
-        # Порядок важен: chgrp сбрасывает и бит setgid, и полномочия файла.
-        sudo chgrp "$GROUP" "$BIN"
-        sudo chmod 2755 "$BIN"
-        sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw+ep "$BIN"
-        bin_privileged || die "Права выдать не удалось. Каталог на разделе с nosuid? Тогда: NET_SURGEON_LEGACY=1 ./run.sh"
-    fi
+    grant_privileges
 
     say "Запуск. Перехват снимется сам при любом выходе, даже при закрытии окна."
     "$BIN" --firewall || true
@@ -714,6 +746,13 @@ sudo -v || die "Без sudo прозрачный режим не настрои�
 
 while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
 SUDO_KEEPALIVE=$!
+
+# Какой запуск сейчас владеет правилами. Сторож прошлого запуска смотрит
+# сюда и не трогает правила, если их поставил уже следующий: перезапуск
+# скрипта быстрее его двухсекундного опроса иначе оставлял новый прокси
+# без перехвата.
+OWNER_FILE="${XDG_RUNTIME_DIR:-/tmp}/net_surgeon-run.pid"
+echo "$$" > "$OWNER_FILE"
 
 # Отдельная группа нужна, чтобы исходящие соединения самого прокси не
 # попадали обратно в перехват. По пользователю разделить нельзя: прокси
@@ -807,8 +846,14 @@ sudo setsid --fork bash -c '
     port=$2
     mark=$3
     table=$4
-    dns_port=$5
+    owner_file=$5
     while kill -0 "$parent" 2>/dev/null; do sleep 2; done
+
+    # Правила уже поставил следующий запуск — они его, не наши.
+    owner=$(cat "$owner_file" 2>/dev/null)
+    if [ -n "$owner" ] && [ "$owner" != "$parent" ] && kill -0 "$owner" 2>/dev/null; then
+        exit 0
+    fi
 
     # Шаблоны те же, что NAT_PAT и остальные выше: только свои правила.
     for tool in iptables ip6tables; do
@@ -835,12 +880,12 @@ sudo setsid --fork bash -c '
         [ "$guard" -gt 16 ] && break
     done
 
-    [ "$dns_port" -gt 0 ] 2>/dev/null && iptables -t nat -S OUTPUT 2>/dev/null |
-        grep -E -- "--dport 53 .*-j REDIRECT --to-ports $dns_port( |\$)" |
+    iptables -t nat -S OUTPUT 2>/dev/null |
+        grep -E -- "--dport 53 .*--gid-owner [0-9]+ -j REDIRECT --to-ports [0-9]+( |\$)" |
         while read -r spec; do
             iptables -t nat -D OUTPUT ${spec#-A OUTPUT } 2>/dev/null || true
         done
-' _ "$$" "$PORT" "$MARK" "$RT_TABLE" "$DNS_PORT" >/dev/null 2>&1 && WATCHDOG_STARTED=1
+' _ "$$" "$PORT" "$MARK" "$RT_TABLE" "$OWNER_FILE" >/dev/null 2>&1 && WATCHDOG_STARTED=1
 
 # Раньше провал здесь проглатывался молча, и о том, что страховки от
 # kill -9 и закрытия окна нет, никто не узнавал.

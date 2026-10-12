@@ -111,6 +111,23 @@ sweep_port_rules() {
 # после него висеть маршрутную петлю значит не вернуть сеть. Механика
 # описана в комментарии run.sh. MARK и RT_TABLE заданы в начале файла.
 
+# Перенаправление DNS (UDP/53) от ./run.sh: узнаётся по форме — исключение
+# группы прокси и REDIRECT, — а не по порту, которого здесь не знают.
+DNS_PAT="--dport 53 .*--gid-owner [0-9]+ -j REDIRECT --to-ports [0-9]+( |\$)"
+
+dns_rule_present() {
+    iptables -t nat -S OUTPUT 2>/dev/null | grep -qE -- "$DNS_PAT"
+}
+
+sweep_dns_rules() {
+    local spec
+    while IFS= read -r spec; do
+        [[ -n $spec ]] || continue
+        # shellcheck disable=SC2086
+        iptables -t nat -D OUTPUT ${spec#-A OUTPUT } 2>/dev/null || true
+    done < <(iptables -t nat -S OUTPUT 2>/dev/null | grep -E -- "$DNS_PAT" || true)
+}
+
 udp_rule_present() {
     iptables -t mangle -S PREROUTING 2>/dev/null | grep -qE -- "$TPROXY_PAT" && return 0
     iptables -t mangle -S OUTPUT 2>/dev/null | grep -qE -- "$MARK_PAT" && return 0
@@ -199,22 +216,25 @@ case "$ACTION" in
         # Наличие группы больше не проверяется: группу могли удалить, а
         # правило осталось — и тогда прежний код отвечал «правила не было»
         # при лежащей сети. Ищем по порту, он в правиле есть всегда.
-        if ! port_rule_present && ! udp_rule_present; then
+        if ! port_rule_present && ! udp_rule_present && ! dns_rule_present; then
             echo "Правил не было."
             exit 0
         fi
 
         sweep_port_rules
         sweep_udp_rules
+        # DNS-перехват ставит ./run.sh (старый путь) — снимаем и его: иначе
+        # «аварийное снятие» оставляло DNS на мёртвом порту.
+        sweep_dns_rules
 
-        if port_rule_present || udp_rule_present; then
+        if port_rule_present || udp_rule_present || dns_rule_present; then
             echo "Снять правила не удалось. Найдите правила с портом $PORT и удалите по одному (-D):" >&2
             echo "  iptables -t nat -S OUTPUT; iptables -t mangle -S" >&2
             echo "  (не используйте -F: это снесёт и правила Docker/VPN)" >&2
             echo "  ip rule del fwmark $MARK lookup $RT_TABLE" >&2
             exit 1
         fi
-        echo "Перехват выключен (TCP и QUIC)."
+        echo "Перехват выключен (TCP, QUIC и DNS)."
         ;;
 
     status)
