@@ -309,6 +309,12 @@ impl<M> Tracker<M> {
         }
         self.last_purge = now;
         self.flows.retain(|_, f| {
+            // Окно очереди прошло: закрыть её, чтобы поток отправителя мусора
+            // завершился. Сам он не узнает: дальнейшие датаграммы потока
+            // фильтр обычно сюда не отдаёт, и до забывания потока он бы висел.
+            if f.queue.as_ref().is_some_and(|(_, until)| now >= *until) {
+                f.queue = None;
+            }
             let alive = now.duration_since(f.last_seen) < IDLE_TTL;
             if !alive && f.is_quic {
                 count.closed += 1;
@@ -459,6 +465,19 @@ mod tests {
         let quic = initial();
         assert!(crate::proxy::udp::session::is_quic_initial(&quic));
         assert!((192..=223).contains(&quic[0]), "Initial попадает в диапазон фильтра");
+    }
+
+    #[test]
+    fn junk_queue_is_closed_on_purge_after_its_window() {
+        let mut t: Tracker<u32> = Tracker::default();
+        let start = Instant::now();
+        let (step, _) = t.process(&v4(443, &initial()), start, bypass, || 1);
+        let Step::Junk { rx, .. } = step else { panic!("ожидали мусор") };
+        assert_eq!(rx.recv().unwrap(), 1);
+        // Другой поток запускает чистку: очередь первого закрыта, хотя сам
+        // он живой и больше датаграмм не присылал.
+        t.process(&v4(50000, b"x"), start + PURGE_EVERY, |_, _| Policy::Pass, || 2);
+        assert!(rx.recv().is_err(), "отправитель мусора завершится");
     }
 
     #[test]

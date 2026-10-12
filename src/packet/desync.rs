@@ -219,6 +219,20 @@ pub fn multidisorder_positions(payload: &[u8]) -> Vec<usize> {
     pts
 }
 
+/// Границы сегментов multidisorder для данных длины `len`: 0, точки реза
+/// (строго возрастающие, внутри данных), `len`. На вход — отсортированные
+/// позиции; лишние (вне данных или повторы) отбрасываются.
+pub fn multidisorder_bounds(positions: &[usize], len: usize) -> Vec<usize> {
+    let mut bounds = vec![0usize];
+    for &p in positions {
+        if p > *bounds.last().unwrap() && p < len {
+            bounds.push(p);
+        }
+    }
+    bounds.push(len);
+    bounds
+}
+
 /// Где резать данные: посередине имени, если оно целиком в сегменте,
 /// иначе после первого байта (как `--dpi-desync-split-pos=1` в zapret).
 pub fn split_pos(payload: &[u8]) -> usize {
@@ -245,11 +259,17 @@ pub fn apply(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
 /// zapret, блокирует соединение ещё до разбора имени. Контрольную сумму IP
 /// пересчитывает отправитель (WinDivert, `nfqueue::fixup_v4`). У IPv6 ip_id
 /// в основном заголовке нет.
+///
+/// Нулевой ip_id не трогается: стек, который шлёт пакеты с DF и нулём,
+/// нулём шлёт и все остальные, и номера 0, 1, 2… выделили бы именно наши.
 fn number_ip_ids(pkt: &[u8], parts: &mut [Vec<u8>]) {
     if pkt.first().map(|b| b >> 4) != Some(4) || pkt.len() < 20 {
         return;
     }
     let id = u16::from_be_bytes([pkt[4], pkt[5]]);
+    if id == 0 {
+        return;
+    }
     for (i, part) in parts.iter_mut().enumerate() {
         part[4..6].copy_from_slice(&id.wrapping_add(i as u16).to_be_bytes());
     }
@@ -313,20 +333,10 @@ fn build(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
             let decoy = &decoy[..decoy.len().min(MAX_SEGMENT)];
             // Подделка на тех же номерах со сдвигом назад: сервер отбросит.
             let fake = with_payload(pkt, t, decoy, t.seq.wrapping_sub(BADSEQ_SHIFT), t.flags);
-            // Границы сегментов: 0, точки реза (строго возрастающие, внутри
-            // данных), конец. На вход приходят отсортированные позиции.
-            let mut bounds = vec![0usize];
-            for &p in positions {
-                let p = p.min(payload.len());
-                if p > *bounds.last().unwrap() && p < payload.len() {
-                    bounds.push(p);
-                }
-            }
-            bounds.push(payload.len());
             // Сегменты в обратном порядке — в этом и есть disorder: переставить
             // пакеты можно прямо здесь, низкий TTL и ретрансмит не нужны.
             let mut out = vec![fake];
-            for w in bounds.windows(2).rev() {
+            for w in multidisorder_bounds(positions, payload.len()).windows(2).rev() {
                 out.extend(segments(w[0], w[1]));
             }
             out
@@ -556,6 +566,15 @@ mod tests {
         let ids: Vec<u16> = parts.iter().map(|p| u16::from_be_bytes([p[4], p[5]])).collect();
         // Первый сохраняет исходный, дальше по порядку, с переходом через ноль.
         assert_eq!(ids, vec![0xfffe, 0xffff, 0, 1]);
+    }
+
+    /// Стек с нулевым ip_id: все части тоже с нулём, как его остальные пакеты.
+    #[test]
+    fn zero_ip_id_stays_zero() {
+        let pkt = v4(b"0123456789", TCP_ACK | TCP_PSH);
+        let t = parse(&pkt).unwrap();
+        let parts = apply(&pkt, &t, &Technique::Split { pos: 4 });
+        assert!(parts.iter().all(|p| p[4..6] == [0, 0]));
     }
 
     #[test]

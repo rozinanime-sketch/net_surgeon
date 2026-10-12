@@ -151,6 +151,7 @@ mod imp {
             };
             let runtime = ctx.runtime.clone();
             let log = log_tx.clone();
+            let telegram_relay = telegram.is_some();
             diverter.threads.push(
                 std::thread::Builder::new()
                     .name("windivert-tcp".into())
@@ -158,7 +159,7 @@ mod imp {
                         // Выбор стратегии запускает диагностику и пишет файл
                         // стратегий — это задачи рантайма tokio.
                         let _rt = runtime.enter();
-                        run_tcp(&tcp, port, &env, &log)
+                        run_tcp(&tcp, port, telegram_relay, &env, &log)
                     })
                     .map_err(|e| e.to_string())?,
             );
@@ -234,7 +235,9 @@ mod imp {
         });
     }
 
-    fn run_tcp(handle: &Arc<Handle>, port: u16, env: &WinEnv, log_tx: &LogSender) {
+    /// `telegram_relay` — задан ли ретранслятор Telegram: только тогда его
+    /// соединения разворачиваются на слушатель (как и в [`super::tcp::filter`]).
+    fn run_tcp(handle: &Arc<Handle>, port: u16, telegram_relay: bool, env: &WinEnv, log_tx: &LogSender) {
         let mut nat = Nat::new(port);
         let mut engine = Engine::new();
         let me = std::process::id();
@@ -248,12 +251,15 @@ mod imp {
             let outbound = addr.outbound();
             let now = Instant::now();
 
-            // Разворот на слушатель: Telegram (фильтр пропускает его, только
-            // когда задан ретранслятор), ответы слушателя и входящие на его
-            // порт снаружи — их Nat выбрасывает.
+            // Разворот на слушатель: Telegram (только когда задан
+            // ретранслятор — без него ClientHello к его сетям обходится, как
+            // любой другой), ответы слушателя и входящие на его порт снаружи —
+            // их Nat выбрасывает.
             let to_listener = if outbound {
                 t.sport == port
-                    || (t.dport == HTTPS_PORT && crate::proxy::telegram::is_telegram(t.dst, t.dport))
+                    || (telegram_relay
+                        && t.dport == HTTPS_PORT
+                        && crate::proxy::telegram::is_telegram(t.dst, t.dport))
             } else {
                 t.dport == port
             };

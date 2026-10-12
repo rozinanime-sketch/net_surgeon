@@ -19,7 +19,7 @@ use crate::bypass::packet_mode::Mark;
 use crate::engine::strategy::Strategy;
 use crate::proxy::adaptive::Selected;
 
-pub const HTTPS_PORT: u16 = 443;
+pub use super::nat::HTTPS_PORT;
 
 /// Сколько ждать ответа сервера на ClientHello, прежде чем засчитать
 /// стратегии провал. Больше таймаута пробы: в бою бывают медленные сети.
@@ -28,6 +28,11 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// подтвердил) должна получить ту же технику, а не новое решение.
 const FLOW_TTL: Duration = Duration::from_secs(120);
 const PURGE_EVERY: Duration = Duration::from_secs(5);
+/// Насколько дальше первого ClientHello может начинаться пакет того же
+/// соединения (повтор, второй ClientHello после HelloRetryRequest). Новое
+/// соединение с того же порта начинается со случайного номера и почти
+/// наверняка лежит вне этого окна.
+const SAME_CONNECTION_SPAN: u32 = 1 << 16;
 
 /// Фильтр WinDivert для TCP.
 ///
@@ -115,6 +120,9 @@ enum Kind {
 struct Flow {
     kind: Kind,
     technique: Technique,
+    /// Номер последовательности первого ClientHello: по нему повтор
+    /// отличается от нового соединения с того же порта.
+    seq: u32,
     seen: Instant,
 }
 
@@ -136,8 +144,11 @@ impl Engine {
         let key = Key { local: t.src, local_port: t.sport, remote: t.dst };
 
         // Повтор ClientHello: сервер не подтвердил первый. Та же техника,
-        // без нового решения и строки в логе.
-        if let Some(flow) = self.flows.get_mut(&key) {
+        // без нового решения и строки в логе. Номер вне окна — это новое
+        // соединение с того же порта: ему своё решение и своя метка.
+        if let Some(flow) = self.flows.get_mut(&key)
+            && t.seq.wrapping_sub(flow.seq) < SAME_CONNECTION_SPAN
+        {
             flow.seen = now;
             return Outbound::Send(desync::apply(pkt, &t, &flow.technique));
         }
@@ -152,7 +163,7 @@ impl Engine {
             },
         };
         let packets = desync::apply(pkt, &t, &technique);
-        self.flows.insert(key, Flow { kind, technique, seen: now });
+        self.flows.insert(key, Flow { kind, technique, seq: t.seq, seen: now });
         Outbound::Send(packets)
     }
 
@@ -273,17 +284,11 @@ fn describe(technique: &Technique, len: usize) -> Option<String> {
         Technique::Fake { pos, decoy } => Some(format!("fake {}+{}+{}", decoy.len(), pos, len - pos)),
         Technique::Seqovl { pos, overlap, .. } => Some(format!("seqovl {}:{}+{}", overlap, pos, len - pos)),
         Technique::FakeMultiDisorder { positions, decoy } => {
-            // Размеры сегментов по точкам реза — для наглядности в логе.
-            let mut parts = Vec::new();
-            let mut prev = 0usize;
-            for &p in positions {
-                let p = p.min(len);
-                if p > prev {
-                    parts.push((p - prev).to_string());
-                    prev = p;
-                }
-            }
-            parts.push((len.saturating_sub(prev)).to_string());
+            // Размеры сегментов по тем же границам, что режет desync.
+            let parts: Vec<String> = desync::multidisorder_bounds(positions, len)
+                .windows(2)
+                .map(|w| (w[1] - w[0]).to_string())
+                .collect();
             Some(format!("fake+multidisorder {}/{}", decoy.len(), parts.join("+")))
         }
     }
@@ -415,6 +420,22 @@ mod tests {
         let again = sent(engine.outbound(&pkt, now, &env));
         assert_eq!(first, again);
         assert_eq!(env.remembered.borrow().len(), 1, "решение принято один раз");
+    }
+
+    /// Порт занят заново под новое соединение к тому же серверу: старая
+    /// техника к нему не прилипает, и его метка забирается.
+    #[test]
+    fn reused_port_with_new_sequence_is_a_new_connection() {
+        let env = FakeEnv { strategy: Some(Strategy::Disorder), ..Default::default() };
+        let mut engine = Engine::new();
+        let now = Instant::now();
+        assert_eq!(sent(engine.outbound(&hello(50010), now, &env)).len(), 2, "disorder");
+
+        env.marks.borrow_mut().insert(50010, Mark::Own);
+        let mut again = hello(50010);
+        again[24..28].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+        assert_eq!(sent(engine.outbound(&again, now, &env)), vec![again.clone()], "своё — как есть");
+        assert!(env.marks.borrow().is_empty(), "метка забрана");
     }
 
     #[test]

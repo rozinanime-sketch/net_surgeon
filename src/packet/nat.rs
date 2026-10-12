@@ -29,14 +29,12 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
+use super::desync::{TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+
 /// Порт, соединения на который перехватываются. Тот же, что у правила
 /// nftables в Linux.
 pub const HTTPS_PORT: u16 = 443;
 
-const TCP_FIN: u8 = 0x01;
-const TCP_SYN: u8 = 0x02;
-const TCP_RST: u8 = 0x04;
-const TCP_ACK: u8 = 0x10;
 const IPPROTO_TCP: u8 = 6;
 
 /// Сколько помнить поток без пакетов. Столько же по умолчанию ждёт TCP
