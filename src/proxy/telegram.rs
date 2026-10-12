@@ -79,6 +79,11 @@ const PORTS: &[u16] = &[443, 80, 5222];
 
 static RELAY: RwLock<Option<Arc<str>>> = RwLock::new(None);
 
+/// Секрет воркера (`token: …` в telegram_relay.txt), если задан. Уходит
+/// заголовком `X-Relay-Token`: без него воркер с секретом не отвечает (см.
+/// cloudflare/worker.js). В лог не пишется.
+static RELAY_TOKEN: RwLock<Option<Arc<str>>> = RwLock::new(None);
+
 /// Имя в приманке для TLS до воркера (`[bypass] fake_sni`). Остальное
 /// у приманки ретранслятора своё (см. `ws::fake_handshake`), из конфига
 /// берётся только имя.
@@ -242,12 +247,16 @@ pub fn reload(log_tx: &LogSender, bypass: &crate::config::BypassParams) {
     if let Ok(mut ttl) = RELAY_TTL.lock() {
         *ttl = None;
     }
-    let host = paths::read_to_string(CONFIG_FILE).ok().and_then(|text| parse(&text));
+    let text = paths::read_to_string(CONFIG_FILE).ok();
+    let host = text.as_deref().and_then(parse);
     if let Some(h) = &host {
         log_t(log_tx, LogLevel::Info, "log.telegram_relay_active", vec![("host", masked(h))]);
     }
     if let Ok(mut guard) = RELAY.write() {
         *guard = host.map(Arc::from);
+    }
+    if let Ok(mut guard) = RELAY_TOKEN.write() {
+        *guard = text.as_deref().and_then(parse_token).map(Arc::from);
     }
 }
 
@@ -281,10 +290,7 @@ pub(crate) fn masked_if_relay(host: &str) -> String {
 /// вписали по привычке, отрезаются: нужен только хост — порты ретранслятор
 /// выбирает сам (443 и 8443).
 fn parse(text: &str) -> Option<String> {
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+    let line = config_lines(text).find(|l| token_value(l).is_none())?;
     let without_scheme = line.split_once("://").map_or(line, |(_, rest)| rest);
     let authority = without_scheme.split('/').next()?;
     let host = match authority.rsplit_once(':') {
@@ -293,6 +299,23 @@ fn parse(text: &str) -> Option<String> {
     }
     .trim();
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Строки файла без пустых и комментариев.
+fn config_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// Значение строки `token: …` (или `token = …`).
+fn token_value(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("token")?.trim_start();
+    let value = rest.strip_prefix(':').or_else(|| rest.strip_prefix('='))?.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Секрет воркера, если он записан в файле.
+fn parse_token(text: &str) -> Option<String> {
+    config_lines(text).find_map(token_value).map(str::to_string)
 }
 
 /// Ведёт соединение клиента к `ip:port` через воркер.
@@ -748,6 +771,12 @@ mod ws {
     /// Рукопожатие WebSocket поверх готового TLS.
     async fn upgrade(mut stream: Stream, host: &str, path: &str) -> std::io::Result<Stream> {
         let key = base64::engine::general_purpose::STANDARD.encode(crate::bypass::random::bytes(16));
+        let token = RELAY_TOKEN
+            .read()
+            .ok()
+            .and_then(|t| t.clone())
+            .map(|t| format!("X-Relay-Token: {t}\r\n"))
+            .unwrap_or_default();
         let request = format!(
             "GET {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
@@ -755,7 +784,8 @@ mod ws {
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: {key}\r\n\
              Sec-WebSocket-Version: 13\r\n\
-             Sec-WebSocket-Protocol: binary\r\n\r\n"
+             Sec-WebSocket-Protocol: binary\r\n\
+             {token}\r\n"
         );
         stream.write_all(request.as_bytes()).await?;
 
@@ -866,6 +896,41 @@ mod tests {
         assert_eq!(masked("relay.mysite.ru"), "relay.***.ru");
         assert_eq!(masked("mysite.ru"), "***.ru");
         assert_eq!(masked("localhost"), "***");
+    }
+
+    #[test]
+    fn parses_optional_token_line() {
+        let text = "# воркер\ntoken: s3cret-value\nabc.x.workers.dev\n";
+        assert_eq!(parse(text).as_deref(), Some("abc.x.workers.dev"), "строка секрета — не хост");
+        assert_eq!(parse_token(text).as_deref(), Some("s3cret-value"));
+        assert_eq!(parse_token("abc.x.workers.dev\ntoken = other\n").as_deref(), Some("other"));
+        assert_eq!(parse_token("abc.x.workers.dev\n"), None);
+        assert_eq!(parse_token("token:\n"), None, "пустой секрет — нет секрета");
+    }
+
+    /// Список сетей и портов в воркере — копия здешнего. Разойдутся — и
+    /// клиент поведёт соединение к воркеру, а тот ответит 403.
+    #[test]
+    fn worker_allows_the_same_networks_and_ports() {
+        let worker = include_str!("../../cloudflare/worker.js");
+        let nets: Vec<String> = worker
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim().strip_prefix("[\"")?;
+                let (ip, rest) = l.split_once("\", ")?;
+                let bits = rest.strip_suffix("],")?;
+                Some(format!("{ip}/{bits}"))
+            })
+            .collect();
+        let ours: Vec<String> = networks_v4().map(|(ip, bits)| format!("{ip}/{bits}")).collect();
+        assert_eq!(nets, ours);
+
+        let ports_line = worker.lines().find(|l| l.starts_with("const PORTS")).expect("PORTS в воркере");
+        let mut theirs: Vec<u16> = ports_line.split('"').filter_map(|p| p.parse().ok()).collect();
+        let mut ours = PORTS.to_vec();
+        theirs.sort_unstable();
+        ours.sort_unstable();
+        assert_eq!(theirs, ours);
     }
 
     #[test]
