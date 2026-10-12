@@ -287,6 +287,9 @@ pub fn load_config() -> Result<Config, String> {
     let mut config: Config = toml::from_str(&contents)
         .map_err(|e| rust_i18n::t!("startup.config_parse", error = e).into_owned())?;
     config.replace_dead_smart_dns();
+    if config.smart_dns_replaced {
+        config.persist_smart_dns();
+    }
     config.drop_foreign_bootstrap();
     Ok(config)
 }
@@ -321,6 +324,16 @@ impl Config {
             self.smart_dns_bootstrap_ip = Some(std::net::IpAddr::from(GEOHIDE_DNS_IP));
             self.smart_dns_replaced = true;
         }
+    }
+
+    /// Замена умного DNS — и в файл: иначе редактор настроек (на телефоне
+    /// и в терминальном интерфейсе) показывал старый закрытый адрес, хотя
+    /// работал уже GeoHide. Не вышло записать — не беда: подмена в памяти
+    /// и так действует, а в лог о ней пишется при запуске.
+    fn persist_smart_dns(&self) {
+        let ip = self.smart_dns_bootstrap_ip.map(|ip| ip.to_string()).unwrap_or_default();
+        let _ = editor::save_field("smart_dns_provider", &self.smart_dns_provider)
+            .and_then(|()| editor::save_field("smart_dns_bootstrap_ip", &ip));
     }
 
     /// Адрес по умолчанию подставляется, когда ключа нет. Но он — адрес

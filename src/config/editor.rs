@@ -114,7 +114,7 @@ fn typed_value(existing: Option<&toml_edit::Item>, new_value: &str) -> Result<to
             .trim()
             .parse::<i64>()
             .map(toml_edit::value)
-            .map_err(|_| bad("integer")),
+            .map_err(|_| bad(&rust_i18n::t!("config.kind_integer"))),
         Some(Value::Boolean(_)) => new_value
             .trim()
             .parse::<bool>()
@@ -124,7 +124,7 @@ fn typed_value(existing: Option<&toml_edit::Item>, new_value: &str) -> Result<to
             .trim()
             .parse::<f64>()
             .map(toml_edit::value)
-            .map_err(|_| bad("number")),
+            .map_err(|_| bad(&rust_i18n::t!("config.kind_number"))),
         Some(Value::String(_)) => Ok(toml_edit::value(new_value)),
         // Поля в файле ещё нет (добавлено в Config с #[serde(default)]) —
         // тип угадываем по введённому, как и раньше.

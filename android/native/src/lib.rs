@@ -354,6 +354,10 @@ pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_configFields<'l>(
     let data_dir = java_string(&mut env, &data_dir);
     let lang = java_string(&mut env, &lang);
     prepare(&data_dir, &lang);
+    // Сначала загрузка как при запуске: она записывает в файл замену
+    // закрытого умного DNS, и экран показывает то, что реально работает,
+    // даже если обход ещё ни разу не включали.
+    let _ = net_surgeon::config::load_config();
     let text = match net_surgeon::config::editor::load_fields() {
         Ok(fields) => fields
             .iter()

@@ -259,6 +259,8 @@ startup.domains_empty: "Список обхода пуст: bypass_domains.txt �
 startup.list_domains_added: "Добавлено в %{file} (новое в этой версии): %{domains}. Удалённые вами домены не вернутся."
 startup.list_update_failed: "Не удалось дописать новые домены в %{file}: %{error}"
 error.config_bad_value: "Значение «%{value}» не подходит для этого поля: ожидается %{expected}. Файл не изменён."
+config.kind_integer: "целое число"
+config.kind_number: "число"
 error.config_would_break: "Правка сделала бы config.toml нечитаемым (%{error}). Файл не изменён."
 log.transparent_bypass_via_ip: "Прозрачный режим: %{ip} опознан как %{domain} по кэшу DNS — включаю обход"
 log.socks5_udp_frag_unsupported: "SOCKS5 UDP: датаграмма с FRAG=%{frag} отброшена — сборка фрагментов не поддерживается"
