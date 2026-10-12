@@ -129,26 +129,37 @@ fn log_tx() -> &'static LogSender {
     })
 }
 
+/// Каталог данных и язык — до первого обращения ядра к файлам: каталог оно
+/// вычисляет один раз, и эта переменная — его первый источник. Зовётся и при
+/// запуске, и из экрана настроек, который может открыться раньше запуска.
+fn prepare(data_dir: &str, lang: &str) {
+    if let Ok(mut l) = LANG.lock() {
+        *l = lang.to_string();
+    }
+    // SAFETY: другие потоки окружение не читают — переменная ставится под
+    // замком один раз, до того как ядро что-либо прочитало.
+    static DIR_SET: Mutex<bool> = Mutex::new(false);
+    let mut set = DIR_SET.lock().unwrap_or_else(|e| e.into_inner());
+    if !*set && std::env::var_os("NET_SURGEON_DIR").is_none() {
+        unsafe { std::env::set_var("NET_SURGEON_DIR", data_dir) };
+    }
+    *set = true;
+    net_surgeon::set_locale(lang);
+}
+
+/// Сколько ждать, пока SOCKS5 ядра займёт порт.
+const SOCKS5_BIND_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Поднимает ядро и tun2proxy поверх дескриптора TUN. `None` — запущено,
 /// иначе текст ошибки для экрана.
 fn start(tun_fd: i32, data_dir: String, lang: String) -> Option<String> {
-    if let Ok(mut l) = LANG.lock() {
-        *l = lang.clone();
-    }
-    let mut running = RUNNING.lock().ok()?;
+    // Отравленный замок — не «успех»: иначе дескриптор TUN остался бы
+    // открытым без читателя, и сеть телефона встала бы.
+    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     if running.is_some() {
         return Some(tr("startup.already_running", &[]));
     }
-
-    // Каталог данных ядро вычисляет один раз, при первом обращении, и эта
-    // переменная — его первый источник. Ставится до bootstrap.
-    //
-    // SAFETY: другие потоки окружение не читают: runtime ещё не запускал
-    // задач ядра, а set_var до первого старта выполняется один раз.
-    if std::env::var_os("NET_SURGEON_DIR").is_none() {
-        unsafe { std::env::set_var("NET_SURGEON_DIR", &data_dir) };
-    }
-    net_surgeon::set_locale(&lang);
+    prepare(&data_dir, &lang);
 
     let startup = match net_surgeon::bootstrap() {
         Ok(s) => s,
@@ -198,16 +209,40 @@ fn start(tun_fd: i32, data_dir: String, lang: String) -> Option<String> {
         });
     }
 
+    // tun2proxy — только когда SOCKS5 ядра действительно занял порт. Раньше
+    // была пауза в 300 мс наугад: занятый порт (другое приложение на 1081,
+    // старый слушатель ещё не закрылся) отправлял весь трафик телефона в
+    // чужой SOCKS или в никуда, а экран показывал «включено».
+    let bound = rt.block_on(async {
+        let deadline = tokio::time::Instant::now() + SOCKS5_BIND_WAIT;
+        while !startup.metrics.snapshot().socks5_listening {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        true
+    });
+    if !bound {
+        token.cancel();
+        return Some(tr("startup.socks5_not_listening", &[("port", startup.config.socks5_port.to_string())]));
+    }
+
     {
         let token = token.clone();
         let mtu = args.mtu;
         rt.spawn(async move {
-            // Ядру нужно мгновение, чтобы поднять SOCKS5: без паузы первые
-            // соединения tun2proxy получили бы отказ.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            match tun2proxy::general_run_async(args, mtu, false, token).await {
+            let result = tun2proxy::general_run_async(args, mtu, false, token.clone()).await;
+            match result {
                 Ok(_) => push_line(tr("startup.tun_stopped", &[])),
                 Err(e) => push_line(format!("✗ {}", tr("startup.tun_error", &[("error", e.to_string())]))),
+            }
+            // Закончился сам, а не по выключению, — обход мёртв. Снимаем
+            // «работает», чтобы экран и плитка это показали, а сервис
+            // (он следит за isRunning) выключился и его можно было включить
+            // снова.
+            if !token.is_cancelled() {
+                stop();
             }
         });
     }
@@ -240,9 +275,8 @@ fn start(tun_fd: i32, data_dir: String, lang: String) -> Option<String> {
 }
 
 fn stop() {
-    if let Ok(mut running) = RUNNING.lock()
-        && let Some(token) = running.take()
-    {
+    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(token) = running.take() {
         token.cancel();
     }
 }
@@ -297,9 +331,90 @@ pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_onNetworkChanged<'
     net_id: JString<'l>,
 ) {
     let id = java_string(&mut env, &net_id);
-    push_line(format!("· сеть: {id}"));
+    // Свойства сети меняются и без смены сети (новый IPv6-адрес, маршруты).
+    // Сбрасывать подобранное под неё каждый раз значило бы терять его зря.
+    if id == net_surgeon::engine::net_id::current() {
+        return;
+    }
+    push_line(format!("· {}", tr("log.network_changed", &[("id", id.clone())])));
     net_surgeon::engine::net_id::set(id);
     net_surgeon::reset_network_tuning();
+}
+
+/// Поля настроек для экрана «Настройки»: по строке на поле,
+/// `группа \t подпись \t путь \t bool|text \t значение`. Подписи — на языке
+/// приложения. Ошибка чтения конфига — одна строка `!\tтекст`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_configFields<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+    lang: JString<'l>,
+) -> jstring {
+    let data_dir = java_string(&mut env, &data_dir);
+    let lang = java_string(&mut env, &lang);
+    prepare(&data_dir, &lang);
+    let text = match net_surgeon::config::editor::load_fields() {
+        Ok(fields) => fields
+            .iter()
+            .filter(|f| !HIDDEN_ON_ANDROID.contains(&f.toml_path))
+            .map(|f| {
+                let clean = |s: String| s.replace(['\t', '\n'], " ");
+                format!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    clean(tr(f.group_key, &[])),
+                    clean(tr(f.label_key, &[])),
+                    f.toml_path,
+                    if f.is_bool() { "bool" } else { "text" },
+                    clean(f.value.clone()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("!\t{}", e.render(&lang)),
+    };
+    env.new_string(text).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Поля, которым на телефоне нечего делать: прозрачного режима, своего
+/// DNS-релея и пакетного режима здесь нет (их роль играет VpnService).
+const HIDDEN_ON_ANDROID: &[&str] = &["port", "udp_port", "transparent_port", "packet_mode"];
+
+/// Записывает одно поле. `null` — сохранено, иначе текст ошибки: значение не
+/// того типа или конфиг с ним не прочитался бы.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_setConfigField<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+    lang: JString<'l>,
+    path: JString<'l>,
+    value: JString<'l>,
+) -> jstring {
+    let data_dir = java_string(&mut env, &data_dir);
+    let lang = java_string(&mut env, &lang);
+    let path = java_string(&mut env, &path);
+    let value = java_string(&mut env, &value);
+    prepare(&data_dir, &lang);
+    match net_surgeon::config::editor::save_field(&path, &value) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(e) => env.new_string(e.render(&lang)).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+/// Проверяет текст config.toml целиком (правка «как текст»). `null` —
+/// годится, иначе текст ошибки.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_checkConfig<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    text: JString<'l>,
+) -> jstring {
+    let text = java_string(&mut env, &text);
+    match net_surgeon::config::check(&text) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(e) => env.new_string(e).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -307,10 +422,7 @@ pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_isRunning<'l>(
     _env: JNIEnv<'l>,
     _class: JClass<'l>,
 ) -> jboolean {
-    match RUNNING.lock() {
-        Ok(r) if r.is_some() => JNI_TRUE,
-        _ => JNI_FALSE,
-    }
+    if RUNNING.lock().unwrap_or_else(|e| e.into_inner()).is_some() { JNI_TRUE } else { JNI_FALSE }
 }
 
 /// Все накопленные строки лога, по одной на строку. Буфер не очищается:

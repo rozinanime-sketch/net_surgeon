@@ -16,20 +16,33 @@ object UpdateCheck {
     private const val PAGE_PREFIX = "https://github.com/rozinanime-sketch/net_surgeon/"
     private const val DAY_MS = 24 * 60 * 60 * 1000L
 
-    /** Проверяет в фоне, если с прошлой проверки прошли сутки. */
+    /** Проверка идёт прямо сейчас. */
+    private val inFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Когда проверка последний раз не удалась (в пределах процесса). */
+    @Volatile private var failedAt = 0L
+    private const val RETRY_MS = 60 * 60 * 1000L
+
+    /**
+     * Проверяет в фоне, если с прошлой проверки прошли сутки. Не удалась —
+     * повтор не раньше чем через час: раньше каждое возвращение на экран
+     * при недоступном GitHub запускало ещё один поток с таймаутами.
+     */
     fun maybeRun(context: Context, done: () -> Unit) {
         val app = context.applicationContext
-        if (System.currentTimeMillis() - Prefs.updateCheckedAt(app) < DAY_MS) return
+        val now = System.currentTimeMillis()
+        if (now - Prefs.updateCheckedAt(app) < DAY_MS || now - failedAt < RETRY_MS) return
+        if (!inFlight.compareAndSet(false, true)) return
         Thread {
-            // Сеть недоступна или GitHub ответил не то — попробуем в другой
-            // день; время проверки при ошибке не записываем.
-            val release = try {
-                fetch()
+            try {
+                val release = fetch()
+                Prefs.saveUpdateCheck(app, release)
+                done()
             } catch (e: Exception) {
-                return@Thread
+                failedAt = System.currentTimeMillis()
+            } finally {
+                inFlight.set(false)
             }
-            Prefs.saveUpdateCheck(app, release)
-            done()
         }.start()
     }
 

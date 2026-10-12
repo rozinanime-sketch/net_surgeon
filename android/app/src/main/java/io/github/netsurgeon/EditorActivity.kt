@@ -16,8 +16,8 @@ import android.widget.Toast
 
 /**
  * Правка файла данных как текста: списка доменов (домен на строку, `#` —
- * комментарий) или адреса ретранслятора Telegram. Формат тот же, что на
- * компьютере, поэтому файл можно перенести как есть.
+ * комментарий), адреса ретранслятора Telegram или config.toml целиком.
+ * Формат тот же, что на компьютере, поэтому файл можно перенести как есть.
  */
 class EditorActivity : Activity() {
 
@@ -27,6 +27,7 @@ class EditorActivity : Activity() {
         val title = intent.getStringExtra(EXTRA_TITLE) ?: file
         val hint = intent.getStringExtra(EXTRA_HINT)
             ?: getString(R.string.hint_domains)
+        val mode = intent.getStringExtra(EXTRA_MODE) ?: MODE_DOMAINS
 
         val pad = (16 * resources.displayMetrics.density).toInt()
         val root = LinearLayout(this).apply {
@@ -69,7 +70,13 @@ class EditorActivity : Activity() {
             text = getString(R.string.save)
             setOnClickListener {
                 try {
-                    DataFiles.write(this@EditorActivity, file, normalize(editor.text.toString()))
+                    val text = normalize(editor.text.toString(), mode)
+                    // Конфиг, который не прочитается, не сохраняем: со следующего
+                    // запуска обход просто не включился бы.
+                    if (mode == MODE_CONFIG) {
+                        NativeBridge.checkConfig(text)?.let { error(it) }
+                    }
+                    DataFiles.write(this@EditorActivity, file, text)
                     Toast.makeText(this@EditorActivity, R.string.saved, Toast.LENGTH_SHORT).show()
                     finish()
                 } catch (e: Exception) {
@@ -85,16 +92,33 @@ class EditorActivity : Activity() {
     /**
      * Домены в нижний регистр и без пробелов вовсе — в имени их не бывает,
      * а клавиатура могла вставить их после точек; комментарии как есть.
+     * Строка `token: …` в файле Telegram — как есть: секрет воркера
+     * сравнивается с учётом регистра, и в нижнем регистре он не подходил.
+     * config.toml не трогаем вовсе.
      */
-    private fun normalize(text: String): String =
-        text.lines().joinToString("\n") { line ->
-            if (line.trimStart().startsWith("#")) line.trimEnd()
-            else line.filterNot { it.isWhitespace() }.lowercase()
+    private fun normalize(text: String, mode: String): String {
+        if (mode == MODE_CONFIG) return text.trimEnd() + "\n"
+        return text.lines().joinToString("\n") { line ->
+            when {
+                line.trimStart().startsWith("#") -> line.trimEnd()
+                mode == MODE_RELAY && isTokenLine(line) -> line.trim()
+                else -> line.filterNot { it.isWhitespace() }.lowercase()
+            }
         }.trimEnd() + "\n"
+    }
+
+    private fun isTokenLine(line: String): Boolean {
+        val rest = line.trimStart().removePrefix("token")
+        return rest.length < line.trimStart().length && rest.trimStart().let { it.startsWith(":") || it.startsWith("=") }
+    }
 
     companion object {
         const val EXTRA_FILE = "file"
         const val EXTRA_TITLE = "title"
         const val EXTRA_HINT = "hint"
+        const val EXTRA_MODE = "mode"
+        const val MODE_DOMAINS = "domains"
+        const val MODE_RELAY = "relay"
+        const val MODE_CONFIG = "config"
     }
 }

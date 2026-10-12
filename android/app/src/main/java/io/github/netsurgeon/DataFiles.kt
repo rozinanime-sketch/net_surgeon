@@ -14,16 +14,12 @@ object DataFiles {
     const val BLOCK = "block_domains.txt"
     const val TELEGRAM_RELAY = "telegram_relay.txt"
     const val SMART_DNS = "smart_dns_domains.txt"
-    private const val CONFIG = "config.toml"
+    const val CONFIG = "config.toml"
     private val DEFAULTS = listOf(CONFIG, BYPASS, BLOCK, SMART_DNS)
 
-    /**
-     * Настройки, появившиеся после первых версий. В уже установленном
-     * приложении config.toml старый и не перезаписывается, поэтому без
-     * них новая возможность молча не включилась бы. Дописываем из assets
-     * только отсутствующие ключи, правки пользователя не трогаем.
-     */
-    private val ADDED_KEYS = listOf("smart_dns_provider", "smart_dns_bootstrap_ip")
+    // Ключи, которых нет в старом config.toml (умный DNS), ядро подставляет
+    // само теми же значениями (src/config/mod.rs) — дописывать их сюда не
+    // нужно.
 
     // Новые домены в уже существующие списки дописывает ядро при запуске
     // (src/config/list_updates.rs), с теми же файлами-метками, что были здесь.
@@ -34,51 +30,37 @@ object DataFiles {
     fun dir(context: Context): File = context.filesDir
 
     fun ensure(context: Context) {
-        for (name in DEFAULTS) {
-            val target = File(dir(context), name)
-            if (target.exists()) continue
-            context.assets.open(name).use { input ->
-                target.outputStream().use { input.copyTo(it) }
-            }
-        }
-        addMissingKeys(context)
-        for (name in OPTIONAL) {
-            val target = File(dir(context), name)
-            if (target.exists()) continue
-            val input = try {
-                context.assets.open(name)
+        for (name in DEFAULTS + OPTIONAL) {
+            if (File(dir(context), name).exists()) continue
+            val bytes = try {
+                context.assets.open(name).use { it.readBytes() }
             } catch (e: java.io.FileNotFoundException) {
-                continue
+                continue // необязательного файла в этой сборке нет
             }
-            input.use { src -> target.outputStream().use { src.copyTo(it) } }
+            // Через временный файл: убитый посреди копирования процесс
+            // оставлял обрезанный файл, а существующий больше не копируется.
+            write(context, name, bytes)
         }
-    }
-
-    private fun addMissingKeys(context: Context) {
-        val target = File(dir(context), CONFIG)
-        val current = target.readText()
-        val present = current.lineSequence().map { it.substringBefore('=').trim() }.toSet()
-        val shipped = context.assets.open(CONFIG).bufferedReader().use { it.readText() }
-        val missing = shipped.lineSequence()
-            .filter { line -> line.substringBefore('=').trim().let { it in ADDED_KEYS && it !in present } }
-            .toList()
-        if (missing.isEmpty()) return
-        // Ключи верхнего уровня: в TOML их нельзя дописать после первой
-        // [секции], иначе они попадут в неё. Вставляем перед ней.
-        val lines = current.lines().toMutableList()
-        val section = lines.indexOfFirst { it.trimStart().startsWith("[") }.takeIf { it >= 0 } ?: lines.size
-        lines.addAll(section, missing + "")
-        write(context, CONFIG, lines.joinToString("\n"))
     }
 
     fun read(context: Context, name: String): String =
         File(dir(context), name).takeIf { it.exists() }?.readText() ?: ""
 
-    /** Через временный файл, как и в ядре: обрезанный список хуже старого. */
-    fun write(context: Context, name: String, text: String) {
+    fun write(context: Context, name: String, text: String) = write(context, name, text.toByteArray())
+
+    /**
+     * Через временный файл, как и в ядре: обрезанный список хуже старого.
+     * Перед переименованием данные сбрасываются на диск — иначе после
+     * пропажи питания переименование могло оказаться на диске раньше
+     * содержимого, и файл оставался пустым.
+     */
+    private fun write(context: Context, name: String, bytes: ByteArray) {
         val target = File(dir(context), name)
         val tmp = File(dir(context), ".$name.tmp")
-        tmp.writeText(text)
+        java.io.FileOutputStream(tmp).use { out ->
+            out.write(bytes)
+            out.fd.sync()
+        }
         if (!tmp.renameTo(target)) {
             tmp.delete()
             error(context.getString(R.string.save_failed, name))

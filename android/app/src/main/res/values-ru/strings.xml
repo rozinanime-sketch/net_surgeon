@@ -11,7 +11,7 @@
     <string name="title_bypass">Домены для обхода</string>
     <string name="title_block">Блокировка трекеров</string>
     <string name="title_telegram">Ретранслятор Telegram</string>
-    <string name="hint_telegram">Адрес своего воркера Cloudflare, например net-surgeon-tg.&lt;поддомен&gt;.workers.dev. Как его завести — cloudflare/README.md в репозитории. Пусто — Telegram идёт напрямую. Применится после перезапуска обхода.</string>
+    <string name="hint_telegram">Адрес своего воркера Cloudflare, например net-surgeon-tg.&lt;поддомен&gt;.workers.dev. Как его завести — cloudflare/README.md в репозитории. Если у воркера есть секрет, добавьте строку «token: &lt;секрет&gt;». Пусто — Telegram идёт напрямую. Применится после перезапуска обхода.</string>
     <string name="title_smart_dns">Нейросети (умный DNS)</string>
     <string name="hint_smart_dns">Сервисы, закрытые для России по IP: их имена разрешаются через умный DNS. Домен на строку, поддомены учитываются. Применится после перезапуска обхода.</string>
     <string name="hint_domains">Домен на строку, поддомены учитываются. Применится после перезапуска обхода.</string>
@@ -34,4 +34,11 @@
     <string name="notif_text">Нажмите, чтобы открыть net surgeon</string>
     <string name="tile_on">Включён</string>
     <string name="tile_off">Выключен</string>
+    <string name="settings">Настройки</string>
+    <string name="title_settings">Настройки</string>
+    <string name="hint_settings">Переключатели сохраняются сразу, поля — кнопкой «Сохранить». Значение, с которым конфиг не прочитается, не сохранится. Применится после перезапуска обхода.</string>
+    <string name="edit_as_text">Как текст</string>
+    <string name="hint_config_text">config.toml целиком, как на компьютере. Конфиг, который не прочитается, не сохранится. Применится после перезапуска обхода.</string>
+    <string name="saved_partly">Сохранено не всё: поправьте поля с ошибкой</string>
+    <string name="start_failed">Обход не включился: %1$s</string>
 </resources>

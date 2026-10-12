@@ -11,8 +11,11 @@ import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
 import android.net.VpnService
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.service.quicksettings.TileService
+import android.widget.Toast
 
 /**
  * VPN без сервера: весь трафик телефона приходит сюда через TUN и уходит
@@ -60,18 +63,37 @@ class SurgeonVpnService : VpnService() {
                 return
             }
 
-        // Язык ресурсов, а не Locale.getDefault(): так учитывается и язык,
-        // выбранный для одного приложения в настройках Android 13+.
-        val lang = if (resources.configuration.locales[0].language == "ru") "ru" else "en"
         // detachFd: дескриптор теперь принадлежит ядру, и Java его не закроет
         // из-под него при сборке мусора.
-        val error = NativeBridge.start(tun.detachFd(), DataFiles.dir(this).absolutePath, lang)
+        val error = NativeBridge.start(tun.detachFd(), DataFiles.dir(this).absolutePath, NativeBridge.lang(this))
         if (error != null) {
+            // Причину — на экран: иначе обход молча не включался (битый
+            // config.toml, занятый порт), и узнать почему можно было только
+            // в логе.
+            Toast.makeText(this, getString(R.string.start_failed, error), Toast.LENGTH_LONG).show()
             shutdown()
             return
         }
         watchNetwork()
+        handler.postDelayed(watchdog, WATCHDOG_MS)
         refreshTile(this)
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+
+    /**
+     * Ядро может остановиться и само (упал tun2proxy). Тогда сервис тоже
+     * выключается: иначе висело бы уведомление «обход включён», а включить
+     * заново было бы нельзя.
+     */
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (!NativeBridge.isRunning()) {
+                shutdown()
+                return
+            }
+            handler.postDelayed(this, WATCHDOG_MS)
+        }
     }
 
     /**
@@ -82,11 +104,17 @@ class SurgeonVpnService : VpnService() {
      */
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
-    /** Стабильный отпечаток сети без разрешений: интерфейс + отсортированные DNS. */
+    /**
+     * Отпечаток сети без особых разрешений: интерфейс, шлюз и DNS. Имя
+     * Wi-Fi требует разрешения на геолокацию, поэтому его нет. Одного
+     * интерфейса с DNS мало: домашний и рабочий Wi-Fi оба давали
+     * «wlan0|192.168.1.1», и стратегии одной сети применялись в другой.
+     */
     private fun networkId(lp: LinkProperties): String {
         val iface = lp.interfaceName ?: ""
+        val gateway = lp.routes.firstOrNull { it.isDefaultRoute && it.hasGateway() }?.gateway?.hostAddress ?: ""
         val dns = lp.dnsServers.mapNotNull { it.hostAddress }.sorted().joinToString(",")
-        return "$iface|$dns"
+        return "$iface|$gateway|$dns"
     }
 
     private fun watchNetwork() {
@@ -118,6 +146,7 @@ class SurgeonVpnService : VpnService() {
     }
 
     private fun shutdown() {
+        handler.removeCallbacks(watchdog)
         unwatchNetwork()
         NativeBridge.stop()
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -131,6 +160,7 @@ class SurgeonVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(watchdog)
         unwatchNetwork()
         NativeBridge.stop()
         refreshTile(this)
@@ -165,6 +195,7 @@ class SurgeonVpnService : VpnService() {
         private const val MTU = 1500
         private const val CHANNEL = "vpn"
         private const val NOTIFICATION_ID = 1
+        private const val WATCHDOG_MS = 2000L
 
         fun startIntent(context: Context) = Intent(context, SurgeonVpnService::class.java)
 

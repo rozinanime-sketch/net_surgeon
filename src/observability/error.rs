@@ -27,4 +27,10 @@ impl AppError {
         self.args.push((name.to_string(), value.to_string()));
         self
     }
+
+    /// Текст на языке `lang` — для тех, кто показывает ошибку сам (экран
+    /// настроек на телефоне).
+    pub fn render(&self, lang: &str) -> String {
+        crate::observability::i18n::translate(lang, self.key, &self.args)
+    }
 }

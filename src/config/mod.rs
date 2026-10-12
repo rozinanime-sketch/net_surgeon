@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use serde::Deserialize;
 
+pub mod editor;
 pub mod list_updates;
 pub mod paths;
 
@@ -269,6 +270,13 @@ fn default_smart_dns_bootstrap_ip() -> Option<std::net::IpAddr> { Some(std::net:
 /// Провайдер DoH по умолчанию и его адрес — те же, что в config.toml.
 const DEFAULT_DOH_PROVIDER: &str = "https://dns11.quad9.net/dns-query";
 const DEFAULT_DOH_IP: [u8; 4] = [9, 9, 9, 11];
+
+/// Разбирается ли текст как config.toml. `Err` — причина, для правки
+/// конфига «как текст» на телефоне: сохранить его, не проверив, значило бы
+/// получить программу, которая больше не стартует.
+pub fn check(text: &str) -> Result<(), String> {
+    toml::from_str::<Config>(text).map(|_| ()).map_err(|e| e.to_string())
+}
 
 pub fn load_config() -> Result<Config, String> {
     // В сообщении — полный путь, по которому искали. Иначе «файл не найден»

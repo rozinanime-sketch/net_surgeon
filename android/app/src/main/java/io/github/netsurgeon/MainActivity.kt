@@ -100,11 +100,16 @@ class MainActivity : Activity() {
             setOnClickListener {
                 openEditor(
                     DataFiles.TELEGRAM_RELAY, getString(R.string.title_telegram),
-                    getString(R.string.hint_telegram)
+                    getString(R.string.hint_telegram), EditorActivity.MODE_RELAY
                 )
             }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         root.addView(row2, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+        root.addView(Button(this).apply {
+            text = getString(R.string.settings)
+            setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
         root.addView(CheckBox(this).apply {
             text = getString(R.string.autostart)
@@ -216,12 +221,13 @@ class MainActivity : Activity() {
         startForegroundService(SurgeonVpnService.startIntent(this))
     }
 
-    private fun openEditor(file: String, title: String, hint: String? = null) {
+    private fun openEditor(file: String, title: String, hint: String? = null, mode: String = EditorActivity.MODE_DOMAINS) {
         startActivity(
             Intent(this, EditorActivity::class.java)
                 .putExtra(EditorActivity.EXTRA_FILE, file)
                 .putExtra(EditorActivity.EXTRA_TITLE, title)
                 .putExtra(EditorActivity.EXTRA_HINT, hint)
+                .putExtra(EditorActivity.EXTRA_MODE, mode)
         )
     }
 
