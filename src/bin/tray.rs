@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ksni::menu::StandardItem;
@@ -20,7 +21,10 @@ const UNIT: &str = "net_surgeon.service";
 
 /// Путь к файлу службы — по нему понимаем, установлена ли она вообще.
 fn unit_path() -> PathBuf {
+    // Пустая переменная — то же, что её нет: так считает и run.sh
+    // (`${XDG_CONFIG_HOME:-$HOME/.config}`), иначе путь к службе разошёлся бы.
     let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let mut home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
@@ -71,13 +75,24 @@ fn dot(on: bool) -> Vec<Icon> {
     vec![Icon { width: SIZE, height: SIZE, data }]
 }
 
-/// Переключить службу и тут же перечитать фактическое состояние.
+/// Идёт переключение службы (systemctl ещё не вернулся).
+static TOGGLING: AtomicBool = AtomicBool::new(false);
+
+/// Переключить службу. `systemctl` — в отдельном потоке: остановка ждёт,
+/// пока программа снимет перехват и вернёт прокси, — это секунды, и раньше
+/// всё это время значок и меню не отвечали (вызов шёл прямо из обработчика
+/// клика, под замком модели). Значок сразу показывает новое состояние,
+/// фактическое перечитает опрос в `main`, когда systemctl закончит.
 fn toggle(state: &mut SurgeonTray) {
-    if !state.installed {
+    if !state.installed || TOGGLING.swap(true, Ordering::SeqCst) {
         return;
     }
-    set_service(!state.active);
-    state.active = service_active();
+    let target = !state.active;
+    state.active = target;
+    std::thread::spawn(move || {
+        set_service(target);
+        TOGGLING.store(false, Ordering::SeqCst);
+    });
 }
 
 struct SurgeonTray {
@@ -154,17 +169,37 @@ fn main() {
     let tray = SurgeonTray { active: service_active(), installed: service_installed() };
     let service = TrayService::new(tray);
     let handle = service.handle();
-    service.spawn();
+    // Не `spawn()`: тот паникует в своём потоке при ошибке D-Bus, а главный
+    // цикл ниже продолжал бы опрашивать systemctl вечно — без значка.
+    std::thread::spawn(move || {
+        if let Err(e) = service.run() {
+            eprintln!("net_surgeon tray: D-Bus: {e}");
+        }
+        std::process::exit(1);
+    });
 
     // Нет внешнего сигнала о смене состояния службы (её могли запустить и из
-    // консоли), поэтому просто опрашиваем systemctl и обновляем значок.
+    // консоли), поэтому просто опрашиваем systemctl. Значок перерисовывается,
+    // только когда состояние сменилось или закончилось переключение из
+    // меню (оно показало состояние заранее и могло не удаться), а не каждые
+    // 2 с впустую. Пока переключение идёт, опрос значок не трогает.
+    let mut last = None;
+    let mut was_toggling = false;
     loop {
         std::thread::sleep(Duration::from_secs(2));
-        let active = service_active();
-        let installed = service_installed();
-        handle.update(|t: &mut SurgeonTray| {
-            t.active = active;
-            t.installed = installed;
-        });
+        let toggling = TOGGLING.load(Ordering::SeqCst);
+        if toggling {
+            was_toggling = true;
+            continue;
+        }
+        let now = (service_active(), service_installed());
+        if last != Some(now) || was_toggling {
+            handle.update(|t: &mut SurgeonTray| {
+                t.active = now.0;
+                t.installed = now.1;
+            });
+            last = Some(now);
+            was_toggling = false;
+        }
     }
 }

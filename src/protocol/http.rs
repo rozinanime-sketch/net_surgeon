@@ -42,23 +42,42 @@ pub fn parse_http_target(request: &str) -> Option<String> {
             if host_value.is_empty() {
                 return None;
             }
-
-            // Голый IPv6-литерал без порта ("[::1]") содержит ':', но порта в нём нет —
-            // отличаем по завершающей ']'.
-            if host_value.ends_with(']') {
-                return Some(format!("{}:80", host_value));
-            }
-
-            // Если порт уже указан (например example.com:8080 или [::1]:8080)
-            if host_value.contains(':') {
-                return Some(host_value.to_string());
-            } else {
-                // Подставляем стандартный порт HTTP
-                return Some(format!("{}:80", host_value));
-            }
+            return Some(with_default_port(host_value));
         }
     }
-    None
+    // Заголовка нет (клиенты HTTP/1.0 его не обязаны слать) — берём адрес
+    // из абсолютного URI строки запроса: `GET http://host/path HTTP/1.0`.
+    let request_line = request.lines().next()?;
+    let authority = absolute_uri_authority(request_line)?;
+    (!authority.is_empty()).then(|| with_default_port(authority))
+}
+
+/// `host` → `host:80`; уже указанный порт сохраняется.
+fn with_default_port(host_value: &str) -> String {
+    // Голый IPv6-литерал без порта ("[::1]") содержит ':', но порта в нём нет —
+    // отличаем по завершающей ']'. Если порт уже указан (example.com:8080
+    // или [::1]:8080) — оставляем как есть.
+    if !host_value.ends_with(']') && host_value.contains(':') {
+        host_value.to_string()
+    } else {
+        format!("{}:80", host_value)
+    }
+}
+
+/// Authority абсолютного URI из строки запроса: `GET http://a.com:8080/x HTTP/1.1` → `a.com:8080`.
+fn absolute_uri_authority(request_line: &str) -> Option<&str> {
+    let uri = request_line.split(' ').nth(1)?;
+    let rest = strip_scheme(uri)?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Отрезает `http://` / `https://` без учёта регистра.
+fn strip_scheme(uri: &str) -> Option<&str> {
+    ["http://", "https://"]
+        .iter()
+        .find(|s| uri.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s)))
+        .map(|s| &uri[s.len()..])
 }
 
 /// Готовит заголовки запроса к отправке серверу: одно соединение — один запрос.
@@ -82,22 +101,43 @@ pub fn rewrite_for_origin(head: &str) -> String {
     out.push_str(&origin_form_request_line(request_line));
     out.push_str("\r\n");
 
+    let mut has_host = false;
+    let mut upgrade = false;
     for line in lines {
         if line.is_empty() {
             continue;
         }
-        let name = line.split(':').next().unwrap_or("").trim();
-        let hop_by_hop = ["connection", "proxy-connection", "keep-alive", "proxy-authorization"]
+        let (name, value) = line.split_once(':').unwrap_or((line, ""));
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("connection") {
+            // `Connection: Upgrade` (WebSocket по ws://) замена на `close`
+            // ломала бы рукопожатие: сервер требует токен upgrade.
+            upgrade |= value.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
+            continue;
+        }
+        let hop_by_hop = ["proxy-connection", "keep-alive", "proxy-authorization"]
             .iter()
             .any(|h| name.eq_ignore_ascii_case(h));
         if hop_by_hop {
             continue;
         }
+        has_host |= name.eq_ignore_ascii_case("host");
         out.push_str(line);
         out.push_str("\r\n");
     }
 
-    out.push_str("Connection: close\r\n\r\n");
+    // Клиент HTTP/1.0 мог не прислать Host, а адрес взят из абсолютного URI
+    // (см. parse_http_target) — после приведения к `/path` без Host сервер
+    // с виртуальными хостами не узнал бы, какой сайт отдавать.
+    if !has_host && let Some(authority) = absolute_uri_authority(request_line).filter(|a| !a.is_empty()) {
+        out.push_str("Host: ");
+        out.push_str(authority);
+        out.push_str("\r\n");
+    }
+
+    // После апгрейда соединение становится туннелем и других запросов по
+    // нему уже не будет, так что закрывать его незачем.
+    out.push_str(if upgrade { "Connection: Upgrade\r\n\r\n" } else { "Connection: close\r\n\r\n" });
     out
 }
 
@@ -108,14 +148,14 @@ fn origin_form_request_line(line: &str) -> String {
         return line.to_string();
     };
 
-    let lower = uri.to_ascii_lowercase();
-    let Some(rest_start) = ["http://", "https://"].iter().find(|s| lower.starts_with(*s)).map(|s| s.len()) else {
+    let Some(rest) = strip_scheme(uri) else {
         return line.to_string();
     };
-    let rest = &uri[rest_start..];
-    let path = match rest.find('/') {
-        Some(i) => &rest[i..],
-        None => "/",
+    // Путь может отсутствовать, а запрос — нет: `http://a.com?x=1` → `/?x=1`.
+    let path = match rest.find(['/', '?']) {
+        Some(i) if rest[i..].starts_with('/') => rest[i..].to_string(),
+        Some(i) => format!("/{}", &rest[i..]),
+        None => "/".to_string(),
     };
     format!("{method} {path} {version}")
 }
@@ -138,6 +178,24 @@ mod tests {
             "GET /x HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"
         );
         assert!(rewrite_for_origin("GET http://a.com:8080 HTTP/1.1\r\nHost: a.com\r\n\r\n").starts_with("GET / HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn origin_rewrite_keeps_query_without_path_and_websocket_upgrade() {
+        assert!(rewrite_for_origin("GET http://a.com?x=1 HTTP/1.1\r\nHost: a.com\r\n\r\n").starts_with("GET /?x=1 HTTP/1.1\r\n"));
+        let ws = rewrite_for_origin("GET http://a.com/ws HTTP/1.1\r\nHost: a.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\n");
+        assert_eq!(ws, "GET /ws HTTP/1.1\r\nHost: a.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    }
+
+    #[test]
+    fn http10_without_host_uses_absolute_uri() {
+        let req = "GET http://a.com:8080/x HTTP/1.0\r\nAccept: */*\r\n\r\n";
+        assert_eq!(parse_http_target(req), Some("a.com:8080".to_string()));
+        assert_eq!(
+            rewrite_for_origin(req),
+            "GET /x HTTP/1.0\r\nAccept: */*\r\nHost: a.com:8080\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(parse_http_target("GET /x HTTP/1.0\r\n\r\n"), None);
     }
 
     #[test]

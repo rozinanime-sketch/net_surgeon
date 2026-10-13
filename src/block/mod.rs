@@ -89,11 +89,12 @@ pub fn reload(enabled: bool, log_tx: &LogSender) {
     }
 }
 
-/// Тот же формат, что у bypass_domains.txt: домен на строку, `#` — комментарий.
+/// Тот же формат, что у bypass_domains.txt: домен на строку, `#` — комментарий,
+/// в том числе в конце строки (`mc.yandex.ru  # метрика`).
 pub(crate) fn parse(text: &str) -> HashSet<String> {
     text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
         .map(|l| l.trim_end_matches('.').to_lowercase())
         .collect()
 }
@@ -104,7 +105,7 @@ mod tests {
 
     #[test]
     fn parses_like_bypass_list() {
-        let list = parse("# счётчики\nmc.yandex.ru\n\n  Top-FWZ1.mail.ru.  \n");
+        let list = parse("# счётчики\nmc.yandex.ru # метрика\n\n  Top-FWZ1.mail.ru.  \n");
         assert_eq!(list.len(), 2);
         assert!(list.contains("mc.yandex.ru"));
         assert!(list.contains("top-fwz1.mail.ru"));

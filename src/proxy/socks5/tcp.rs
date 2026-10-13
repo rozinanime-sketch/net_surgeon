@@ -13,7 +13,7 @@ use crate::observability::logging::{LogSender, log_nested_t, log_t, LogLevel};
 use crate::config::BypassParams;
 use crate::observability::metrics::Metrics;
 use crate::engine::strategy::StrategyStore;
-use crate::protocol::socks5::parse_socks5_target;
+use crate::protocol::socks5::{parse_socks5_target, socks5_request_len};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const NO_AUTH: u8 = 0x00;
@@ -194,7 +194,7 @@ fn offers_no_auth(greeting: &[u8]) -> bool {
 async fn read_request(stream: &mut TcpStream, buf: &mut [u8], carried: usize) -> Option<usize> {
     let mut have = carried;
     loop {
-        if parse_socks5_target(&buf[..have]).is_some() || have >= buf.len() {
+        if socks5_request_len(&buf[..have]).is_some_and(|need| have >= need) || have >= buf.len() {
             return Some(have);
         }
         match stream.read(&mut buf[have..]).await {
