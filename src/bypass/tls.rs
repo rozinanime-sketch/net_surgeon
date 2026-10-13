@@ -554,6 +554,22 @@ pub fn fake_host(allowed: &str, len: usize) -> Vec<u8> {
     label(len)
 }
 
+/// Середина домена второго уровня в имени — `midsld` у zapret: в
+/// `gateway.discord.gg` это середина `discord`. Именно эту часть DPI
+/// сверяет со списком, и разрез по ней прячет её надёжнее, чем по краю
+/// имени. `None` — резать нечего (имя короче двух байт).
+pub fn mid_sld(host: &[u8]) -> Option<usize> {
+    let host = host.strip_suffix(b".").unwrap_or(host);
+    let dots: Vec<usize> = host.iter().enumerate().filter(|(_, b)| **b == b'.').map(|(i, _)| i).collect();
+    let (start, end) = match dots.as_slice() {
+        [] => (0, host.len()),
+        [only] => (0, *only),
+        [.., before, last] => (before + 1, *last),
+    };
+    let mid = start + (end - start) / 2;
+    (mid > 0 && mid < host.len()).then_some(mid)
+}
+
 /// Сохранила ли подделка разрешённое имя целиком. Нет — имя длиннее
 /// настоящего, и DPI видит лишь его окончание или случайное имя: смена
 /// `fake_sni` тогда проверяет не то, что задумано.
@@ -811,6 +827,14 @@ mod tests {
         // discord.com (11): от google.com не поместится ничего, кроме зоны
         assert!(fake_host("www.google.com", 11).ends_with(b".com"));
         assert!(fake_host("cloudflare.com", 19).ends_with(b".cloudflare.com"));
+    }
+
+    #[test]
+    fn mid_sld_cuts_the_second_level_name_in_half() {
+        assert_eq!(mid_sld(b"gateway.discord.gg"), Some(8 + 3)); // disc|ord
+        assert_eq!(mid_sld(b"discord.com"), Some(3)); // dis|cord
+        assert_eq!(mid_sld(b"localhost"), Some(4));
+        assert_eq!(mid_sld(b"x"), None);
     }
 
     #[test]

@@ -386,6 +386,9 @@ impl Env for LinuxEnv {
         tls::decoy_for(payload, payload.len(), &p.fake_sni, p.fake_clone)
             .unwrap_or_else(|| tls::build_client_hello_sized(&p.fake_sni, payload.len()))
     }
+    fn host_fake_options(&self) -> (bool, bool) {
+        (self.bypass_params.hostfakesplit_midhost, self.bypass_params.hostfakesplit_disorder_after)
+    }
     fn fake_host(&self, len: usize) -> Vec<u8> {
         tls::fake_host(&self.bypass_params.fake_sni, len)
     }

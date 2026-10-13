@@ -521,6 +521,8 @@ mod ws {
             fake_md5sig: md5sig,
             fake_sni: sni.to_string(),
             fake_clone: true,
+            hostfakesplit_midhost: false,
+            hostfakesplit_disorder_after: false,
         }
     }
 

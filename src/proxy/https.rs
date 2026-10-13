@@ -232,13 +232,21 @@ pub async fn handle_connect(
                             ("second", second.to_string()),
                             ("domain", domain_c2s.clone()),
                         ]),
-                        Applied::HostFakeSplit { before, host, after, fake } => log_t(&log_tx_c2s, LogLevel::Warning, "log.hostfakesplit_applied", vec![
-                            ("before", before.to_string()),
-                            ("host", host.to_string()),
-                            ("after", after.to_string()),
-                            ("fake", fake),
-                            ("domain", domain_c2s.clone()),
-                        ]),
+                        Applied::HostFakeSplit { before, host, after, fake, midhost, disordered } => {
+                            let options: Vec<&str> = [(midhost, "midhost"), (disordered, "disorder_after")]
+                                .into_iter()
+                                .filter_map(|(on, name)| on.then_some(name))
+                                .collect();
+                            let options = if options.is_empty() { String::new() } else { format!(" ({})", options.join(", ")) };
+                            log_t(&log_tx_c2s, LogLevel::Warning, "log.hostfakesplit_applied", vec![
+                                ("before", before.to_string()),
+                                ("host", host.to_string()),
+                                ("after", after.to_string()),
+                                ("fake", fake),
+                                ("options", options),
+                                ("domain", domain_c2s.clone()),
+                            ]);
+                        }
                         Applied::None => {}
                     }
                 }

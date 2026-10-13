@@ -53,6 +53,14 @@ pub struct BypassParams {
     /// сравнения: какая приманка лучше обманывает DPI, зависит от сети.
     #[serde(default = "default_true")]
     pub fake_clone: bool,
+    /// hostfakesplit: настоящее имя ещё и разрезать посередине домена
+    /// второго уровня (`midhost=midsld` у zapret2).
+    #[serde(default)]
+    pub hostfakesplit_midhost: bool,
+    /// hostfakesplit: хвост после имени отправить двумя кусками не по
+    /// порядку, первый — с TTL `disorder_ttl` (`disorder_after` у zapret2).
+    #[serde(default)]
+    pub hostfakesplit_disorder_after: bool,
 }
 
 /// Параметры junk-обфускации в SOCKS5 UDP (раньше были захардкожены

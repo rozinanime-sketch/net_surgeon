@@ -92,8 +92,21 @@ where
     let Some(loc) = super::tls::find_sni(data) else {
         return Ok(None);
     };
-    let split_pos = loc.split_point().min(data.len());
+    disorder_at(server_writer, fd, data, loc.split_point().min(data.len()), ttl).await
+}
 
+/// Disorder по заданной позиции: `data[..split_pos]` с TTL `ttl`, остальное
+/// — как обычно. `Ok(None)` — ядро отказало в смене TTL, ничего не ушло.
+async fn disorder_at<W>(
+    server_writer: &mut W,
+    fd: RawSock,
+    data: &[u8],
+    split_pos: usize,
+    ttl: u32,
+) -> std::io::Result<Option<SplitInfo>>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
     let original_ttl = socket::get_ttl(fd).unwrap_or(64);
     if !socket::set_ttl(fd, ttl) {
         return Ok(None);
@@ -324,6 +337,10 @@ pub struct HostFakeInfo {
     pub after: usize,
     /// Что DPI получил вместо имени: по нему видно, сохранился ли `fake_sni`.
     pub fake: String,
+    /// Имя разрезано посередине (`hostfakesplit_midhost`).
+    pub midhost: bool,
+    /// Хвост ушёл не по порядку (`hostfakesplit_disorder_after`).
+    pub disordered: bool,
 }
 
 /// hostfakesplit (как у zapret): ClientHello режется по границам имени в
@@ -366,19 +383,50 @@ where
     server_writer.write_all(before).await?;
     // Всё до имени — до подмены, с обычным TTL.
     server_writer.flush().await?;
-    if !send_fake_signed_or_not(fd, &fake, host, params).await? {
-        // Начало уже ушло — отказываться поздно: остальное как есть.
-        server_writer.write_all(rest).await?;
-        server_writer.flush().await?;
-        return Ok(Some(HostFakeInfo { before: before.len(), host: 0, after: rest.len(), fake: String::new() }));
+
+    // Имя целиком или двумя половинами, каждая под своей половиной подделки:
+    // DPI, собравший обе подделки, видит разрешённое имя, а настоящее не
+    // встречается ему одним куском.
+    let mid = params.hostfakesplit_midhost.then(|| super::tls::mid_sld(host)).flatten();
+    let parts: &[(usize, usize)] = match mid {
+        Some(m) => &[(0, m), (m, host.len())],
+        None => &[(0, host.len())],
+    };
+    for (i, &(a, b)) in parts.iter().enumerate() {
+        if !send_fake_signed_or_not(fd, &fake[a..b], &host[a..b], params).await? {
+            // Отказ на первой подделке: имя ещё не ушло — остальное как есть.
+            // На второй первая половина уже в сокете — досылаем с неё.
+            server_writer.write_all(&rest[a..]).await?;
+            server_writer.flush().await?;
+            let host_sent = if i == 0 { 0 } else { a };
+            return Ok(Some(HostFakeInfo {
+                before: before.len(),
+                host: host_sent,
+                after: rest.len() - host_sent,
+                fake: String::from_utf8_lossy(&fake[..host_sent]).into_owned(),
+                midhost: false,
+                disordered: false,
+            }));
+        }
     }
-    server_writer.write_all(after).await?;
-    server_writer.flush().await?;
+
+    // Хвост — двумя кусками не по порядку, как disorder: последний байт
+    // уходит раньше остального (позиция «-1» у zapret2). Ядро не дало
+    // сменить TTL — хвост как обычно.
+    let disordered = params.hostfakesplit_disorder_after
+        && after.len() >= 2
+        && disorder_at(server_writer, fd, after, after.len() - 1, params.disorder_ttl).await?.is_some();
+    if !disordered {
+        server_writer.write_all(after).await?;
+        server_writer.flush().await?;
+    }
     Ok(Some(HostFakeInfo {
         before: before.len(),
         host: host.len(),
         after: after.len(),
         fake: String::from_utf8_lossy(&fake).into_owned(),
+        midhost: mid.is_some(),
+        disordered,
     }))
 }
 

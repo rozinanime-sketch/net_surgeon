@@ -215,7 +215,11 @@ pub enum Technique {
     /// же длины (`fake_host`, на основе разрешённого) — до и после: начало,
     /// поддельное имя, имя, поддельное имя, конец. DPI видит тот же
     /// ClientHello, где разрешённое имя стоит рядом с настоящим.
-    HostFakeSplit { host: std::ops::Range<usize>, fake_host: Vec<u8> },
+    ///
+    /// `midhost` — настоящее имя ещё и разрезано в этой позиции (абсолютной,
+    /// внутри `host`); `disorder_after` — последний байт хвоста уходит раньше
+    /// остального. Опции `midhost` и `disorder_after` у zapret2.
+    HostFakeSplit { host: std::ops::Range<usize>, fake_host: Vec<u8>, midhost: Option<usize>, disorder_after: bool },
 }
 
 /// Точки реза для multidisorder: начало данных и центр имени в SNI.
@@ -379,7 +383,7 @@ fn build(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
             }
             out
         }
-        Technique::HostFakeSplit { host, fake_host } => {
+        Technique::HostFakeSplit { host, fake_host, midhost, disorder_after } => {
             let (start, end) = (host.start.min(payload.len()), host.end.min(payload.len()));
             if start == 0 || start >= end {
                 return segments(0, payload.len());
@@ -389,9 +393,21 @@ fn build(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
             let fake = with_payload(pkt, t, &name, t.seq.wrapping_add(start as u32).wrapping_sub(BADSEQ_SHIFT), t.flags & !TCP_PSH);
             let mut out = segments(0, start);
             out.push(fake.clone());
-            out.extend(segments(start, end));
+            match midhost.filter(|m| (start + 1..end).contains(m)) {
+                Some(m) => {
+                    out.extend(segments(start, m));
+                    out.extend(segments(m, end));
+                }
+                None => out.extend(segments(start, end)),
+            }
             out.push(fake);
-            out.extend(segments(end, payload.len()));
+            let len = payload.len();
+            if *disorder_after && len >= end + 2 {
+                out.extend(segments(len - 1, len));
+                out.extend(segments(end, len - 1));
+            } else {
+                out.extend(segments(end, len));
+            }
             out
         }
     }
@@ -652,11 +668,36 @@ mod tests {
     fn host_fake_split_surrounds_the_host_with_a_fake_one() {
         let pkt = v4(b"xx.real.namexx", TCP_ACK | TCP_PSH);
         let t = parse(&pkt).unwrap();
-        let parts = apply(&pkt, &t, &Technique::HostFakeSplit { host: 2..12, fake_host: b"fake.allow".to_vec() });
+        let parts = apply(&pkt, &t, &Technique::HostFakeSplit {
+            host: 2..12,
+            fake_host: b"fake.allow".to_vec(),
+            midhost: None,
+            disorder_after: false,
+        });
         let payloads: Vec<Vec<u8>> = parts.iter().map(|p| parse(p).unwrap().payload(p).to_vec()).collect();
         assert_eq!(payloads, [b"xx".to_vec(), b"fake.allow".to_vec(), b".real.name".to_vec(), b"fake.allow".to_vec(), b"xx".to_vec()]);
         assert_eq!(parse(&parts[1]).unwrap().seq, 1002u32.wrapping_sub(BADSEQ_SHIFT));
         assert_eq!(reassemble(&parts, 1000), b"xx.real.namexx");
+    }
+
+    /// С опциями: имя двумя сегментами, последний байт хвоста раньше
+    /// остального — а сервер собирает тот же поток.
+    #[test]
+    fn host_fake_split_options_reorder_but_keep_the_stream() {
+        let pkt = v4(b"xx.real.namexyz", TCP_ACK | TCP_PSH);
+        let t = parse(&pkt).unwrap();
+        let parts = apply(&pkt, &t, &Technique::HostFakeSplit {
+            host: 2..12,
+            fake_host: b"fake.allow".to_vec(),
+            midhost: Some(7),
+            disorder_after: true,
+        });
+        let payloads: Vec<Vec<u8>> = parts.iter().map(|p| parse(p).unwrap().payload(p).to_vec()).collect();
+        assert_eq!(payloads, [
+            b"xx".to_vec(), b"fake.allow".to_vec(), b".real".to_vec(), b".name".to_vec(),
+            b"fake.allow".to_vec(), b"z".to_vec(), b"xy".to_vec(),
+        ]);
+        assert_eq!(reassemble(&parts, 1000), b"xx.real.namexyz");
     }
 
     #[test]

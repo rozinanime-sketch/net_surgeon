@@ -1766,7 +1766,8 @@ pub mod apply {
         Fake { decoy: usize, real: usize },
         FakeMultiDisorder { decoy: usize, first: usize, second: usize },
         /// `fake` — имя, которое получил DPI; пусто — подделка не ушла.
-        HostFakeSplit { before: usize, host: usize, after: usize, fake: String },
+        /// `midhost`, `disordered` — какие опции hostfakesplit сработали.
+        HostFakeSplit { before: usize, host: usize, after: usize, fake: String, midhost: bool, disordered: bool },
         Split { first: usize, second: usize },
     }
 
@@ -1782,8 +1783,19 @@ pub mod apply {
                 Applied::Oob { first, second } => format!("oob {first}+{second}"),
                 Applied::Fake { decoy, real } => format!("fake {decoy}+{real}"),
                 Applied::FakeMultiDisorder { decoy, first, second } => format!("fake+multidisorder {decoy}/{first}+{second}"),
-                Applied::HostFakeSplit { before, host, after, fake } if fake.is_empty() => format!("hostfakesplit {before}+{host}~+{after}"),
-                Applied::HostFakeSplit { before, host, after, fake } => format!("hostfakesplit {before}+{host}~+{after}, {fake}"),
+                Applied::HostFakeSplit { before, host, after, fake, midhost, disordered } => {
+                    let mut out = format!("hostfakesplit {before}+{host}~+{after}");
+                    if *midhost {
+                        out.push_str(" midhost");
+                    }
+                    if *disordered {
+                        out.push_str(" disorder_after");
+                    }
+                    if !fake.is_empty() {
+                        out.push_str(&format!(", {fake}"));
+                    }
+                    out
+                }
             })
         }
     }
@@ -1839,7 +1851,14 @@ pub mod apply {
                 .map(|info| Applied::Fake { decoy: info.decoy, real: info.real }),
             Strategy::HostFakeSplit => fragment::split_with_host_fake(writer, fd, data, &decoy_params())
                 .await?
-                .map(|info| Applied::HostFakeSplit { before: info.before, host: info.host, after: info.after, fake: info.fake }),
+                .map(|info| Applied::HostFakeSplit {
+                    before: info.before,
+                    host: info.host,
+                    after: info.after,
+                    fake: info.fake,
+                    midhost: info.midhost,
+                    disordered: info.disordered,
+                }),
             Strategy::FakeMultiDisorder => fragment::split_with_fake_disorder(writer, fd, data, &decoy_params())
                 .await?
                 .map(|info| Applied::FakeMultiDisorder { decoy: info.decoy, first: info.first, second: info.second }),

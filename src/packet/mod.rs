@@ -361,6 +361,9 @@ mod imp {
             crate::bypass::tls::decoy_for(payload, payload.len(), &p.fake_sni, p.fake_clone)
                 .unwrap_or_else(|| crate::bypass::tls::build_client_hello_sized(&p.fake_sni, payload.len()))
         }
+        fn host_fake_options(&self) -> (bool, bool) {
+            (self.tcp.bypass_params.hostfakesplit_midhost, self.tcp.bypass_params.hostfakesplit_disorder_after)
+        }
         fn fake_host(&self, len: usize) -> Vec<u8> {
             crate::bypass::tls::fake_host(&self.tcp.bypass_params.fake_sni, len)
         }

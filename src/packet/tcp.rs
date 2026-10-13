@@ -83,6 +83,10 @@ pub trait Env {
     fn lookup(&self, ip: IpAddr) -> Option<String>;
     /// Приманка ровно в длину `payload` — настоящего ClientHello.
     fn decoy(&self, payload: &[u8]) -> Vec<u8>;
+    /// Опции hostfakesplit: разрезать имя посередине, хвост не по порядку.
+    fn host_fake_options(&self) -> (bool, bool) {
+        (false, false)
+    }
     /// Поддельное имя ровно в `len` байт для hostfakesplit.
     fn fake_host(&self, len: usize) -> Vec<u8> {
         crate::bypass::tls::fake_host("www.google.com", len)
@@ -280,7 +284,14 @@ fn technique_for(strategy: Strategy, payload: &[u8], env: &impl Env) -> Techniqu
         Strategy::FakedSplit => Technique::FakedSplit { pos, decoy: env.decoy(payload) },
         // Имени в сегменте нет (подключение по IP, ECH) — обычный сплит.
         Strategy::HostFakeSplit => match desync::host_range(payload) {
-            Some(host) => Technique::HostFakeSplit { fake_host: env.fake_host(host.len()), host },
+            Some(host) => {
+                let (mid, disorder_after) = env.host_fake_options();
+                let midhost = mid
+                    .then(|| crate::bypass::tls::mid_sld(&payload[host.clone()]))
+                    .flatten()
+                    .map(|m| host.start + m);
+                Technique::HostFakeSplit { fake_host: env.fake_host(host.len()), host, midhost, disorder_after }
+            }
             None => Technique::Split { pos },
         },
     }
@@ -303,8 +314,15 @@ fn describe(technique: &Technique, len: usize) -> Option<String> {
             Some(format!("fake+multidisorder {}/{}", decoy.len(), parts.join("+")))
         }
         Technique::FakedSplit { pos, .. } => Some(format!("fakedsplit ~{pos}~+~{}~", len - pos)),
-        Technique::HostFakeSplit { host, .. } => {
-            Some(format!("hostfakesplit {}+~{}~+{}", host.start, host.len(), len.saturating_sub(host.end)))
+        Technique::HostFakeSplit { host, midhost, disorder_after, .. } => {
+            let mut out = format!("hostfakesplit {}+~{}~+{}", host.start, host.len(), len.saturating_sub(host.end));
+            if midhost.is_some() {
+                out.push_str(" midhost");
+            }
+            if *disorder_after {
+                out.push_str(" disorder_after");
+            }
+            Some(out)
         }
     }
 }

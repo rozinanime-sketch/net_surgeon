@@ -172,6 +172,15 @@ fake_ttl = 8
 fake_md5sig = true
 fake_sni = "www.google.com"
 fake_clone = true
+# Опции hostfakesplit (как в zapret2), по умолчанию выключены:
+# hostfakesplit_midhost — настоящее имя ещё и разрезать посередине домена
+#   второго уровня (disc|ord); каждую половину прикрывает своя половина
+#   подделки.
+# hostfakesplit_disorder_after — хвост ClientHello после имени отправить
+#   не по порядку: последний байт раньше остального, с TTL disorder_ttl.
+#   Дороже на время повтора, как disorder.
+hostfakesplit_midhost = false
+hostfakesplit_disorder_after = false
 
 [socks5_junk]
 count = 6

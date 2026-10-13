@@ -30,6 +30,8 @@ const FIELD_GROUPS: &[(&str, &[(&str, &str)])] = &[
         ("field.fake_md5sig", "bypass.fake_md5sig"),
         ("field.fake_sni", "bypass.fake_sni"),
         ("field.fake_clone", "bypass.fake_clone"),
+        ("field.hostfakesplit_midhost", "bypass.hostfakesplit_midhost"),
+        ("field.hostfakesplit_disorder_after", "bypass.hostfakesplit_disorder_after"),
     ]),
     ("config.group_junk", &[
         ("field.junk_count", "socks5_junk.count"),

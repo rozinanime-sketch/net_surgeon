@@ -72,6 +72,8 @@ fn test_bypass_params() -> BypassParams {
         fake_md5sig: false,
         fake_sni: "www.google.com".to_string(),
         fake_clone: true,
+        hostfakesplit_midhost: false,
+        hostfakesplit_disorder_after: false,
     }
 }
 
@@ -327,6 +329,36 @@ async fn fake_delivers_the_real_hello_through_the_swapped_page() {
         let received = collector.await.expect("collector");
         assert_eq!(received, hello, "{} байт: на приёме настоящий ClientHello", hello.len());
     }
+}
+
+/// hostfakesplit со всеми опциями — две половины подделки под разрезанным
+/// именем и хвост не по порядку — доставляет приёмнику ровно настоящий
+/// ClientHello: подделки подменены, хвост собран ретрансмитом.
+#[tokio::test]
+async fn host_fake_split_with_all_options_delivers_the_real_hello() {
+    use crate::engine::strategy::apply::Applied;
+
+    let hello = crate::bypass::tls::build_client_hello("gateway.discord.gg");
+    let params = BypassParams {
+        hostfakesplit_midhost: true,
+        hostfakesplit_disorder_after: true,
+        ..test_bypass_params()
+    };
+    let (port, collector) = spawn_collector().await;
+    let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+    let fd = crate::bypass::socket::raw_sock(&upstream);
+    let applied = first_packet(&mut upstream, fd, &hello, Strategy::HostFakeSplit, &params)
+        .await
+        .expect("отправка");
+    drop(upstream);
+
+    if crate::bypass::socket::fake_supported() {
+        let Applied::HostFakeSplit { midhost, disordered, .. } = applied else { panic!("не hostfakesplit") };
+        assert!(midhost, "имя разрезано посередине");
+        assert!(disordered, "хвост не по порядку");
+    }
+    let received = collector.await.expect("collector");
+    assert_eq!(received, hello, "на приёме настоящий ClientHello");
 }
 
 /// Fake с MD5-подписью, весь путь целиком: приёмник без ключа выбрасывает
