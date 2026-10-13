@@ -197,19 +197,21 @@ pub async fn split_with_fake<W>(
 where
     W: tokio::io::AsyncWriteExt + Unpin,
 {
-    let Some(decoy) = send_decoy(server_writer, fd, data, params).await? else {
+    let Some(decoy) = send_decoy(server_writer, fd, data, data, params).await? else {
         return Ok(None);
     };
     Ok(Some(FakeInfo { decoy, real: data.len() }))
 }
 
 /// Общая часть fake и fake + disorder: приманка на номерах `real`, которые
-/// потом займёт ретрансмит настоящих данных. Возвращает размер приманки;
-/// `Ok(None)` — техника здесь неприменима, ничего не отправлено.
+/// потом займёт ретрансмит настоящих данных. `hello` — весь настоящий
+/// ClientHello: с него снимается копия для приманки. Возвращает размер
+/// приманки; `Ok(None)` — техника здесь неприменима, ничего не отправлено.
 async fn send_decoy<W>(
     server_writer: &mut W,
     fd: RawSock,
     real: &[u8],
+    hello: &[u8],
     params: &crate::config::BypassParams,
 ) -> std::io::Result<Option<usize>>
 where
@@ -220,7 +222,7 @@ where
     }
     // Приманка обязана занять ровно столько номеров, сколько настоящие
     // данные: ретрансмит повторяет их байт в байт.
-    let Some(decoy) = super::tls::build_decoy_hello(&params.fake_sni, real.len()) else {
+    let Some(decoy) = super::tls::decoy_for(hello, real.len(), &params.fake_sni, params.fake_clone) else {
         return Ok(None);
     };
 
@@ -302,7 +304,9 @@ where
     // байт в байт настоящей первой половиной. Возвращает управление, как
     // только приманка ушла: TTL уже восстановлен, а настоящая первая половина
     // ждёт ретрансмита на `[S, pos)`.
-    let Some(decoy) = send_decoy(server_writer, fd, first, params).await? else {
+    // Копия ClientHello длиннее первой половины — приманка здесь собранная
+    // с нуля: целый пакет с чужим именем, а не обрывок копии.
+    let Some(decoy) = send_decoy(server_writer, fd, first, data, params).await? else {
         return Ok(None);
     };
     // Вторая половина — с обычным TTL и номером S+pos: доходит раньше ретрансмита.

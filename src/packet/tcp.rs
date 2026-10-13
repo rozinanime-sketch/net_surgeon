@@ -81,7 +81,8 @@ pub trait Env {
     fn record(&self, domain: &str, selected: Selected, responded: bool);
     fn remember(&self, ip: IpAddr, domain: &str);
     fn lookup(&self, ip: IpAddr) -> Option<String>;
-    fn decoy(&self, len: usize) -> Vec<u8>;
+    /// Приманка ровно в длину `payload` — настоящего ClientHello.
+    fn decoy(&self, payload: &[u8]) -> Vec<u8>;
     /// Поддельное имя ровно в `len` байт для hostfakesplit.
     fn fake_host(&self, len: usize) -> Vec<u8> {
         crate::bypass::tls::fake_host("www.google.com", len)
@@ -264,19 +265,19 @@ fn technique_for(strategy: Strategy, payload: &[u8], env: &impl Env) -> Techniqu
         Strategy::None => Technique::Pass,
         Strategy::SniSplit | Strategy::TlsRecord | Strategy::Oob => Technique::Split { pos },
         Strategy::Disorder => Technique::Disorder { pos },
-        Strategy::Fake => Technique::Fake { pos, decoy: env.decoy(payload.len()) },
+        Strategy::Fake => Technique::Fake { pos, decoy: env.decoy(payload) },
         Strategy::Seqovl => {
             // Приманка — полный ClientHello с именем из белого списка; overlap
             // в её размер, чтобы она целиком легла перед настоящими данными на
             // номерах до начала потока (сервер их отбросит как уже принятое).
-            let decoy = env.decoy(payload.len());
+            let decoy = env.decoy(payload);
             Technique::Seqovl { pos, overlap: decoy.len(), decoy }
         }
         Strategy::FakeMultiDisorder => Technique::FakeMultiDisorder {
             positions: desync::multidisorder_positions(payload),
-            decoy: env.decoy(payload.len()),
+            decoy: env.decoy(payload),
         },
-        Strategy::FakedSplit => Technique::FakedSplit { pos, decoy: env.decoy(payload.len()) },
+        Strategy::FakedSplit => Technique::FakedSplit { pos, decoy: env.decoy(payload) },
         // Имени в сегменте нет (подключение по IP, ECH) — обычный сплит.
         Strategy::HostFakeSplit => match desync::host_range(payload) {
             Some(host) => Technique::HostFakeSplit { fake_host: env.fake_host(host.len()), host },
@@ -345,8 +346,8 @@ mod tests {
         fn lookup(&self, _: IpAddr) -> Option<String> {
             None
         }
-        fn decoy(&self, len: usize) -> Vec<u8> {
-            crate::bypass::tls::build_client_hello_sized("www.google.com", len)
+        fn decoy(&self, payload: &[u8]) -> Vec<u8> {
+            crate::bypass::tls::build_client_hello_sized("www.google.com", payload.len())
         }
         fn log_intercepted(&self, _: &str, _: IpAddr, _: bool) {}
         fn log_applied(&self, _: &str, _: &str) {}

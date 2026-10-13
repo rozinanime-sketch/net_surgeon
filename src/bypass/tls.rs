@@ -357,6 +357,144 @@ pub fn build_client_hello_sized(sni: &str, target: usize) -> Vec<u8> {
     wrap_client_hello(&body)
 }
 
+/// Приманка — копия настоящего ClientHello с другим именем (как
+/// `tls_client_hello_clone` и `dupsid` в zapret2).
+///
+/// Собранный с нуля ClientHello отличается от браузерного всем, кроме
+/// имени: набором шифров, порядком расширений, отпечатком JA3/JA4. DPI,
+/// который это сверяет, видит, что приманка — не тот же клиент, и не
+/// верит ей. Копия совпадает с настоящим во всём, кроме SNI и поля random:
+/// тот же session id, те же расширения в том же порядке, тот же размер.
+///
+/// Длина обязана совпасть с настоящим байт в байт (ретрансмит займёт те же
+/// номера). Разницу в длине имени забирает расширение padding: оно есть у
+/// браузеров, а если его нет — добавляется. Если подогнать так нельзя,
+/// берётся имя той же длины, что настоящее (см. [`fake_host`]).
+///
+/// `None` — это не один целый ClientHello в одной записи или в нём нет SNI:
+/// вызывающий берёт собранную с нуля приманку.
+pub fn clone_client_hello(real: &[u8], sni: &str) -> Option<Vec<u8>> {
+    let parsed = ParsedHello::parse(real)?;
+    let sni = sni.trim_end_matches('.');
+    parsed.rebuild(sni.as_bytes(), real.len()).or_else(|| {
+        // Не подогнать padding'ом — имя той же длины, что настоящее.
+        let same = fake_host(sni, parsed.sni_len);
+        parsed.rebuild(&same, real.len())
+    })
+}
+
+/// ClientHello, разобранный до расширений: то, что нужно для его копии.
+struct ParsedHello<'a> {
+    /// Тело ClientHello от версии до длины расширений (не включая её).
+    head: &'a [u8],
+    /// Расширения: тип и данные, в исходном порядке.
+    extensions: Vec<(u16, &'a [u8])>,
+    /// Длина имени в настоящем SNI.
+    sni_len: usize,
+    /// Версия в заголовке TLS-записи.
+    record_version: [u8; 2],
+}
+
+impl<'a> ParsedHello<'a> {
+    fn parse(data: &'a [u8]) -> Option<Self> {
+        // Ровно одна запись с одним целым ClientHello: иначе копия заняла бы
+        // не те байты, что настоящий пакет.
+        if record_len(data)? != data.len() || data.get(5)? != &0x01 {
+            return None;
+        }
+        let hs_len = u32::from_be_bytes([0, data[6], data[7], data[8]]) as usize;
+        if 9 + hs_len != data.len() {
+            return None;
+        }
+        let mut pos = 9 + 2 + 32;
+        pos += 1 + *data.get(pos)? as usize; // session id
+        pos += 2 + u16_at(data, pos)?; // шифры
+        pos += 1 + *data.get(pos)? as usize; // сжатие
+        let head = data.get(9..pos)?;
+        let ext_end = pos + 2 + u16_at(data, pos)?;
+        if ext_end != data.len() {
+            return None;
+        }
+        pos += 2;
+        let mut extensions = Vec::new();
+        let mut sni_len = None;
+        while pos < ext_end {
+            let ext_type = u16_at(data, pos)? as u16;
+            let len = u16_at(data, pos + 2)?;
+            let body = data.get(pos + 4..pos + 4 + len)?;
+            if ext_type == 0x0000 {
+                // list_len(2) type(1) name_len(2) name — одно имя host_name
+                if body.get(2)? != &0x00 || 5 + u16_at(body, 3)? != body.len() {
+                    return None;
+                }
+                sni_len = Some(u16_at(body, 3)?);
+            }
+            extensions.push((ext_type, body));
+            pos += 4 + len;
+        }
+        Some(ParsedHello { head, extensions, sni_len: sni_len?, record_version: [data[1], data[2]] })
+    }
+
+    /// Копия с именем `name` ровно в `target` байт; `None` — не подогнать.
+    fn rebuild(&self, name: &[u8], target: usize) -> Option<Vec<u8>> {
+        const PADDING: u16 = 0x0015;
+        const PRE_SHARED_KEY: u16 = 0x0029;
+        let name = std::str::from_utf8(name).ok()?;
+
+        // Всё, кроме padding: его размер подбирается под остаток.
+        let mut ext = Vec::new();
+        let mut padding_at = None;
+        for &(ext_type, body) in &self.extensions {
+            match ext_type {
+                0x0000 => push_ext(&mut ext, 0x0000, &server_name_ext(name)),
+                PADDING => padding_at = Some(ext.len()),
+                // pre_shared_key обязан быть последним: новый padding — до него
+                PRE_SHARED_KEY if padding_at.is_none() => {
+                    padding_at = Some(ext.len());
+                    push_ext(&mut ext, ext_type, body);
+                }
+                _ => push_ext(&mut ext, ext_type, body),
+            }
+        }
+        let padding_at = padding_at.unwrap_or(ext.len());
+
+        // запись(5) + handshake(4) + head + длина расширений(2) + расширения
+        let without_padding = 5 + 4 + self.head.len() + 2 + ext.len();
+        let pad = target.checked_sub(without_padding)?;
+        if pad != 0 {
+            // Заголовок padding — 4 байта: остаток в 1–3 байта не уложить.
+            let data_len = pad.checked_sub(4)?;
+            let mut padding = Vec::with_capacity(pad);
+            push_ext(&mut padding, PADDING, &vec![0u8; data_len]);
+            ext.splice(padding_at..padding_at, padding);
+        }
+
+        let mut body = self.head.to_vec();
+        // Поле random — своё: одинаковое у приманки и настоящего пакета
+        // выдало бы, что это одно и то же. Session id остаётся — как у
+        // zapret2 (dupsid): по нему DPI связывает приманку с соединением.
+        body[2..34].copy_from_slice(&super::random::bytes(32));
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let mut out = wrap_client_hello(&body);
+        out[1..3].copy_from_slice(&self.record_version);
+        (out.len() == target).then_some(out)
+    }
+}
+
+/// Приманка для настоящего ClientHello `real` длиной `len`: его копия с
+/// именем `sni`, если `clone` и копия собирается ровно в `len`, иначе
+/// собранная с нуля. `None` — приманку такой длины не собрать.
+pub fn decoy_for(real: &[u8], len: usize, sni: &str, clone: bool) -> Option<Vec<u8>> {
+    if clone
+        && let Some(copy) = clone_client_hello(real, sni)
+        && copy.len() == len
+    {
+        return Some(copy);
+    }
+    build_decoy_hello(sni, len)
+}
+
 /// Данные расширения server_name: list_len(2) entry_type(1) name_len(2) name.
 fn server_name_ext(sni: &str) -> Vec<u8> {
     let name = sni.as_bytes();
@@ -547,6 +685,114 @@ pub fn split_into_records(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Типы расширений по порядку — «отпечаток», который копия обязана
+    /// сохранить (кроме padding, чей размер подгоняется).
+    fn ext_types(hello: &[u8]) -> Vec<u16> {
+        ParsedHello::parse(hello).unwrap().extensions.iter().map(|(t, _)| *t).collect()
+    }
+
+    fn session_id(hello: &[u8]) -> &[u8] {
+        let len = hello[9 + 34] as usize;
+        &hello[9 + 35..9 + 35 + len]
+    }
+
+    #[test]
+    fn clone_keeps_everything_but_the_name_and_random() {
+        let real = build_client_hello_sized("discord.com", 1850);
+        let copy = clone_client_hello(&real, "www.google.com").unwrap();
+        assert_eq!(copy.len(), real.len());
+        assert_eq!(sni_host(&copy).as_deref(), Some("www.google.com"));
+        assert_eq!(session_id(&copy), session_id(&real));
+        assert_ne!(copy[11..43], real[11..43], "random — своё");
+        assert_eq!(ext_types(&copy), ext_types(&real));
+        // Настоящий пакет не тронут
+        assert_eq!(sni_host(&real).as_deref(), Some("discord.com"));
+    }
+
+    /// Без padding в настоящем пакете он добавляется, если имя короче, а
+    /// длиннее — берётся имя той же длины: размер совпадает всегда.
+    #[test]
+    fn clone_without_padding_still_matches_the_length() {
+        let real = build_client_hello_sized("updates.discord.com", 0);
+        assert!(!ext_types(&real).contains(&0x0015));
+
+        let shorter = clone_client_hello(&real, "www.google.com").unwrap();
+        assert_eq!(shorter.len(), real.len());
+        assert_eq!(sni_host(&shorter).as_deref(), Some("www.google.com"));
+        assert!(ext_types(&shorter).contains(&0x0015));
+
+        let longer = clone_client_hello(&real, "a-much-longer-allowed-name.example.com").unwrap();
+        assert_eq!(longer.len(), real.len());
+        assert_eq!(sni_host(&longer).unwrap().len(), "updates.discord.com".len());
+    }
+
+    /// pre_shared_key должен остаться последним: добавленный padding — до него.
+    #[test]
+    fn clone_keeps_pre_shared_key_last() {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[7u8; 32]);
+        body.extend_from_slice(&[32]);
+        body.extend_from_slice(&[9u8; 32]);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        let mut ext = Vec::new();
+        push_ext(&mut ext, 0x0000, &server_name_ext("updates.discord.com"));
+        push_ext(&mut ext, 0x0029, &[1, 2, 3, 4]);
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let real = wrap_client_hello(&body);
+
+        let copy = clone_client_hello(&real, "google.com").unwrap();
+        assert_eq!(copy.len(), real.len());
+        assert_eq!(ext_types(&copy), vec![0x0000, 0x0015, 0x0029]);
+    }
+
+    #[test]
+    fn clone_refuses_what_is_not_one_whole_client_hello() {
+        let real = build_client_hello_sized("discord.com", 600);
+        // Обрывок, лишние байты после записи, вовсе не TLS
+        assert!(clone_client_hello(&real[..300], "www.google.com").is_none());
+        assert!(clone_client_hello(&[real.as_slice(), b"x"].concat(), "www.google.com").is_none());
+        assert!(clone_client_hello(b"GET / HTTP/1.1\r\n", "www.google.com").is_none());
+    }
+
+    /// Настоящий ClientHello от rustls (так ходит программа обновления
+    /// Discord), а не наш синтетический: другой набор и порядок расширений.
+    #[test]
+    fn clone_of_a_real_rustls_hello() {
+        use std::sync::Arc;
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("updates.discord.com").unwrap();
+        let mut conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        let mut real = Vec::new();
+        conn.write_tls(&mut real).unwrap();
+
+        let copy = clone_client_hello(&real, "www.google.com").unwrap();
+        assert_eq!(copy.len(), real.len());
+        assert_eq!(sni_host(&copy).as_deref(), Some("www.google.com"));
+        assert_eq!(session_id(&copy), session_id(&real));
+        let without_padding = |h: &[u8]| ext_types(h).into_iter().filter(|t| *t != 0x0015).collect::<Vec<_>>();
+        assert_eq!(without_padding(&copy), without_padding(&real));
+    }
+
+    /// decoy_for: копия, если просили и она подходит по длине; иначе — с нуля.
+    #[test]
+    fn decoy_for_falls_back_to_a_built_decoy() {
+        let real = build_client_hello_sized("discord.com", 1850);
+        let copy = decoy_for(&real, real.len(), "www.google.com", true).unwrap();
+        assert_eq!(session_id(&copy), session_id(&real));
+        let built = decoy_for(&real, real.len(), "www.google.com", false).unwrap();
+        assert_ne!(session_id(&built), session_id(&real));
+        // Первая половина для fake + disorder: копия длиннее — собранная с нуля
+        let half = decoy_for(&real, 700, "www.google.com", true).unwrap();
+        assert_eq!(half.len(), 700);
+        assert_eq!(sni_host(&half).as_deref(), Some("www.google.com"));
+    }
 
     /// Поддельное имя ровно нужной длины и похоже на домен.
     #[test]

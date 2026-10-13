@@ -48,6 +48,11 @@ pub struct BypassParams {
     /// под Telegram использует www.google.com.
     #[serde(default = "default_fake_sni")]
     pub fake_sni: String,
+    /// Приманка — копия настоящего ClientHello с именем `fake_sni`, а не
+    /// собранная с нуля (см. `tls::clone_client_hello`). Выключатель — для
+    /// сравнения: какая приманка лучше обманывает DPI, зависит от сети.
+    #[serde(default = "default_true")]
+    pub fake_clone: bool,
 }
 
 /// Параметры junk-обфускации в SOCKS5 UDP (раньше были захардкожены

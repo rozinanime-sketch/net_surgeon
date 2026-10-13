@@ -520,6 +520,7 @@ mod ws {
             fake_ttl: ttl,
             fake_md5sig: md5sig,
             fake_sni: sni.to_string(),
+            fake_clone: true,
         }
     }
 

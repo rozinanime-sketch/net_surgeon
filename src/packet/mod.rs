@@ -356,8 +356,10 @@ mod imp {
         fn lookup(&self, ip: IpAddr) -> Option<String> {
             self.policy.ip_cache.lookup(&ip)
         }
-        fn decoy(&self, len: usize) -> Vec<u8> {
-            crate::bypass::tls::build_client_hello_sized(&self.tcp.bypass_params.fake_sni, len)
+        fn decoy(&self, payload: &[u8]) -> Vec<u8> {
+            let p = &self.tcp.bypass_params;
+            crate::bypass::tls::decoy_for(payload, payload.len(), &p.fake_sni, p.fake_clone)
+                .unwrap_or_else(|| crate::bypass::tls::build_client_hello_sized(&p.fake_sni, payload.len()))
         }
         fn fake_host(&self, len: usize) -> Vec<u8> {
             crate::bypass::tls::fake_host(&self.tcp.bypass_params.fake_sni, len)

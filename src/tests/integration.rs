@@ -71,6 +71,7 @@ fn test_bypass_params() -> BypassParams {
         fake_ttl: 2,
         fake_md5sig: false,
         fake_sni: "www.google.com".to_string(),
+        fake_clone: true,
     }
 }
 

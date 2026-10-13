@@ -381,8 +381,10 @@ impl Env for LinuxEnv {
     fn lookup(&self, ip: IpAddr) -> Option<String> {
         self.ip_cache.lookup(&ip)
     }
-    fn decoy(&self, len: usize) -> Vec<u8> {
-        tls::build_client_hello_sized(&self.bypass_params.fake_sni, len)
+    fn decoy(&self, payload: &[u8]) -> Vec<u8> {
+        let p = &self.bypass_params;
+        tls::decoy_for(payload, payload.len(), &p.fake_sni, p.fake_clone)
+            .unwrap_or_else(|| tls::build_client_hello_sized(&p.fake_sni, payload.len()))
     }
     fn fake_host(&self, len: usize) -> Vec<u8> {
         tls::fake_host(&self.bypass_params.fake_sni, len)
@@ -736,8 +738,8 @@ mod tests {
         fn lookup(&self, _: IpAddr) -> Option<String> {
             None
         }
-        fn decoy(&self, len: usize) -> Vec<u8> {
-            vec![0; len]
+        fn decoy(&self, payload: &[u8]) -> Vec<u8> {
+            vec![0; payload.len()]
         }
         fn log_intercepted(&self, _: &str, _: IpAddr, _: bool) {}
         fn log_applied(&self, _: &str, _: &str) {}
@@ -798,8 +800,8 @@ mod tests {
         fn lookup(&self, _: IpAddr) -> Option<String> {
             None
         }
-        fn decoy(&self, len: usize) -> Vec<u8> {
-            vec![0; len]
+        fn decoy(&self, payload: &[u8]) -> Vec<u8> {
+            vec![0; payload.len()]
         }
         fn log_intercepted(&self, _: &str, _: IpAddr, _: bool) {}
         fn log_applied(&self, _: &str, _: &str) {}
