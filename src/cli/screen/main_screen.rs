@@ -317,8 +317,13 @@ fn draw_metrics(frame: &mut Frame, area: Rect, app: &App) {
     .block(Block::default().borders(Borders::ALL));
     frame.render_widget(tx, cols[2]);
 
-    let dns_status = if m.dns_ok { t!("metrics.ok").to_string() } else { t!("metrics.fail").to_string() };
-    let dns_color = if m.dns_ok { Color::LightGreen } else { Color::LightRed };
+    // Не проверялся (релей не запущен или ещё не было запросов) — прочерк,
+    // а не зелёное «OK».
+    let (dns_status, dns_color) = match m.dns_ok {
+        Some(true) => (t!("metrics.ok").to_string(), Color::LightGreen),
+        Some(false) => (t!("metrics.fail").to_string(), Color::LightRed),
+        None => ("—".to_string(), Color::DarkGray),
+    };
     // QUIC-обход идёт через SOCKS5 UDP: показываем число активных сессий
     // и сколько фейковых Initial отправлено. Прежний индикатор OK/FAIL
     // относился к удалённому форвардеру и ни о чём не говорил.

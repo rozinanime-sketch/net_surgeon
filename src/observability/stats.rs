@@ -48,15 +48,20 @@ impl Percentiles {
 
     /// Перцентиль `p` в диапазоне 0.0..=1.0 методом ближайшего ранга.
     pub fn percentile(&self, p: f64) -> Option<f64> {
+        self.percentiles([p])[0]
+    }
+
+    /// Несколько перцентилей за одну сортировку окна.
+    pub fn percentiles<const N: usize>(&self, ps: [f64; N]) -> [Option<f64>; N] {
         if self.window.is_empty() {
-            return None;
+            return [None; N];
         }
         let mut sorted: Vec<f64> = self.window.iter().copied().collect();
         sorted.sort_by(f64::total_cmp);
-
-        let p = p.clamp(0.0, 1.0);
-        let rank = (p * (sorted.len() - 1) as f64).round() as usize;
-        sorted.get(rank).copied()
+        ps.map(|p| {
+            let rank = (p.clamp(0.0, 1.0) * (sorted.len() - 1) as f64).round() as usize;
+            sorted.get(rank).copied()
+        })
     }
 
     pub fn p50(&self) -> Option<f64> {

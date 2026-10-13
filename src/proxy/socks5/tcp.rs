@@ -65,9 +65,8 @@ pub async fn run_socks5_server(
                         let metrics = Arc::clone(&metrics);
                         let ip_cache = Arc::clone(&ip_cache);
                         tokio::spawn(async move {
-                            metrics.conn_opened();
+                            let _conn = metrics.connection();
                             handle_socks5(stream, udp_port, is_enabled, bypass_domains, bypass_params, strategy_ttl_hours, log_tx, Arc::clone(&metrics), strategies, ip_cache).await;
-                            metrics.conn_closed();
                         });
                     }
                     Err(e) => log_t(&log_tx, LogLevel::Error, "log.socks5_error", vec![("error", e.to_string())]),

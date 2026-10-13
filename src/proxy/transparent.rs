@@ -235,10 +235,9 @@ pub async fn run_transparent_proxy(
                                 let ip_cache = Arc::clone(&ip_cache);
                                 let strategies = Arc::clone(&strategies);
                                 tokio::spawn(async move {
-                                    metrics.conn_opened();
+                                    let _conn = metrics.connection();
                                     handle(client, is_enabled, &bypass_domains, &bypass_params,
                                            strategy_ttl_hours, &log_tx, &metrics, &ip_cache, &strategies).await;
-                                    metrics.conn_closed();
                                 });
                             }
                             Err(e) => log_t(&log_tx, LogLevel::Error, "log.tcp_error", vec![("error", e.to_string())]),

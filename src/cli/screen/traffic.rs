@@ -122,7 +122,7 @@ fn row_item(r: &DomainTraffic) -> ListItem<'static> {
         Span::styled(format!("{:<34} ", truncate(&r.domain, 34)), Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(format!("{:>11} ", format_bytes(r.rx)), Style::default().fg(Color::LightBlue)),
         Span::styled(format!("{:>11} ", format_bytes(r.tx)), Style::default().fg(Color::LightGreen)),
-        Span::styled(format!("{:>11}", format_bytes(r.rx + r.tx)), Style::default().fg(Color::Gray)),
+        Span::styled(format!("{:>11}", format_bytes(r.rx.saturating_add(r.tx))), Style::default().fg(Color::Gray)),
     ]))
 }
 

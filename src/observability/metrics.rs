@@ -1,13 +1,21 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::observability::stats::Percentiles;
 
-/// Сколько доменов помнить в разбивке трафика. При переполнении вытесняется
-/// самый лёгкий — интересны как раз тяжёлые. Обновляется раз на соединение
-/// (не на байт), так что линейный проход при вытеснении дёшев.
+/// Сколько доменов помнить в разбивке трафика. При переполнении вытесняются
+/// самые лёгкие из давно не активных — интересны тяжёлые, — пачкой
+/// [`DOMAIN_TRAFFIC_EVICT`] за раз, чтобы не сканировать карту на каждое
+/// новое имя.
 const DOMAIN_TRAFFIC_CAP: usize = 512;
+const DOMAIN_TRAFFIC_EVICT: usize = 64;
+/// Домен с трафиком за это время не вытесняется, даже если пока лёгкий.
+/// Раньше вытеснялся самый лёгкий вообще — а им почти всегда был только что
+/// добавленный, и сайт, качающий гигабайты мелкими соединениями, в таблицу
+/// не попадал никогда.
+const DOMAIN_TRAFFIC_FRESH: Duration = Duration::from_secs(300);
 /// Сколько строк отдавать в снимок для интерфейса.
 const DOMAIN_TRAFFIC_TOP: usize = 20;
 
@@ -25,7 +33,11 @@ pub struct Metrics {
     /// подсистемы, через которую не идёт трафик, — вводить в заблуждение.
     pub quic_sessions: AtomicUsize,
     pub quic_initial_sent: AtomicU64,
-    pub dns_ok: AtomicBool,
+    /// Последний DoH-запрос релея удался. До первого запроса и без релея
+    /// — неизвестно, а не «OK»: раньше индикатор горел зелёным, ничего не
+    /// проверив.
+    dns_checked: AtomicBool,
+    dns_ok: AtomicBool,
 
     /// Реально ли слушается порт. Ставится самим слушателем ПОСЛЕ успешного
     /// bind и снимается при выходе. Раньше статус выставлялся оптимистично
@@ -48,7 +60,49 @@ pub struct Metrics {
     /// Трафик по доменам: имя → (rx, tx). Копится раз на закрытие соединения
     /// суммой за это соединение, а не на каждый байт: домен известен при
     /// установке, а блокировка карты в горячем пути была бы дорогой.
-    domain_traffic: Mutex<HashMap<String, (u64, u64)>>,
+    domain_traffic: Mutex<DomainTable>,
+}
+
+#[derive(Default)]
+struct DomainTable {
+    domains: HashMap<String, DomainEntry>,
+    /// Трафик вытесненных доменов: итог в заголовке экрана считается по
+    /// всем доменам, и без этого он занижался.
+    evicted: u64,
+}
+
+struct DomainEntry {
+    rx: u64,
+    tx: u64,
+    last: Instant,
+}
+
+impl DomainEntry {
+    fn total(&self) -> u64 {
+        self.rx.saturating_add(self.tx)
+    }
+}
+
+/// Счётчик открытых соединений: держится, пока жив, и снимается сам —
+/// и при панике обработчика, которая раньше оставляла его завышенным.
+pub struct ConnectionGuard(Arc<Metrics>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// То же для QUIC-сессии: лежит в самой сессии и снимается вместе с ней —
+/// при закрытии по таймауту, при перезапуске прокси (таблица сессий
+/// выбрасывается целиком) и при панике. Раньше после каждого перезапуска
+/// на экране оставались «фантомные» сессии.
+pub struct QuicSessionGuard(Arc<Metrics>);
+
+impl Drop for QuicSessionGuard {
+    fn drop(&mut self) {
+        self.0.quic_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Metrics {
@@ -59,7 +113,8 @@ impl Metrics {
             bytes_tx: AtomicU64::new(0),
             quic_sessions: AtomicUsize::new(0),
             quic_initial_sent: AtomicU64::new(0),
-            dns_ok: AtomicBool::new(true),
+            dns_checked: AtomicBool::new(false),
+            dns_ok: AtomicBool::new(false),
             tcp_listening: AtomicBool::new(false),
             udp_listening: AtomicBool::new(false),
             socks5_listening: AtomicBool::new(false),
@@ -67,18 +122,32 @@ impl Metrics {
             transparent_udp_listening: AtomicBool::new(false),
             connect_latency: Mutex::new(Percentiles::new(512)),
             ttfb_latency: Mutex::new(Percentiles::new(512)),
-            domain_traffic: Mutex::new(HashMap::new()),
+            domain_traffic: Mutex::new(DomainTable::default()),
         })
     }
 
-    pub fn conn_opened(&self) { self.active_connections.fetch_add(1, Ordering::Relaxed); }
-    pub fn conn_closed(&self) { self.active_connections.fetch_sub(1, Ordering::Relaxed); }
+    /// Открытое соединение; счётчик снимется, когда вернувшийся охранник
+    /// будет удалён.
+    pub fn connection(self: &Arc<Self>) -> ConnectionGuard {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+        ConnectionGuard(Arc::clone(self))
+    }
     pub fn add_rx(&self, n: u64) { self.bytes_rx.fetch_add(n, Ordering::Relaxed); }
     pub fn add_tx(&self, n: u64) { self.bytes_tx.fetch_add(n, Ordering::Relaxed); }
+    /// QUIC-сессия; охранник храните в самой сессии.
+    pub fn quic_session(self: &Arc<Self>) -> QuicSessionGuard {
+        self.quic_sessions.fetch_add(1, Ordering::Relaxed);
+        QuicSessionGuard(Arc::clone(self))
+    }
+    /// Для перехвата Windows, который сам ведёт учёт открытых и закрытых
+    /// потоков (packet::udp::Tracker) и живёт до конца процесса.
     pub fn quic_session_opened(&self) { self.quic_sessions.fetch_add(1, Ordering::Relaxed); }
     pub fn quic_session_closed(&self) { self.quic_sessions.fetch_sub(1, Ordering::Relaxed); }
     pub fn quic_initial_sent(&self) { self.quic_initial_sent.fetch_add(1, Ordering::Relaxed); }
-    pub fn set_dns_ok(&self, ok: bool) { self.dns_ok.store(ok, Ordering::Relaxed); }
+    pub fn set_dns_ok(&self, ok: bool) {
+        self.dns_ok.store(ok, Ordering::Relaxed);
+        self.dns_checked.store(true, Ordering::Relaxed);
+    }
 
     pub fn set_tcp_listening(&self, v: bool) { self.tcp_listening.store(v, Ordering::Relaxed); }
     pub fn set_udp_listening(&self, v: bool) { self.udp_listening.store(v, Ordering::Relaxed); }
@@ -100,15 +169,18 @@ impl Metrics {
         if domain.is_empty() || (rx == 0 && tx == 0) {
             return;
         }
-        let Ok(mut map) = self.domain_traffic.lock() else { return };
-        let entry = map.entry(domain.to_string()).or_insert((0, 0));
-        entry.0 = entry.0.saturating_add(rx);
-        entry.1 = entry.1.saturating_add(tx);
-        // Переполнение: выбрасываем самый лёгкий домен — интересны тяжёлые.
-        if map.len() > DOMAIN_TRAFFIC_CAP
-            && let Some(lightest) = map.iter().min_by_key(|(_, (r, t))| r.saturating_add(*t)).map(|(k, _)| k.clone())
-        {
-            map.remove(&lightest);
+        let Ok(mut table) = self.domain_traffic.lock() else { return };
+        let now = Instant::now();
+        // Строка — только для нового имени, а не на каждое соединение.
+        if let Some(entry) = table.domains.get_mut(domain) {
+            entry.rx = entry.rx.saturating_add(rx);
+            entry.tx = entry.tx.saturating_add(tx);
+            entry.last = now;
+            return;
+        }
+        table.domains.insert(domain.to_string(), DomainEntry { rx, tx, last: now });
+        if table.domains.len() > DOMAIN_TRAFFIC_CAP {
+            table.evict(now, domain);
         }
     }
 
@@ -116,13 +188,17 @@ impl Metrics {
     /// трафик ПО ВСЕМ доменам (не только показанным) — чтобы итог в заголовке
     /// не занижался, когда доменов больше, чем строк в топе.
     pub fn top_domains(&self) -> (Vec<DomainTraffic>, u64) {
-        let Ok(map) = self.domain_traffic.lock() else { return (Vec::new(), 0) };
-        let total: u64 = map.values().map(|(rx, tx)| rx.saturating_add(*tx)).sum();
-        let mut rows: Vec<DomainTraffic> = map
+        let Ok(table) = self.domain_traffic.lock() else { return (Vec::new(), 0) };
+        let total = table.domains.values().fold(table.evicted, |sum, e| sum.saturating_add(e.total()));
+        let mut rows: Vec<DomainTraffic> = table
+            .domains
             .iter()
-            .map(|(domain, (rx, tx))| DomainTraffic { domain: domain.clone(), rx: *rx, tx: *tx })
+            .map(|(domain, e)| DomainTraffic { domain: domain.clone(), rx: e.rx, tx: e.tx })
             .collect();
-        rows.sort_by(|a, b| (b.rx + b.tx).cmp(&(a.rx + a.tx)).then_with(|| a.domain.cmp(&b.domain)));
+        drop(table);
+        rows.sort_by(|a, b| {
+            b.rx.saturating_add(b.tx).cmp(&a.rx.saturating_add(a.tx)).then_with(|| a.domain.cmp(&b.domain))
+        });
         rows.truncate(DOMAIN_TRAFFIC_TOP);
         (rows, total)
     }
@@ -137,13 +213,17 @@ impl Metrics {
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
-        // Один захват на все четыре величины: раньше ttfb_latency блокировался
-        // четырежды подряд, и p50/p95/p99 могли прийти из разных состояний окна.
-        let ttfb = self.ttfb_latency.lock().ok();
-        let (ttfb_p50, ttfb_p95, ttfb_p99, latency_samples) = match ttfb.as_deref() {
-            Some(p) => (p.p50(), p.p95(), p.p99(), p.len()),
-            None => (None, None, None, 0),
+        // Окно копируется под замком, а сортируется уже без него и один раз
+        // на все три перцентиля: снимок берёт интерфейс 20 раз в секунду, а
+        // на этом же замке ждут соединения (record_ttfb_ms). Раньше окно
+        // сортировалось трижды, и всё — под замком.
+        let ttfb = self.ttfb_latency.lock().map(|p| p.clone()).ok();
+        let latency_samples = ttfb.as_ref().map_or(0, |p| p.len());
+        let [ttfb_p50, ttfb_p95, ttfb_p99] = match ttfb {
+            Some(p) => p.percentiles([0.50, 0.95, 0.99]),
+            None => [None; 3],
         };
+        let connect_p50 = self.connect_latency.lock().map(|p| p.clone()).ok().and_then(|p| p.percentiles([0.50])[0]);
 
         MetricsSnapshot {
             active_connections: self.active_connections.load(Ordering::Relaxed),
@@ -151,17 +231,38 @@ impl Metrics {
             bytes_tx: self.bytes_tx.load(Ordering::Relaxed),
             quic_sessions: self.quic_sessions.load(Ordering::Relaxed),
             quic_initial_sent: self.quic_initial_sent.load(Ordering::Relaxed),
-            dns_ok: self.dns_ok.load(Ordering::Relaxed),
+            dns_ok: self.dns_checked.load(Ordering::Relaxed).then(|| self.dns_ok.load(Ordering::Relaxed)),
             tcp_listening: self.tcp_listening.load(Ordering::Relaxed),
             udp_listening: self.udp_listening.load(Ordering::Relaxed),
             socks5_listening: self.socks5_listening.load(Ordering::Relaxed),
             transparent_listening: self.transparent_listening.load(Ordering::Relaxed),
             transparent_udp_listening: self.transparent_udp_listening.load(Ordering::Relaxed),
-            connect_p50: self.connect_latency.lock().ok().and_then(|p| p.p50()),
+            connect_p50,
             ttfb_p50,
             ttfb_p95,
             ttfb_p99,
             latency_samples,
+        }
+    }
+}
+
+impl DomainTable {
+    /// Выбрасывает пачку самых лёгких из давно не активных доменов; если
+    /// таких не хватает — самых лёгких вообще, но не `keep` (только что
+    /// добавленный). Их трафик остаётся в итоге.
+    fn evict(&mut self, now: Instant, keep: &str) {
+        let mut candidates: Vec<(bool, u64, String)> = self
+            .domains
+            .iter()
+            .filter(|(name, _)| name.as_str() != keep)
+            .map(|(name, e)| (now.duration_since(e.last) < DOMAIN_TRAFFIC_FRESH, e.total(), name.clone()))
+            .collect();
+        // Сначала давно не активные (false < true), среди них — лёгкие.
+        candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let excess = self.domains.len() - DOMAIN_TRAFFIC_CAP + DOMAIN_TRAFFIC_EVICT;
+        for (_, total, name) in candidates.into_iter().take(excess) {
+            self.domains.remove(&name);
+            self.evicted = self.evicted.saturating_add(total);
         }
     }
 }
@@ -183,7 +284,8 @@ pub struct MetricsSnapshot {
     pub bytes_tx: u64,
     pub quic_sessions: usize,
     pub quic_initial_sent: u64,
-    pub dns_ok: bool,
+    /// `None` — DoH-релей ещё ничего не проверял (или не запущен).
+    pub dns_ok: Option<bool>,
     pub tcp_listening: bool,
     pub udp_listening: bool,
     pub socks5_listening: bool,
@@ -246,6 +348,47 @@ mod tests {
         let (rows, total) = m.top_domains();
         assert_eq!(rows.len(), DOMAIN_TRAFFIC_TOP, "показываем только топ");
         assert_eq!(total, (DOMAIN_TRAFFIC_TOP as u64 + 5) * 10, "итог — по всем доменам");
+    }
+
+    #[test]
+    fn new_domain_is_not_evicted_and_total_keeps_evicted_bytes() {
+        let m = Metrics::new();
+        let long_ago = Instant::now() - DOMAIN_TRAFFIC_FRESH - Duration::from_secs(1);
+        {
+            let mut t = m.domain_traffic.lock().unwrap();
+            for i in 0..DOMAIN_TRAFFIC_CAP {
+                t.domains.insert(format!("old{i}"), DomainEntry { rx: 1_000_000, tx: 0, last: long_ago });
+            }
+        }
+        // Новый сайт мелкими соединениями: 50 КБ за раз.
+        for _ in 0..3 {
+            m.record_domain_traffic("new.example", 50_000, 0);
+        }
+        let (rows, total) = m.top_domains();
+        let table = m.domain_traffic.lock().unwrap();
+        let new = table.domains.get("new.example").expect("новый домен остаётся в таблице");
+        assert_eq!(new.rx, 150_000, "и копит трафик");
+        assert!(table.domains.len() <= DOMAIN_TRAFFIC_CAP);
+        assert_eq!(total, DOMAIN_TRAFFIC_CAP as u64 * 1_000_000 + 150_000, "итог учитывает вытесненных");
+        assert_eq!(rows.len(), DOMAIN_TRAFFIC_TOP);
+    }
+
+    #[test]
+    fn guards_undo_their_counters_when_dropped() {
+        let m = Metrics::new();
+        let conn = m.connection();
+        let quic = m.quic_session();
+        assert_eq!((m.snapshot().active_connections, m.snapshot().quic_sessions), (1, 1));
+        drop((conn, quic));
+        assert_eq!((m.snapshot().active_connections, m.snapshot().quic_sessions), (0, 0));
+    }
+
+    #[test]
+    fn dns_is_unknown_until_checked() {
+        let m = Metrics::new();
+        assert_eq!(m.snapshot().dns_ok, None);
+        m.set_dns_ok(false);
+        assert_eq!(m.snapshot().dns_ok, Some(false));
     }
 
     #[test]

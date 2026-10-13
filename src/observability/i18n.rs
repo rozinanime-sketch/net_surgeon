@@ -10,13 +10,39 @@
 //! встроенного словаря, что и у t!(), — с тем же откатом на английский.
 
 pub fn translate(lang_code: &str, key: &str, args: &[(String, String)]) -> String {
-    let mut text = crate::_rust_i18n_try_translate(lang_code, key)
+    let template = crate::_rust_i18n_try_translate(lang_code, key)
         .map(|t| t.into_owned())
         .unwrap_or_else(|| key.to_string());
-    for (name, value) in args {
-        text = text.replace(&format!("%{{{}}}", name), value);
+    substitute(&template, args)
+}
+
+/// Подставляет `%{имя}` за один проход по шаблону. Раньше аргументы
+/// подставлялись по очереди в растущую строку, и значение, в котором самом
+/// встречалось `%{error}` (заголовок Host от клиента, текст ошибки),
+/// подменялось следующим аргументом.
+fn substitute(template: &str, args: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("%{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let name = &after[..end];
+                match args.iter().find(|(n, _)| n == name) {
+                    Some((_, value)) => out.push_str(value),
+                    None => out.push_str(&rest[start..start + 2 + end + 1]),
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
     }
-    text
+    out.push_str(rest);
+    out
 }
 
 pub fn translate_nested(
@@ -41,6 +67,16 @@ mod tests {
         let args = vec![("field".to_string(), "port".to_string())];
         assert_eq!(translate("ru", "config.field_saved", &args), "Поле port сохранено");
         assert_eq!(translate("en", "config.field_saved", &args), "Field port saved");
+    }
+
+    #[test]
+    fn values_are_not_substituted_again() {
+        let args = vec![
+            ("addr".to_string(), "evil%{error}".to_string()),
+            ("error".to_string(), "timeout".to_string()),
+        ];
+        assert_eq!(substitute("%{addr}: %{error} %{unknown}", &args), "evil%{error}: timeout %{unknown}");
+        assert_eq!(substitute("open %{", &args), "open %{");
     }
 
     #[test]

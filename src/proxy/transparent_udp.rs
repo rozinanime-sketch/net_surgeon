@@ -95,11 +95,10 @@ struct Session {
     /// убивала бы её посреди просмотра.
     last_seen: Arc<std::sync::Mutex<Instant>>,
     cancel: CancellationToken,
-    /// Начался ли разговор с QUIC Initial. Счётчик QUIC-сессий в интерфейсе
-    /// должен означать одно и то же везде: в SOCKS5-режиме он считает только
-    /// такие сессии, а здесь раньше считал любую UDP-сессию, и одно и то же
-    /// поле показывало разные величины в зависимости от режима.
-    is_quic: bool,
+    /// Счётчик QUIC-сессий в интерфейсе — только у сессий, начавшихся с QUIC
+    /// Initial, как и в SOCKS5-режиме. Снимается вместе с сессией, в том
+    /// числе при перезапуске прокси.
+    _quic: Option<crate::observability::metrics::QuicSessionGuard>,
 }
 
 /// Ключ — пара «клиент, назначение»: один клиентский порт разговаривает
@@ -307,7 +306,7 @@ pub async fn run_transparent_udp(
     ]);
 
     let sessions: Arc<Mutex<HashMap<SessionKey, Session>>> = Arc::new(Mutex::new(HashMap::new()));
-    spawn_gc(Arc::clone(&sessions), Arc::clone(&metrics), token.clone());
+    spawn_gc(Arc::clone(&sessions), token.clone());
 
     let mut buf = [0u8; MAX_DATAGRAM];
 
@@ -386,11 +385,7 @@ async fn handle_datagram(
             return;
         }
         // Обратный путь умер — сессию открываем заново.
-        if let Some(dead) = table.remove(&key)
-            && dead.is_quic
-        {
-            metrics.quic_session_closed();
-        }
+        table.remove(&key);
     }
 
     // Имя домена в QUIC зашифровано, поэтому решение об обходе
@@ -437,9 +432,6 @@ async fn handle_datagram(
         return;
     };
 
-    if is_quic {
-        metrics.quic_session_opened();
-    }
     // Кроме QUIC сюда приходит UDP на порты звонков, а на них сидят и игры.
     // О каждой такой сессии без мусора писать незачем: лог утонул бы в них.
     if call {
@@ -541,7 +533,7 @@ async fn open_session(
         },
     );
 
-    Some(Session { sender, last_seen, cancel, is_quic })
+    Some(Session { sender, last_seen, cancel, _quic: is_quic.then(|| metrics.quic_session()) })
 }
 
 async fn return_path(
@@ -580,36 +572,22 @@ async fn return_path(
     cancel.cancel();
 }
 
-fn spawn_gc(
-    sessions: Arc<Mutex<HashMap<SessionKey, Session>>>,
-    metrics: Arc<Metrics>,
-    token: CancellationToken,
-) {
+fn spawn_gc(sessions: Arc<Mutex<HashMap<SessionKey, Session>>>, token: CancellationToken) {
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = tokio::time::sleep(GC_INTERVAL) => {
                     let now = Instant::now();
-                    let mut closed = 0usize;
-
                     let mut table = sessions.lock().await;
                     table.retain(|_, session| {
                         let last = session.last_seen.lock().map(|s| *s).unwrap_or(now);
                         let alive = now.duration_since(last) < SESSION_TIMEOUT;
                         if !alive {
                             session.cancel.cancel();
-                            if session.is_quic {
-                                closed += 1;
-                            }
                         }
                         alive
                     });
-                    drop(table);
-
-                    for _ in 0..closed {
-                        metrics.quic_session_closed();
-                    }
                 }
             }
         }

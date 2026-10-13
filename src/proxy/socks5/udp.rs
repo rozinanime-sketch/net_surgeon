@@ -22,10 +22,10 @@ struct SocksSession {
     /// принимает (скачивание, видеопоток), умирала по таймауту GC посреди
     /// живой передачи.
     last_seen: Arc<std::sync::Mutex<Instant>>,
-    /// Была ли сессия QUIC. Нужно, чтобы GC декрементировал счётчик
-    /// ровно для тех сессий, для которых он инкрементировался: иначе
-    /// quic_sessions в интерфейсе растёт и никогда не падает.
-    is_quic: bool,
+    /// Счётчик QUIC-сессий в интерфейсе — у QUIC-сессии. Снимается вместе с
+    /// ней: по таймауту, при замене умершей и при перезапуске прокси, когда
+    /// таблица выбрасывается целиком (раньше там счётчик не уменьшался).
+    _quic: Option<crate::observability::metrics::QuicSessionGuard>,
     /// Очередь отправки через отдельный исходящий сокет (слушающий для этого
     /// не годится: ответ сервера был бы неотличим от нового пакета клиента).
     /// Отправку ведёт одна задача на сессию — так мусор уходит первым,
@@ -176,7 +176,6 @@ pub async fn run_socks5_udp_processor(
     // неограниченно вместе с сокетами обратного пути.
     {
         let sessions_gc = Arc::clone(&active_sessions);
-        let metrics_gc = Arc::clone(&metrics);
         let token = token.clone();
         tokio::spawn(async move {
             loop {
@@ -186,25 +185,14 @@ pub async fn run_socks5_udp_processor(
                         let now = Instant::now();
                         let mut table = sessions_gc.lock().await;
 
-                        // Считаем закрываемые QUIC-сессии, чтобы счётчик
-                        // уменьшался ровно там, где он увеличивался.
-                        let mut closed_quic = 0usize;
                         table.retain(|_, session| {
                             let last = session.last_seen.lock().map(|s| *s).unwrap_or(now);
                             let alive = now.duration_since(last) < SESSION_TIMEOUT;
                             if !alive {
-                                if session.is_quic {
-                                    closed_quic += 1;
-                                }
                                 session.cancel.cancel();
                             }
                             alive
                         });
-                        drop(table);
-
-                        for _ in 0..closed_quic {
-                            metrics_gc.quic_session_closed();
-                        }
                     }
                 }
             }
@@ -325,11 +313,7 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
             return;
         }
         // Обратный путь сессии умер — убираем её и открываем новую ниже.
-        if let Some(dead) = table.remove(&key)
-            && dead.is_quic
-        {
-            ctx.metrics.quic_session_closed();
-        }
+        table.remove(&key);
     }
 
     // Имя назначения: присланное клиентом, иначе из кэша «адрес → домен» —
@@ -419,9 +403,7 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
         // опознал, и обход к нему просто не применялся.
         log_t(&ctx.log_tx, LogLevel::Info, "log.socks5_quic", vec![("addr", target)]);
     }
-    if is_quic {
-        ctx.metrics.quic_session_opened();
-    }
+    let quic = is_quic.then(|| ctx.metrics.quic_session());
 
     // Мусор отправит задача сессии, первая датаграмма встанет в очередь
     // следом за ним.
@@ -439,7 +421,7 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
     );
     session::enqueue(&sender, payload);
 
-    table.insert(key, SocksSession { last_seen, is_quic, sender, cancel });
+    table.insert(key, SocksSession { last_seen, _quic: quic, sender, cancel });
 }
 
 #[cfg(test)]

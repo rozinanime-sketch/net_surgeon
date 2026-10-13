@@ -62,7 +62,6 @@ pub fn channel() -> (LogSender, LogReceiver) {
     mpsc::unbounded_channel()
 }
 
-/// Простое сообщение без перевода (маркеры, готовый текст).
 /// Служебный маркер «прогон диагностики окончен»: интерфейсу, а не в лог.
 /// С номером прогона — чтобы поздний маркер старого прогона не снял флаг
 /// уже идущего нового.
@@ -85,6 +84,7 @@ fn diagnostics_marker_carries_its_run() {
     assert_eq!(diagnostics_done_run("обычная строка"), None);
 }
 
+/// Простое сообщение без перевода (маркеры, готовый текст).
 pub fn log(tx: &LogSender, level: LogLevel, text: impl Into<String>) {
     let _ = tx.send(LogMessage { level, payload: LogPayload::Plain(text.into()) });
 }
