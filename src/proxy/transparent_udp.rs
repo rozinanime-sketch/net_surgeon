@@ -99,6 +99,8 @@ struct Session {
     /// Initial, как и в SOCKS5-режиме. Снимается вместе с сессией, в том
     /// числе при перезапуске прокси.
     _quic: Option<crate::observability::metrics::QuicSessionGuard>,
+    /// Место в пределе UDP-сессий (см. limits); освобождается с сессией.
+    _slot: crate::proxy::limits::Slot,
 }
 
 /// Ключ — пара «клиент, назначение»: один клиентский порт разговаривает
@@ -428,7 +430,9 @@ async fn handle_datagram(
     let decoy = session::classify_decoy(&payload);
     let junk_plan = (bypass || call).then(|| (junk.clone(), decoy));
 
-    let Some(session) = open_session(client_addr, orig_dst, is_quic, junk_plan, log_tx, metrics, token).await else {
+    // Сверх предела новая сессия не открывается (см. limits).
+    let Some(slot) = crate::proxy::limits::udp_slot(log_tx) else { return };
+    let Some(session) = open_session(client_addr, orig_dst, is_quic, junk_plan, slot, log_tx, metrics, token).await else {
         return;
     };
 
@@ -452,11 +456,13 @@ async fn handle_datagram(
 }
 
 /// Поднимает пару сокетов под новую сессию и запускает оба направления.
+#[allow(clippy::too_many_arguments)]
 async fn open_session(
     client_addr: SocketAddr,
     orig_dst: SocketAddr,
     is_quic: bool,
     junk: Option<(Socks5JunkParams, session::DecoyKind)>,
+    slot: crate::proxy::limits::Slot,
     log_tx: &LogSender,
     metrics: &Arc<Metrics>,
     token: &CancellationToken,
@@ -533,7 +539,7 @@ async fn open_session(
         },
     );
 
-    Some(Session { sender, last_seen, cancel, _quic: is_quic.then(|| metrics.quic_session()) })
+    Some(Session { sender, last_seen, cancel, _quic: is_quic.then(|| metrics.quic_session()), _slot: slot })
 }
 
 async fn return_path(

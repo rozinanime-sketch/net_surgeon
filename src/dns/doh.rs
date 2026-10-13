@@ -96,6 +96,9 @@ pub async fn run_doh_relay(
             recv_result = async { tokio::select! { r = recv_v4 => r, r = recv_v6 => r } } => {
                 match recv_result {
                     Ok((query, client_addr, socket)) => {
+                        // Сверх предела запрос отбрасывается: клиент DNS
+                        // повторит его сам (см. proxy::limits).
+                        let Some(slot) = crate::proxy::limits::dns_slot(&log_tx) else { continue };
                         let client = client.clone();
                         let doh_provider = doh_provider.clone();
                         let log_tx = log_tx.clone();
@@ -104,6 +107,7 @@ pub async fn run_doh_relay(
                         let smart = smart.clone();
 
                         tokio::spawn(async move {
+                            let _slot = slot;
                             metrics.add_rx(query.len() as u64);
                             // Трекер получает «такого домена нет» сразу, без
                             // похода к провайдеру: соединения не будет вовсе.

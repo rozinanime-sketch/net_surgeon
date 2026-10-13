@@ -33,6 +33,8 @@ struct SocksSession {
     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     /// Останавливает задачу обратного пути, когда GC закрывает сессию.
     cancel: CancellationToken,
+    /// Место в пределе UDP-сессий (см. limits); освобождается с сессией.
+    _slot: crate::proxy::limits::Slot,
 }
 
 /// Ключ сессии — пара «клиент, назначение», а не один адрес клиента.
@@ -349,6 +351,10 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
         && ctx.junk.calls
         && session::is_call_flow(&payload, dst_addr.ip());
 
+    // Сверх предела новая сессия не открывается, датаграмма отбрасывается:
+    // идущие сессии важнее (см. limits).
+    let Some(slot) = crate::proxy::limits::udp_slot(&ctx.log_tx) else { return };
+
     // Семейство исходящего сокета должно совпадать с адресом назначения,
     // иначе send упадёт.
     let bind_addr = if dst_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
@@ -421,7 +427,7 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
     );
     session::enqueue(&sender, payload);
 
-    table.insert(key, SocksSession { last_seen, _quic: quic, sender, cancel });
+    table.insert(key, SocksSession { last_seen, _quic: quic, sender, cancel, _slot: slot });
 }
 
 #[cfg(test)]

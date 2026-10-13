@@ -9,6 +9,7 @@ mod transparent;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod transparent_udp;
 mod verdict;
+pub(crate) mod limits;
 // pub, потому что подмодули ходят друг к другу (socks5/udp.rs читает
 // udp::quic_parser) и на них смотрят интеграционные тесты.
 pub mod socks5;
@@ -125,6 +126,10 @@ pub async fn run_all(
     // проба гоняет технику по-настоящему. Здесь же, потому что порт берётся
     // из этого конфига и может смениться при перезапуске прокси.
     crate::engine::freeze::set_socks_port(config.socks5_port);
+
+    // До первого соединения: пределы на соединения считаются от лимита
+    // дескрипторов один раз (см. limits).
+    limits::raise_fd_limit();
 
     // Идентичность сети для стратегий (engine::net_id): на Linux-десктопе — по
     // шлюзу. На Android маршрут по умолчанию ведёт в TUN, поэтому там id

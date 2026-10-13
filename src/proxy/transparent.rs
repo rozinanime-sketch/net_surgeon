@@ -229,6 +229,8 @@ pub async fn run_transparent_proxy(
                     accept_result = listener.accept() => {
                         match accept_result {
                             Ok((client, _peer)) => {
+                                // Сверх предела — закрыть сразу (см. limits).
+                                let Some(slot) = crate::proxy::limits::tcp_slot(&log_tx) else { continue };
                                 let bypass_domains = Arc::clone(&bypass_domains);
                                 let bypass_params = bypass_params.clone();
                                 let log_tx = log_tx.clone();
@@ -236,12 +238,16 @@ pub async fn run_transparent_proxy(
                                 let ip_cache = Arc::clone(&ip_cache);
                                 let strategies = Arc::clone(&strategies);
                                 tokio::spawn(async move {
+                                    let _slot = slot;
                                     let _conn = metrics.connection();
                                     handle(client, is_enabled, &bypass_domains, &bypass_params,
                                            strategy_ttl_hours, &log_tx, &metrics, &ip_cache, &strategies).await;
                                 });
                             }
-                            Err(e) => log_t(&log_tx, LogLevel::Error, "log.tcp_error", vec![("error", e.to_string())]),
+                            Err(e) => {
+                                log_t(&log_tx, LogLevel::Error, "log.tcp_error", vec![("error", e.to_string())]);
+                                tokio::time::sleep(crate::proxy::limits::ACCEPT_ERROR_PAUSE).await;
+                            }
                         }
                     }
                 }

@@ -45,6 +45,10 @@ const PURGE_EVERY: Duration = Duration::from_secs(30);
 /// отправителя мусора. С запасом больше, чем уходит на сам мусор
 /// (по умолчанию 6 пакетов с паузами до 40 мс).
 const QUEUE_WINDOW: Duration = Duration::from_secs(2);
+/// Сколько потоков помнить. Сверх — новый поток проходит как есть, без
+/// мусора и без учёта: у потока с мусором свой системный поток отправки,
+/// и лавина новых UDP-потоков (торрент, сканер) иначе плодила бы их тысячами.
+const MAX_FLOWS: usize = 4096;
 
 /// Разобранные заголовки IP и UDP.
 #[derive(Debug, Clone, Copy)]
@@ -282,6 +286,9 @@ impl<M> Tracker<M> {
             return (Step::Pass, closed);
         }
 
+        if self.flows.len() >= MAX_FLOWS {
+            return (Step::Pass, closed);
+        }
         let is_quic = crate::proxy::udp::session::is_quic_initial(payload);
         let mut flow = Flow { last_seen: now, blocked: false, is_quic, queue: None };
         let step = match policy(&u, payload) {
@@ -373,6 +380,25 @@ mod tests {
         assert_eq!(u16::from_be_bytes([bigger[2], bigger[3]]), 28 + 1200);
         assert_eq!(u16::from_be_bytes([bigger[24], bigger[25]]), 8 + 1200);
         assert_eq!(&bigger[12..24], &pkt[12..24], "адреса и порты те же");
+    }
+
+    /// Сверх MAX_FLOWS новый поток проходит как есть: без мусора и без
+    /// своего отправителя.
+    #[test]
+    fn flows_beyond_the_limit_pass_untouched() {
+        let mut t: Tracker<u32> = Tracker::default();
+        let now = Instant::now();
+        let from = |sport: u16| {
+            let mut p = v4(443, &initial());
+            p[20..22].copy_from_slice(&sport.to_be_bytes());
+            p
+        };
+        for sport in 0..MAX_FLOWS as u16 {
+            t.process(&from(sport), now, |_, _| Policy::Pass, || 0);
+        }
+        let (step, _) = t.process(&from(MAX_FLOWS as u16), now, bypass, || 1);
+        assert!(matches!(step, Step::Pass));
+        assert_eq!(t.flows.len(), MAX_FLOWS);
     }
 
     /// Initial к сайту из списка открывает очередь, и следующие датаграммы

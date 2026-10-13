@@ -57,8 +57,9 @@ pub async fn run_socks5_server(
             _ = token.cancelled() => break,
             accept_result = listener.accept() => {
                 match accept_result {
-                    Ok((stream, peer)) => {
-                        let _ = peer;
+                    Ok((stream, _peer)) => {
+                        // Сверх предела — закрыть сразу (см. limits).
+                        let Some(slot) = crate::proxy::limits::tcp_slot(&log_tx) else { continue };
                         let log_tx = log_tx.clone();
                         let bypass_domains = Arc::clone(&bypass_domains);
                         let bypass_params = bypass_params.clone();
@@ -66,11 +67,15 @@ pub async fn run_socks5_server(
                         let metrics = Arc::clone(&metrics);
                         let ip_cache = Arc::clone(&ip_cache);
                         tokio::spawn(async move {
+                            let _slot = slot;
                             let _conn = metrics.connection();
                             handle_socks5(stream, udp_port, is_enabled, bypass_domains, bypass_params, strategy_ttl_hours, log_tx, Arc::clone(&metrics), strategies, ip_cache).await;
                         });
                     }
-                    Err(e) => log_t(&log_tx, LogLevel::Error, "log.socks5_error", vec![("error", e.to_string())]),
+                    Err(e) => {
+                        log_t(&log_tx, LogLevel::Error, "log.socks5_error", vec![("error", e.to_string())]);
+                        tokio::time::sleep(crate::proxy::limits::ACCEPT_ERROR_PAUSE).await;
+                    }
                 }
             }
         }
