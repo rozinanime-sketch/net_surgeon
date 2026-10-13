@@ -113,7 +113,7 @@ where
     // молча выродится в обычный сплит. Поэтому не пауза наугад, а очередь
     // сокета; если ядро о ней не отвечает — прежние несколько миллисекунд.
     if !socket::wait_sent(fd, DISORDER_SEND_WAIT).await {
-        tokio::time::sleep(Duration::from_millis(3)).await;
+        tokio::time::sleep(socket::UNKNOWN_QUEUE_PAUSE).await;
     }
 
     // TTL возвращаем в любом случае: ретрансмит первой половины должен уйти

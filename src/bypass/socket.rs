@@ -211,11 +211,15 @@ pub async fn wait_sent(fd: RawSock, max: std::time::Duration) -> bool {
     }
 }
 
+/// Пауза, когда ядро не говорит, ушёл ли сегмент: на свежем соединении его
+/// обычно хватает.
+pub const UNKNOWN_QUEUE_PAUSE: std::time::Duration = std::time::Duration::from_millis(3);
+
 /// Без `SIOCOUTQNSD` узнать нельзя — пауза в несколько миллисекунд, которой
 /// на свежем соединении обычно хватает.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub async fn wait_sent(_fd: RawSock, _max: std::time::Duration) -> bool {
-    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    tokio::time::sleep(UNKNOWN_QUEUE_PAUSE).await;
     true
 }
 
@@ -433,13 +437,6 @@ pub async fn send_fake(fd: RawSock, decoy: &[u8], real: &[u8], ttl: u32, md5sig:
     if decoy.len() != real.len() || decoy.is_empty() {
         return Ok(false);
     }
-    // Без SIOCOUTQNSD не узнать, ушла ли приманка (так бывает на Android,
-    // где SELinux режет ioctl сокета). Вернуть TTL наугад нельзя: приманка
-    // ушла бы с обычным TTL, дошла до сервера, и настоящий ClientHello он
-    // выбросил бы как повтор. Лучше откатиться на другую технику.
-    if unsent_bytes(fd).is_none() {
-        return Ok(false);
-    }
     let Some(page) = FakePage::new(decoy) else {
         return Ok(false);
     };
@@ -456,10 +453,15 @@ pub async fn send_fake(fd: RawSock, decoy: &[u8], real: &[u8], ttl: u32, md5sig:
     }
 
     let sent = splice_page(fd, &page).await;
-    if sent.is_ok() {
+    if sent.is_ok() && !wait_sent(fd, FAKE_SEND_WAIT).await {
         // TTL берётся в момент передачи, а не записи в очередь: вернуть его
-        // раньше — и приманка уйдёт с обычным и дойдёт до сервера.
-        wait_sent(fd, FAKE_SEND_WAIT).await;
+        // раньше — и приманка уйдёт с обычным и дойдёт до сервера. Ядро не
+        // говорит, ушла ли она (на Android SELinux не даёт приложению
+        // SIOCOUTQNSD), — короткая пауза: на свежем соединении сегмент
+        // уходит сразу при записи. Раньше в этом случае приманка не
+        // отправлялась вовсе, и на телефоне соединение до ретранслятора
+        // Telegram шло без неё и замерзало после пары килобайт.
+        tokio::time::sleep(UNKNOWN_QUEUE_PAUSE).await;
     }
     // Если приманка так и не ушла, подмена безвредна: уйдут сразу настоящие
     // данные, просто без обмана DPI.
