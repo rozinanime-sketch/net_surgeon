@@ -57,13 +57,16 @@ pub struct Selected {
     /// соединение жило, — исход относится к прежней сети, и записи новой его
     /// не засчитывают.
     pub net: u64,
+    /// Размер ClientHello соединения: если запись сбросят по его исходу,
+    /// передиагностика мерит пакетом того же размера. 0 — неизвестен.
+    pub hello_len: usize,
 }
 
 impl Selected {
-    pub const DIRECT: Selected = Selected { strategy: Strategy::None, source: None, net: 0 };
+    pub const DIRECT: Selected = Selected { strategy: Strategy::None, source: None, net: 0, hello_len: 0 };
 
     pub fn new(strategy: Strategy, source: Option<HelloClass>) -> Selected {
-        Selected { strategy, source, net: crate::engine::net_state::net_generation() }
+        Selected { strategy, source, net: crate::engine::net_state::net_generation(), hello_len: 0 }
     }
 }
 
@@ -93,6 +96,10 @@ pub fn select_packet(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selec
 }
 
 fn select_with(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) -> Selected {
+    Selected { hello_len, ..choose(ctx, domain, hello_len, packet) }
+}
+
+fn choose(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) -> Selected {
     // Seqovl — только под перехватом пакетов (сокету номер последовательности
     // не задать); прочие пакетные техники — как раньше: под перехватом лишь
     // те, что он умеет применить.
@@ -182,6 +189,15 @@ pub fn record_outcome(ctx: &Context<'_>, domain: &str, selected: Selected, respo
     log_nested_t(ctx.log_tx, LogLevel::Warning, "log.strategy_invalidated", "strategy", selected.strategy.label_key(), vec![
         ("domain", domain.to_string()),
     ]);
+    // Сразу перемерить, не дожидаясь следующего соединения без записи и не
+    // глядя на паузу автодиагностики. Иначе поддомен после сброса брал
+    // стратегию родителя — обычно ту же нерабочую, — и диагностика не
+    // запускалась вовсе: так Discord и висел, когда провайдер перестал
+    // пропускать OOB и две TLS-записи.
+    if selected.hello_len > 0 {
+        ctx.strategies.forget_auto_diagnosis(domain, class);
+        spawn_diagnosis(ctx, domain, class, selected.hello_len);
+    }
     // Сброс закрепляется на диске, иначе после перезапуска вернётся та же
     // нерабочая запись. Запись файла — в блокирующий пул: здесь обработчик
     // соединения, и синхронный вызов задержал бы рабочий поток tokio.
@@ -287,6 +303,26 @@ mod tests {
             "split_pos_min = 4\nsplit_pos_max = 12\nsplit_delay_ms = 3\nwindow_clamp = 0\n",
         ).expect("параметры обхода");
         (Arc::new(StrategyStore::new()), params, tx)
+    }
+
+    /// Сброс записи запускает передиагностику сразу, даже в паузу
+    /// автодиагностики: иначе поддомен брал нерабочую стратегию родителя.
+    #[tokio::test]
+    async fn invalidated_strategy_is_rediagnosed_at_once() {
+        let (store, params, tx) = ctx_parts();
+        store.set("discord.gg", HelloClass::Large, Strategy::Oob, 0.44);
+        store.set("gateway.discord.gg", HelloClass::Large, Strategy::Oob, 0.44);
+        // Пауза автодиагностики идёт — раньше она и мешала перемерить.
+        store.claim_auto_diagnosis("gateway.discord.gg", HelloClass::Large, AUTO_DIAGNOSIS_COOLDOWN);
+        let ctx = Context { strategies: &store, bypass_params: &params, ttl_hours: 24, log_tx: &tx };
+
+        let selected = select(&ctx, "gateway.discord.gg", 1800);
+        assert_eq!(selected.hello_len, 1800);
+        for _ in 0..3 {
+            record_outcome(&ctx, "gateway.discord.gg", selected, false);
+        }
+        // Пауза снята и тут же занята новой диагностикой.
+        assert!(!store.claim_auto_diagnosis("gateway.discord.gg", HelloClass::Large, AUTO_DIAGNOSIS_COOLDOWN));
     }
 
     #[tokio::test]

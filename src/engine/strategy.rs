@@ -1006,6 +1006,12 @@ impl StrategyStore {
     /// Пауза покрывает и идущую диагностику (десятки соединений подряд
     /// не должны запускать десятки прогонов), и неудачную: если не сработало
     /// ничего, повторять прогон на каждое соединение бессмысленно.
+    /// Снимает паузу автодиагностики для пары «домен + размер»: запись по ней
+    /// только что сброшена, и перемерить нужно сейчас.
+    pub fn forget_auto_diagnosis(&self, domain: &str, class: HelloClass) {
+        self.auto_diagnosis.lock().unwrap_or_else(|e| e.into_inner()).remove(&key_for(domain, class));
+    }
+
     pub fn claim_auto_diagnosis(&self, domain: &str, class: HelloClass, cooldown: std::time::Duration) -> bool {
         let key = key_for(domain, class);
         let now = std::time::Instant::now();
