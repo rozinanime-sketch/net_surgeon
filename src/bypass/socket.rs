@@ -396,6 +396,61 @@ fn unsent_bytes(fd: RawSock) -> Option<libc::c_int> {
     (rc == 0).then_some(n)
 }
 
+/// Сколько раз ядро повторяло отправку по сокету и сколько отправленных
+/// байт сервер так и не подтвердил (`TCP_INFO`); `None` — ядро не ответило.
+///
+/// По сокету иначе не отличить «сервер молчит» от «пакеты пропадают»: оба
+/// выглядят тишиной. Повторы с неподтверждёнными данными — второе: ни один
+/// пакет не дошёл или ни один ответ не вернулся. Так zapret2 опознаёт
+/// блокировку (`standard_failure_detector`, retrans).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn retransmits(fd: RawSock) -> Option<Retransmits> {
+    /// Начало `struct tcp_info` из `linux/tcp.h` до tcpi_total_retrans.
+    /// В крейте `libc` её нет для Android, а раскладка у ядра неизменна:
+    /// новые поля добавляются только в конец.
+    #[repr(C)]
+    #[derive(Default)]
+    struct TcpInfo {
+        _flags: [u8; 8],
+        _rto: u32,
+        _ato: u32,
+        _snd_mss: u32,
+        _rcv_mss: u32,
+        unacked: u32,
+        _sacked: u32,
+        _lost: u32,
+        _retrans: u32,
+        _fackets: u32,
+        _times: [u32; 4],
+        _pmtu_to_reordering: [u32; 8],
+        _rcv_rtt: u32,
+        _rcv_space: u32,
+        total_retrans: u32,
+    }
+    let mut info = TcpInfo::default();
+    let mut len = std::mem::size_of::<TcpInfo>() as libc::socklen_t;
+    // SAFETY: ядро пишет не больше `len` байт в переданную структуру.
+    let rc = unsafe {
+        libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_INFO, (&mut info as *mut TcpInfo).cast(), &mut len)
+    };
+    (rc == 0 && len as usize >= std::mem::size_of::<TcpInfo>())
+        .then_some(Retransmits { total: info.total_retrans, unacked_segments: info.unacked })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn retransmits(_fd: RawSock) -> Option<Retransmits> {
+    None
+}
+
+/// Повторы отправки по сокету (см. [`retransmits`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Retransmits {
+    /// Сколько всего раз ядро повторяло отправку.
+    pub total: u32,
+    /// Сколько отправленных сегментов ещё не подтверждено.
+    pub unacked_segments: u32,
+}
+
 /// Включает (`key_len` > 0) или снимает (0) TCP-подпись MD5 для пакетов к
 /// собеседнику сокета. Ключ из нулей: его всё равно никто не проверяет, а
 /// сервер без ключа пакет с такой опцией выбрасывает (как в ByeDPI,

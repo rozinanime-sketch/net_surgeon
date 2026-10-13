@@ -455,7 +455,7 @@ async fn handle_connect(
         }
 
         let mut up = Flow::default();
-        up.add(initial.len());
+        up.add(&initial);
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
         let end = loop {
             match cr.read(&mut buf).await {
@@ -466,7 +466,7 @@ async fn handle_connect(
                     if let Err(e) = sw.write_all(&buf[..n]).await {
                         break End::new(Side::Server, &e);
                     }
-                    up.add(n);
+                    up.add(&buf[..n]);
                 }
             }
         };
@@ -492,7 +492,7 @@ async fn handle_connect(
                         responded_flag.store(crate::bypass::tls::server_accepted(&buf[..n]), Ordering::Relaxed);
                     }
                     metrics_s2c.add_tx(n as u64);
-                    down.add(n);
+                    down.add(&buf[..n]);
                     if let Err(e) = cw.write_all(&buf[..n]).await {
                         break End::new(Side::Client, &e);
                     }
@@ -501,6 +501,7 @@ async fn handle_connect(
         };
         let _ = cw.shutdown().await;
         down.end = Some(end);
+        down.retrans = crate::bypass::socket::retransmits(server_fd);
         down
     };
 

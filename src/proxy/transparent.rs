@@ -530,7 +530,7 @@ async fn handle(
                     }
                     metrics_s2c.add_tx(len as u64);
                     tx_total_s2c.fetch_add(len as u64, Ordering::Relaxed);
-                    down.add(len);
+                    down.add(&buf[..len]);
                     if let Err(e) = client_writer.write_all(&buf[..len]).await {
                         break End::new(Side::Client, &e);
                     }
@@ -541,13 +541,14 @@ async fn handle(
         // и вторая сторона висела до собственного таймаута.
         let _ = client_writer.shutdown().await;
         down.end = Some(end);
+        down.retrans = crate::bypass::socket::retransmits(server_fd);
         down
     };
 
     let metrics_c2s = Arc::clone(metrics);
     let rx_total_c2s = Arc::clone(&rx_total);
     let mut up = Flow::default();
-    up.add(payload.len());
+    up.add(&payload);
     let to_server = async move {
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
         let end = loop {
@@ -560,7 +561,7 @@ async fn handle(
                     if let Err(e) = server_writer.write_all(&buf[..len]).await {
                         break End::new(Side::Server, &e);
                     }
-                    up.add(len);
+                    up.add(&buf[..len]);
                 }
             }
         };

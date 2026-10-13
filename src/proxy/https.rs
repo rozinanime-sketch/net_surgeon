@@ -250,7 +250,7 @@ pub async fn handle_connect(
 
         // Дальше стратегия уже ни при чём — обычное перекладывание байт.
         let mut up = Flow::default();
-        up.add(first.len());
+        up.add(&first);
         let mut buffer = [0u8; crate::proxy::PUMP_BUF];
         let end = loop {
             match client_reader.read(&mut buffer).await {
@@ -259,7 +259,7 @@ pub async fn handle_connect(
                     metrics_c2s.add_rx(n as u64);
                     rx_total_c2s.fetch_add(n as u64, Ordering::Relaxed);
                     if let Err(e) = server_writer.write_all(&buffer[..n]).await { break End::new(Side::Server, &e); }
-                    up.add(n);
+                    up.add(&buffer[..n]);
                 }
                 Err(e) => break End::new(Side::Client, &e),
             }
@@ -296,13 +296,14 @@ pub async fn handle_connect(
                     let data = &buffer[..bytes_read];
                     metrics_s2c.add_tx(bytes_read as u64);
                     tx_total_s2c.fetch_add(bytes_read as u64, Ordering::Relaxed);
-                    down.add(bytes_read);
+                    down.add(data);
                     if let Err(e) = client_writer.write_all(data).await { break End::new(Side::Client, &e); }
                 }
                 Err(e) => break End::new(Side::Server, &e),
             }
         };
         down.end = Some(end);
+        down.retrans = crate::bypass::socket::retransmits(server_fd);
         down
     };
 

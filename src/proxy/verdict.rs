@@ -81,6 +81,10 @@ impl End {
     }
 }
 
+/// Сколько начала потока помнить: заголовки HTTP-ответа (редирект на
+/// заглушку) помещаются с запасом.
+const HEAD_MAX: usize = 1024;
+
 /// Одно направление пересылки: сколько байт прошло, когда последний кусок
 /// и чем кончилось.
 #[derive(Debug, Default)]
@@ -90,13 +94,52 @@ pub(crate) struct Flow {
     /// `None` — направление кончилось без отдельного события (например,
     /// до пересылки дело не дошло).
     pub end: Option<End>,
+    /// Начало потока, до HEAD_MAX байт.
+    pub head: Vec<u8>,
+    /// Повторы отправки по сокету сервера к концу пересылки — заполняется у
+    /// направления «сервер → клиент», пока сокет ещё открыт.
+    pub retrans: Option<crate::bypass::socket::Retransmits>,
 }
 
 impl Flow {
-    pub fn add(&mut self, n: usize) {
-        self.bytes += n as u64;
+    pub fn add(&mut self, chunk: &[u8]) {
+        if self.head.len() < HEAD_MAX {
+            let take = chunk.len().min(HEAD_MAX - self.head.len());
+            self.head.extend_from_slice(&chunk[..take]);
+        }
+        self.bytes += chunk.len() as u64;
         self.last = Some(Instant::now());
     }
+}
+
+/// Сколько повторов отправки при неподтверждённых данных — уже не потери
+/// на Wi-Fi, а глухая стена. Тот же порог у zapret2 (retrans=3).
+const RETRANS_STUCK: u32 = 3;
+
+/// Ответ — HTTP-редирект на чужой сайт: так DPI отдаёт заглушку «доступ
+/// ограничен». Чужой — другой домен второго уровня, как у zapret2
+/// (`is_dpi_redirect`): переход с `example.com` на `www.example.com` — не он.
+pub(crate) fn is_dpi_redirect(domain: &str, reply: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(&reply[..reply.len().min(HEAD_MAX)]);
+    let mut lines = text.split("\r\n");
+    let status = lines.next().unwrap_or_default();
+    let code = status.strip_prefix("HTTP/1.").and_then(|r| r.get(2..5));
+    if !matches!(code, Some("302" | "307")) {
+        return false;
+    }
+    let Some(location) = lines.take_while(|l| !l.is_empty()).find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("location").then(|| value.trim())
+    }) else {
+        return false;
+    };
+    let host = location.split("://").nth(1).unwrap_or("").split(['/', ':', '?', '#']).next().unwrap_or("");
+    let sld = |h: &str| {
+        let h = h.trim_end_matches('.').to_ascii_lowercase();
+        let parts: Vec<&str> = h.rsplitn(3, '.').take(2).collect();
+        parts.into_iter().rev().collect::<Vec<_>>().join(".")
+    };
+    !host.is_empty() && sld(host) != sld(domain)
 }
 
 /// Длина ClientHello, если первый пакет — TLS; 0 — не TLS.
@@ -111,6 +154,7 @@ pub(crate) enum Verdict {
     TlsFail,
     DataStallSuspected,
     Reset,
+    DpiRedirect,
     Ok,
     Unknown,
 }
@@ -122,6 +166,7 @@ impl Verdict {
             Verdict::TlsFail => "TLS_FAIL",
             Verdict::DataStallSuspected => "DATA_STALL_SUSPECTED",
             Verdict::Reset => "RESET",
+            Verdict::DpiRedirect => "DPI_REDIRECT",
             Verdict::Ok => "OK",
             Verdict::Unknown => "UNKNOWN",
         }
@@ -168,6 +213,11 @@ pub(crate) struct Facts {
     /// Клиент писал после последнего байта сервера — сколько с тех пор
     /// прошло до конца. `None` — последним говорил сервер.
     pub unanswered: Option<Duration>,
+    /// Ядро не раз повторяло отправку, а сервер так и не подтвердил данные:
+    /// пакеты пропадают в сети, а не сервер молчит.
+    pub stuck: bool,
+    /// Ответ — редирект на заглушку (см. [`is_dpi_redirect`]).
+    pub redirect: bool,
 }
 
 pub(crate) fn classify(f: &Facts) -> Finding {
@@ -178,17 +228,30 @@ pub(crate) fn classify(f: &Facts) -> Finding {
     if f.received > 0 && f.alert {
         return finding(Verdict::TlsFail, Confidence::High, "verdict.alert");
     }
+    if f.redirect {
+        return finding(Verdict::DpiRedirect, Confidence::High, "verdict.dpi_redirect");
+    }
     // Сброс со стороны сервера. Кто его прислал — сервер или DPI от его
-    // имени, — по сокету не видно; видно только сам сброс.
+    // имени, — по сокету не видно. Но в первых килобайтах это почерк DPI
+    // (zapret2 считает так RST до 4 КБ), а позже — скорее сам сервер.
     if f.side == Side::Server && f.how == How::Reset {
-        return finding(Verdict::Reset, Confidence::High, "verdict.server_reset");
+        return if f.received <= PAST_HANDSHAKE {
+            finding(Verdict::Reset, Confidence::High, "verdict.server_reset_early")
+        } else {
+            finding(Verdict::Reset, Confidence::Medium, "verdict.server_reset")
+        };
     }
     if f.hello_len == 0 {
         return finding(Verdict::Unknown, Confidence::Low, "verdict.not_tls");
     }
     // На ClientHello не пришло ни байта: дальше рукопожатия дело не дошло.
     if f.received == 0 {
-        return finding(Verdict::TlsFail, Confidence::Medium, "verdict.no_reply");
+        // Сервер не подтвердил даже ClientHello: соединение заглушили.
+        return if f.stuck {
+            finding(Verdict::TlsFail, Confidence::High, "verdict.blackhole")
+        } else {
+            finding(Verdict::TlsFail, Confidence::Medium, "verdict.no_reply")
+        };
     }
     // Ответ был, но клиент ничего не дослал после ClientHello: свою часть
     // рукопожатия (Finished) он не отправил — ответ сервера до него не дошёл
@@ -202,6 +265,10 @@ pub(crate) fn classify(f: &Facts) -> Finding {
         Some(silence) if silence >= STALL_SILENCE => {
             // Ядро сдалось, повторяя отправку, — пакеты пропадали в сети, это
             // уже не похоже на молчащее приложение.
+            // Повторы с неподтверждёнными данными — данные не доходят.
+            if f.stuck {
+                return finding(Verdict::DataStallSuspected, Confidence::High, "verdict.unanswered_retrans");
+            }
             let confidence = if f.side == Side::Server && f.how == How::Error { Confidence::Medium } else { Confidence::Low };
             finding(Verdict::DataStallSuspected, confidence, "verdict.unanswered")
         }
@@ -268,6 +335,8 @@ pub(crate) fn report(log_tx: &LogSender, domain: &str, strategy: Strategy, conn:
         side: first.side,
         how: first.how,
         unanswered,
+        stuck: down.retrans.is_some_and(|r| r.total >= RETRANS_STUCK && r.unacked_segments > 0),
+        redirect: hello_len == 0 && is_dpi_redirect(domain, &down.head),
     });
     log_finding(log_tx, domain, strategy.as_str(), finding);
 }
@@ -299,6 +368,8 @@ mod tests {
             side: Side::Client,
             how: How::Fin,
             unanswered: None,
+            stuck: false,
+            redirect: false,
         }
     }
 
@@ -366,6 +437,68 @@ mod tests {
         let plain = Facts { hello_len: 0, ..done() };
         assert_eq!(verdict(plain).0, Verdict::Unknown);
         assert_eq!(verdict(Facts { side: Side::Server, how: How::Reset, ..plain }).0, Verdict::Reset);
+    }
+
+    /// Сегодняшний Discord: ClientHello ушёл, ядро повторяет его, а сервер
+    /// не подтвердил ни байта — соединение заглушено, а не сервер молчит.
+    #[test]
+    fn unacknowledged_hello_is_a_blackhole() {
+        let silent = Facts { sent: 1586, received: 0, ..done() };
+        assert_eq!(classify(&silent).reason, "verdict.no_reply");
+        let stuck = Facts { stuck: true, ..silent };
+        assert_eq!(verdict(stuck), (Verdict::TlsFail, Confidence::High));
+        assert_eq!(classify(&stuck).reason, "verdict.blackhole");
+    }
+
+    #[test]
+    fn retransmits_turn_a_suspected_stall_into_a_sure_one() {
+        let f = Facts { sent: 723, received: 2773, unanswered: Some(Duration::from_secs(60)), stuck: true, ..done() };
+        assert_eq!(verdict(f), (Verdict::DataStallSuspected, Confidence::High));
+    }
+
+    #[test]
+    fn early_reset_is_dpi_like_late_one_is_not_sure() {
+        let early = Facts { received: 1200, side: Side::Server, how: How::Reset, ..done() };
+        assert_eq!(classify(&early).reason, "verdict.server_reset_early");
+        assert_eq!(verdict(early).1, Confidence::High);
+        let late = Facts { received: 500_000, ..early };
+        assert_eq!(verdict(late), (Verdict::Reset, Confidence::Medium));
+    }
+
+    #[test]
+    fn redirect_to_another_site_is_a_block_page() {
+        let reply = |code: &str, location: &str| format!("HTTP/1.1 {code} Found\r\nServer: x\r\nLocation: {location}\r\n\r\n").into_bytes();
+        assert!(is_dpi_redirect("rutracker.org", &reply("302", "http://warning.rt.ru/?id=1")));
+        assert!(is_dpi_redirect("rutracker.org", &reply("307", "https://blocked.example.net:8080/")));
+        // Свой сайт, относительный путь, постоянный редирект — не заглушка
+        assert!(!is_dpi_redirect("example.com", &reply("302", "https://www.example.com/login")));
+        assert!(!is_dpi_redirect("example.com", &reply("302", "/login")));
+        assert!(!is_dpi_redirect("example.com", &reply("301", "https://other.org/")));
+        assert!(!is_dpi_redirect("example.com", b"HTTP/1.1 200 OK\r\n\r\n"));
+
+        let f = Facts { hello_len: 0, redirect: true, ..done() };
+        assert_eq!(verdict(f), (Verdict::DpiRedirect, Confidence::High));
+    }
+
+    #[test]
+    fn flow_keeps_only_the_head_of_the_stream() {
+        let mut flow = Flow::default();
+        flow.add(&[1u8; 700]);
+        flow.add(&[2u8; 700]);
+        assert_eq!((flow.bytes, flow.head.len()), (1400, HEAD_MAX));
+        assert_eq!(flow.head[HEAD_MAX - 1], 2);
+    }
+
+    /// Ядро отвечает на TCP_INFO по живому соединению: повторов нет.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn retransmits_are_read_from_a_live_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _server = listener.accept().await.unwrap();
+        let r = crate::bypass::socket::retransmits(crate::bypass::socket::raw_sock(&client)).unwrap();
+        assert_eq!(r, crate::bypass::socket::Retransmits::default());
     }
 
     #[test]
