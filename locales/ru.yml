@@ -290,7 +290,7 @@ log.blocklist_active: "Блокировка трекеров включена, �
 log.blocklist_missing: "Блокировка трекеров включена, но список не прочитан (%{path}): %{error}"
 log.smart_dns_active: "Умный DNS %{provider}: доменов в списке: %{count}"
 log.smart_dns_missing: "Умный DNS задан, но список не прочитан (%{path}): %{error}"
-log.smart_dns_error: "Умный DNS не ответил для %{domain}, беру основной DoH: %{error}"
+log.smart_dns_error: "Умный DNS не ответил для %{domain}: %{error}. Минуту все имена идут через основной DoH"
 log.smart_dns_replaced: "Прежний умный DNS не работает, он заменён на %{provider}: ему уходят только запросы к нейросетям из smart_dns_domains.txt. Свой провайдер — в config.toml"
 log.blocked: "Заблокировано: %{domain} (%{via})"
 log.tproxy_forward_error: "TPROXY UDP: не удалось отправить на %{addr}: %{error}"

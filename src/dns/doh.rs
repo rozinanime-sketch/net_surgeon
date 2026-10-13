@@ -129,7 +129,7 @@ pub async fn run_doh_relay(
                             // панель вечно показывала бы OK, ничего не измеряя.
                             let qname = extract_qname(&query);
                             let via_smart = smart.as_ref().filter(|_| {
-                                qname.as_deref().is_some_and(super::smart::matches)
+                                qname.as_deref().is_some_and(super::smart::matches) && super::smart::available()
                             });
                             // Ответ умного DNS — общий адрес его прокси для
                             // всех имён списка: в кэш «адрес → домен» он не
@@ -146,11 +146,15 @@ pub async fn run_doh_relay(
                                         // Умный DNS не ответил — лучше настоящий
                                         // адрес от основного провайдера, чем никакого:
                                         // сервис хотя бы скажет, что закрыт по стране.
+                                        // Минуту после этого умный DNS не
+                                        // спрашивается (см. smart::available).
                                         Err(e) => {
-                                            log_t(&log_tx, LogLevel::Warning, "log.smart_dns_error", vec![
-                                                ("domain", qname.clone().unwrap_or_default()),
-                                                ("error", e),
-                                            ]);
+                                            if super::smart::mark_down() {
+                                                log_t(&log_tx, LogLevel::Warning, "log.smart_dns_error", vec![
+                                                    ("domain", qname.clone().unwrap_or_default()),
+                                                    ("error", e),
+                                                ]);
+                                            }
                                             resolve_via_doh(&client, &doh_provider, &query).await
                                         }
                                     }

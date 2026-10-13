@@ -72,6 +72,33 @@ pub fn reload(provider: &str, log_tx: &LogSender) {
     }
 }
 
+/// Сколько не спрашивать умный DNS после неудачи.
+const DOWN_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// До какого момента (секунды UNIX) умный DNS считается недоступным.
+static DOWN_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Можно ли сейчас спрашивать умный DNS.
+///
+/// После неудачи — минуту нет. Раньше каждый запрос заново ждал таймаут
+/// и лишь потом шёл к основному DoH: под VPN, где умный DNS недоступен,
+/// любой сайт из списка открывался на секунды дольше, а лог заполняли
+/// одинаковые предупреждения — по три на имя (A, AAAA, HTTPS).
+pub fn available() -> bool {
+    now_secs() >= DOWN_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Умный DNS не ответил. `true` — это первая неудача после доступности:
+/// о ней стоит написать, об остальных нет.
+pub fn mark_down() -> bool {
+    let until = now_secs() + DOWN_FOR.as_secs();
+    DOWN_UNTIL.swap(until, std::sync::atomic::Ordering::Relaxed) <= now_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
