@@ -109,7 +109,10 @@ pub(crate) const PUMP_BUF: usize = 16 * 1024;
 /// имя настоящего сайта короче, и DPI получил лишь окончание или случайное
 /// имя. Иначе смена `fake_sni` выглядела бы проверкой, а не проверяла
 /// ничего. Не чаще раза в минуту — соединений с той же картиной много.
-pub(crate) fn fake_sni_note(log_tx: &LogSender, applied: &crate::engine::strategy::apply::Applied, fake_sni: &str) {
+pub(crate) fn fake_sni_note(log_tx: &LogSender, applied: &crate::engine::strategy::apply::Applied, domain: &str, config_sni: &str) {
+    // Сверяется с тем именем, что приманка брала на деле: оно могло быть
+    // подобрано для домена (bypass::fake_sni).
+    let fake_sni = &crate::bypass::fake_sni::for_host(domain, config_sni);
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
     let crate::engine::strategy::apply::Applied::HostFakeSplit { fake, .. } = applied else { return };

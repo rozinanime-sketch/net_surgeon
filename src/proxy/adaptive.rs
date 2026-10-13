@@ -245,6 +245,12 @@ fn spawn_diagnosis(ctx: &Context<'_>, domain: &str, class: HelloClass, hello_len
         // Проба того же размера, что пришёл в бою: ради этого всё и делается.
         let timing = ProbeTiming { hello_size: hello_len, ..ProbeTiming::default() };
         let result = diagnostics::diagnose(&domain, &params, timing).await;
+        if let Some(name) = &result.decoy_sni {
+            log_t(&log_tx, LogLevel::Success, "log.decoy_sni_found", vec![
+                ("domain", domain.clone()),
+                ("name", name.clone()),
+            ]);
+        }
 
         // Слот освобождаем до freeze-проб: они идут через прокси и не должны
         // держать лимит одновременных диагностик (проба может ждать до ~30с).

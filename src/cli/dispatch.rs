@@ -139,6 +139,13 @@ fn report_diagnostics(log_tx: &LogSender, domain: &str, result: &crate::engine::
         ]);
     }
 
+    if let Some(name) = &result.decoy_sni {
+        log::log_t(log_tx, LogLevel::Success, "log.decoy_sni_found", vec![
+            ("domain", domain.to_string()),
+            ("name", name.clone()),
+        ]);
+    }
+
     log::log_nested_t(log_tx, LogLevel::Info, "log.diag_quic", "verdict", result.quic.description_key(), vec![
         ("domain", domain.to_string()),
     ]);

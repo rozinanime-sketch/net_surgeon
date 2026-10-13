@@ -523,6 +523,7 @@ mod ws {
             fake_clone: true,
             hostfakesplit_midhost: false,
             hostfakesplit_disorder_after: false,
+            fake_sni_candidates: Vec::new(),
         }
     }
 

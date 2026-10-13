@@ -87,9 +87,9 @@ pub trait Env {
     fn host_fake_options(&self) -> (bool, bool) {
         (false, false)
     }
-    /// Поддельное имя ровно в `len` байт для hostfakesplit.
-    fn fake_host(&self, len: usize) -> Vec<u8> {
-        crate::bypass::tls::fake_host("www.google.com", len)
+    /// Поддельное имя той же длины, что настоящее `host`, для hostfakesplit.
+    fn fake_host(&self, host: &[u8]) -> Vec<u8> {
+        crate::bypass::tls::fake_host("www.google.com", host.len())
     }
     fn log_intercepted(&self, domain: &str, dst: IpAddr, bypass: bool);
     fn log_applied(&self, domain: &str, detail: &str);
@@ -290,7 +290,7 @@ fn technique_for(strategy: Strategy, payload: &[u8], env: &impl Env) -> Techniqu
                     .then(|| crate::bypass::tls::mid_sld(&payload[host.clone()]))
                     .flatten()
                     .map(|m| host.start + m);
-                Technique::HostFakeSplit { fake_host: env.fake_host(host.len()), host, midhost, disorder_after }
+                Technique::HostFakeSplit { fake_host: env.fake_host(&payload[host.clone()]), host, midhost, disorder_after }
             }
             None => Technique::Split { pos },
         },

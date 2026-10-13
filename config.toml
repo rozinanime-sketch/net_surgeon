@@ -181,6 +181,11 @@ fake_clone = true
 #   Дороже на время повтора, как disorder.
 hostfakesplit_midhost = false
 hostfakesplit_disorder_after = false
+# Запасные имена для приманки («белый SNI»). Если с fake_sni не прошла ни
+# одна приманка, диагностика пробует эти по очереди и запоминает рабочее для
+# домена до смены сети. Список — догадка: какие имена пропускает DPI вашей
+# сети, видно только по диагностике. Пустой — не перебирать.
+fake_sni_candidates = ["vk.com", "ya.ru", "www.gosuslugi.ru", "www.ozon.ru", "www.wildberries.ru"]
 
 [socks5_junk]
 count = 6

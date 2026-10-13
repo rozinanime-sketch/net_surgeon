@@ -337,6 +337,9 @@ pub struct DiagnosticResult {
     /// Части, обрамлённые подделками (fakedsplit). Только под перехватом
     /// пакетов.
     pub faked_split: SplitScore,
+    /// Имя приманки из `fake_sni_candidates`, с которым прошла приманка, —
+    /// если с `fake_sni` не прошла ни одна (см. `bypass::fake_sni`).
+    pub decoy_sni: Option<String>,
 }
 
 fn classify_write_error(_e: &std::io::Error) -> ProbeOutcome { ProbeOutcome::ResetOnWrite }
@@ -623,6 +626,11 @@ pub async fn diagnose_thorough(domain: &str, bypass_params: &BypassParams, timin
     diagnose_with(domain, bypass_params, TRIALS_THOROUGH, false, timing).await
 }
 
+/// Сколько запасных имён приманки перебирать. Каждое — до двух серий проб
+/// (fake и hostfakesplit), а перебор идёт, только когда всё остальное уже
+/// провалилось: больше — и диагностика одного домена тянулась бы минутами.
+const MAX_DECOY_CANDIDATES: usize = 6;
+
 async fn diagnose_with(
     domain: &str,
     bypass_params: &BypassParams,
@@ -736,6 +744,7 @@ async fn diagnose_with(
             fake_multidisorder: empty,
             host_fake_split: empty,
             faked_split: empty,
+            decoy_sni: None,
         };
     }
 
@@ -764,6 +773,7 @@ async fn diagnose_with(
             fake_multidisorder: empty,
             host_fake_split: empty,
             faked_split: empty,
+            decoy_sni: None,
         };
     }
 
@@ -782,6 +792,7 @@ async fn diagnose_with(
             fake_multidisorder: empty,
             host_fake_split: empty,
             faked_split: empty,
+            decoy_sni: None,
         };
     }
 
@@ -806,6 +817,7 @@ async fn diagnose_with(
             fake_multidisorder: empty,
             host_fake_split: empty,
             faked_split: empty,
+            decoy_sni: None,
         };
     }
 
@@ -896,6 +908,42 @@ async fn diagnose_with(
         empty
     };
 
+    // Ступень 8½: «белый SNI». Ни одна приманка с `fake_sni` не прошла —
+    // перебираем запасные имена (bypass::fake_sni). DPI может пропускать
+    // только имена из своего белого списка, и какие они — видно лишь на
+    // пробе. Только на сокете: в пакетном режиме приманку ставит перехват
+    // по своим параметрам, и пробе её имя не задать.
+    let (mut fake, mut host_fake_split) = (fake, host_fake_split);
+    let mut decoy_sni = None;
+    let decoys_failed = !fake.is_convincing() && !fake_multidisorder.is_convincing() && !host_fake_split.is_convincing();
+    if !packet_mode && crate::bypass::socket::fake_supported() && decoys_failed {
+        let mut probe_params = bypass_params.clone();
+        probe_params.fake_ttl = swept_ttl.unwrap_or_else(|| crate::bypass::fake_ttl::effective(bypass_params.fake_ttl));
+        let candidates = bypass_params
+            .fake_sni_candidates
+            .iter()
+            .filter(|name| !name.eq_ignore_ascii_case(&bypass_params.fake_sni))
+            .take(MAX_DECOY_CANDIDATES);
+        for name in candidates {
+            probe_params.fake_sni = name.clone();
+            let score = trials(&target, domain, FragStrategy::Fake, &probe_params, trials_count, early_abandon, timing).await;
+            if score.is_convincing() {
+                fake = score;
+                decoy_sni = Some(name.clone());
+                break;
+            }
+            let score = trials(&target, domain, FragStrategy::HostFakeSplit, &probe_params, trials_count, early_abandon, timing).await;
+            if score.is_convincing() {
+                host_fake_split = score;
+                decoy_sni = Some(name.clone());
+                break;
+            }
+        }
+        if let Some(name) = &decoy_sni {
+            crate::bypass::fake_sni::note_working(domain, name);
+        }
+    }
+
     // Ступень 9: fakedsplit — только под перехватом пакетов: на сокете
     // подделку ПОСЛЕ настоящих данных на тех же номерах не отправить.
     let faked_split = if packet_mode {
@@ -923,7 +971,7 @@ async fn diagnose_with(
         probe_quic(domain).await
     };
 
-    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake, seqovl, fake_multidisorder, host_fake_split, faked_split }
+    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake, seqovl, fake_multidisorder, host_fake_split, faked_split, decoy_sni }
 }
 
 #[cfg(test)]

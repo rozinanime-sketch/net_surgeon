@@ -61,6 +61,10 @@ pub struct BypassParams {
     /// порядку, первый — с TTL `disorder_ttl` (`disorder_after` у zapret2).
     #[serde(default)]
     pub hostfakesplit_disorder_after: bool,
+    /// Запасные имена для приманки: их перебирает диагностика, если с
+    /// `fake_sni` не прошла ни одна приманка (см. `bypass::fake_sni`).
+    #[serde(default = "default_fake_sni_candidates")]
+    pub fake_sni_candidates: Vec<String>,
 }
 
 /// Параметры junk-обфускации в SOCKS5 UDP (раньше были захардкожены
@@ -270,6 +274,16 @@ fn default_listen_host() -> String { "127.0.0.1".to_string() }
 fn default_disorder_ttl() -> u32 { 2 }
 fn default_fake_ttl() -> u32 { 2 }
 fn default_fake_sni() -> String { "www.google.com".to_string() }
+
+/// Отечественные сервисы, которые попадают в белые списки первыми. Это
+/// догадка, а не проверенный список: какие имена пропускает DPI конкретной
+/// сети, видно только по диагностике.
+fn default_fake_sni_candidates() -> Vec<String> {
+    ["vk.com", "ya.ru", "www.gosuslugi.ru", "www.ozon.ru", "www.wildberries.ru"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
 fn default_strategy_ttl_hours() -> u64 { 24 }
 fn default_reward_reliability() -> f64 { 1.0 }
 fn default_reward_latency() -> f64 { 0.3 }

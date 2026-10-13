@@ -312,6 +312,7 @@ log.fake_applied: "fake: приманка %{decoy} Б, настоящий %{real
 log.fake_multidisorder_applied: "fake+multidisorder: приманка %{decoy} Б, части %{first}+%{second} Б переставлены — %{domain}"
 log.hostfakesplit_applied: "hostfakesplit: %{before} Б, имя %{host} Б после поддельного «%{fake}»%{options}, %{after} Б — %{domain}"
 log.fake_sni_unfit: "hostfakesplit: fake_sni «%{fake_sni}» длиннее имени сайта (%{len} Б) и целиком не поместился — DPI получил «%{fake}». Для проверки fake_sni берите имя не длиннее имён нужных сайтов"
+log.decoy_sni_found: "%{domain}: приманка прошла с именем «%{name}» — оно и будет в приманке для этого домена до смены сети"
 log.fake_score: "Приманка fake — %{domain}: успехов %{successes}/%{attempts}, уверенность %{confidence}, медиана %{median} мс"
 log.fake_multidisorder_score: "Приманка + перестановка — %{domain}: успехов %{successes}/%{attempts}, уверенность %{confidence}, медиана %{median} мс"
 log.host_fake_split_score: "Поддельное имя (hostfakesplit) — %{domain}: успехов %{successes}/%{attempts}, уверенность %{confidence}, медиана %{median} мс"

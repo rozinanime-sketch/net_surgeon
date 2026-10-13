@@ -1107,6 +1107,7 @@ mod tests {
             fake_multidisorder: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             host_fake_split: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             faked_split: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
+            decoy_sni: None,
         }
     }
 
@@ -1816,10 +1817,12 @@ pub mod apply {
         W: tokio::io::AsyncWriteExt + Unpin,
     {
         // TTL приманки — подобранный сетью, а не из конфига: он должен
-        // умереть дальше DPI, но ближе сервера (см. bypass::fake_ttl).
+        // умереть дальше DPI, но ближе сервера (см. bypass::fake_ttl). Имя —
+        // подобранное диагностикой для этого домена (bypass::fake_sni).
         let decoy_params = || {
             let mut tuned = bypass.clone();
             tuned.fake_ttl = crate::bypass::fake_ttl::effective(bypass.fake_ttl);
+            tuned.fake_sni = crate::bypass::fake_sni::for_hello(data, &bypass.fake_sni);
             tuned
         };
         let applied = match strategy {

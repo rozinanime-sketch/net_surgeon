@@ -358,14 +358,16 @@ mod imp {
         }
         fn decoy(&self, payload: &[u8]) -> Vec<u8> {
             let p = &self.tcp.bypass_params;
-            crate::bypass::tls::decoy_for(payload, payload.len(), &p.fake_sni, p.fake_clone)
-                .unwrap_or_else(|| crate::bypass::tls::build_client_hello_sized(&p.fake_sni, payload.len()))
+            let sni = crate::bypass::fake_sni::for_hello(payload, &p.fake_sni);
+            crate::bypass::tls::decoy_for(payload, payload.len(), &sni, p.fake_clone)
+                .unwrap_or_else(|| crate::bypass::tls::build_client_hello_sized(&sni, payload.len()))
         }
         fn host_fake_options(&self) -> (bool, bool) {
             (self.tcp.bypass_params.hostfakesplit_midhost, self.tcp.bypass_params.hostfakesplit_disorder_after)
         }
-        fn fake_host(&self, len: usize) -> Vec<u8> {
-            crate::bypass::tls::fake_host(&self.tcp.bypass_params.fake_sni, len)
+        fn fake_host(&self, host: &[u8]) -> Vec<u8> {
+            let sni = crate::bypass::fake_sni::for_host(&String::from_utf8_lossy(host), &self.tcp.bypass_params.fake_sni);
+            crate::bypass::tls::fake_host(&sni, host.len())
         }
         fn log_intercepted(&self, domain: &str, dst: IpAddr, bypass: bool) {
             log_t(&self.log_tx, LogLevel::Success, "log.transparent_tunnel", vec![

@@ -436,7 +436,7 @@ async fn handle_connect(
 
             match crate::engine::strategy::apply::first_packet(&mut sw, server_fd, &initial, selected.strategy, bypass_params).await {
                 Ok(applied) => {
-                    crate::proxy::fake_sni_note(log_tx, &applied, &bypass_params.fake_sni);
+                    crate::proxy::fake_sni_note(log_tx, &applied, &domain, &bypass_params.fake_sni);
                     let detail = applied.detail().unwrap_or_else(|| "direct".to_string());
                     log_t(log_tx, LogLevel::Success, "log.socks5_hello_sent", vec![
                         ("target", target.clone()),

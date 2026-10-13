@@ -195,7 +195,7 @@ pub async fn handle_connect(
             // (strategy::apply), чтобы два пути не разъезжались.
             match crate::engine::strategy::apply::first_packet(&mut server_writer, server_fd, &first, strategy, &bypass_params_c2s).await {
                 Ok(applied) => {
-                    super::fake_sni_note(&log_tx_c2s, &applied, &bypass_params_c2s.fake_sni);
+                    super::fake_sni_note(&log_tx_c2s, &applied, &domain_c2s, &bypass_params_c2s.fake_sni);
                     match applied {
                         Applied::TlsRecord { bytes } => log_t(&log_tx_c2s, LogLevel::Warning, "log.tls_record_applied", vec![
                             ("bytes", bytes.to_string()),

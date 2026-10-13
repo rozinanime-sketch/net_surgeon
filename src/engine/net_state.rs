@@ -146,15 +146,48 @@ pub fn auto_fake_ttl() -> Option<u32> {
     }
 }
 
+// --- имя приманки, подобранное диагностикой («белый SNI») ------------------
+
+fn decoy_names() -> &'static RwLock<std::collections::HashMap<String, String>> {
+    static NAMES: OnceLock<RwLock<std::collections::HashMap<String, String>>> = OnceLock::new();
+    NAMES.get_or_init(Default::default)
+}
+
+/// Имя приманки, с которым у домена `host` (или у его родителя) прошёл
+/// обход в этой сети; `None` — не подбиралось.
+pub fn decoy_name(host: &str) -> Option<String> {
+    let names = decoy_names().read().unwrap_or_else(|e| e.into_inner());
+    if names.is_empty() {
+        return None;
+    }
+    let mut cur = host.trim_end_matches('.');
+    loop {
+        if let Some(name) = names.get(cur) {
+            return Some(name.clone());
+        }
+        cur = cur.split_once('.')?.1;
+    }
+}
+
+/// Запоминает имя приманки, с которым у домена прошёл обход.
+pub fn note_decoy_name(domain: &str, name: &str) {
+    decoy_names()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(domain.trim_end_matches('.').to_ascii_lowercase(), name.to_string());
+}
+
 // --- сброс при смене сети --------------------------------------------------
 
-/// Сбрасывает подобранное под конкретную сеть: «сеть морозит» и TTL приманки.
+/// Сбрасывает подобранное под конкретную сеть: «сеть морозит», TTL и имена
+/// приманки.
 /// Число хопов до DPI и серверов на другой сети иное, и старые значения ломали
 /// бы обход. Порт SOCKS5 (из конфига) и сам id сети здесь не трогаем — их
 /// выставляет вызывающий.
 pub fn reset_for_network() {
     set_prefer_decoy(false);
     AUTO_FAKE_TTL.store(0, Ordering::Relaxed);
+    decoy_names().write().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Общий замок для тестов, трогающих сетевые глобалы (`PREFER_DECOY`,
@@ -184,6 +217,19 @@ mod tests {
         assert_eq!(auto_fake_ttl(), Some(6), "большее не поднимает минимум");
         reset_for_network();
         assert_eq!(auto_fake_ttl(), None, "сброс при смене сети");
+    }
+
+    #[test]
+    fn decoy_name_covers_subdomains_and_resets_with_the_network() {
+        let _g = test_guard();
+        reset_for_network();
+        assert_eq!(decoy_name("discord.com"), None);
+        note_decoy_name("Discord.com", "vk.com");
+        assert_eq!(decoy_name("discord.com").as_deref(), Some("vk.com"));
+        assert_eq!(decoy_name("gateway.discord.com").as_deref(), Some("vk.com"));
+        assert_eq!(decoy_name("notdiscord.com"), None);
+        reset_for_network();
+        assert_eq!(decoy_name("discord.com"), None);
     }
 
     #[test]
