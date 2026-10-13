@@ -175,7 +175,7 @@ pub async fn run(diagnostics_only: bool, startup: Startup) {
                 // Маркер завершения прогона диагностики — служебный,
                 // показывать его незачем.
                 if let LogPayload::Plain(text) = &msg.payload
-                    && text == "__DIAGNOSTICS_DONE__"
+                    && text.starts_with(log::DIAGNOSTICS_DONE)
                 {
                     continue;
                 }

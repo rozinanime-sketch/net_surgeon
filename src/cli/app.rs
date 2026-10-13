@@ -95,6 +95,13 @@ pub struct App {
     /// не стартовал поверх уже идущего — иначе прогоны наложились бы,
     /// удвоив нагрузку на сеть и исказив результат.
     pub diagnostics_running: bool,
+    /// Номер текущего прогона: маркер окончания несёт его, и поздний маркер
+    /// прошлого прогона (после снятия флага по таймауту) не снимает флаг
+    /// нового.
+    pub diagnostics_run: u64,
+    /// Высота панели логов при последней отрисовке — дальше её прокручивать
+    /// некуда.
+    pub log_view_height: std::cell::Cell<usize>,
     /// Режим только диагностики: слушатели не поднимаются.
     pub diagnostics_only: bool,
 }
@@ -123,6 +130,8 @@ impl App {
             language: if crate::default_language() == "ru" { Language::Ru } else { Language::En },
             proxy_token: None,
             diagnostics_running: false,
+            diagnostics_run: 0,
+            log_view_height: std::cell::Cell::new(1),
             diagnostics_only: false,
         }
     }
@@ -157,11 +166,28 @@ impl App {
             self.logs.pop_front();
         }
         self.logs.push_back(LogEntry { level, time, payload });
+        // Прокрутка считается от конца: без сдвига каждая новая строка
+        // уводила бы читаемое место вверх.
+        if !self.log_autoscroll {
+            self.log_scroll = (self.log_scroll + 1).min(self.max_log_scroll());
+        }
+    }
+
+    /// Дальше последнего экрана прокручивать некуда — та же граница, что
+    /// при отрисовке. Раньше Home и PageUp уходили за неё, и Down
+    /// «залипал» на десятки нажатий.
+    pub fn max_log_scroll(&self) -> usize {
+        self.logs.len().saturating_sub(self.log_view_height.get().max(1))
     }
 
     pub fn scroll_logs_up(&mut self, amount: usize) {
         self.log_autoscroll = false;
-        self.log_scroll = self.log_scroll.saturating_add(amount).min(self.logs.len().saturating_sub(1));
+        self.log_scroll = self.log_scroll.saturating_add(amount).min(self.max_log_scroll());
+    }
+
+    pub fn scroll_logs_to_top(&mut self) {
+        self.log_autoscroll = false;
+        self.log_scroll = self.max_log_scroll();
     }
 
     pub fn scroll_logs_down(&mut self, amount: usize) {
@@ -187,5 +213,29 @@ impl App {
 
     pub fn current(&self) -> MenuItem {
         MenuItem::ALL[self.selected]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Home и PageUp упираются в последний экран, а новые строки не
+    /// сдвигают то, что читают.
+    #[test]
+    fn log_scroll_stops_at_the_last_screen_and_holds_its_place() {
+        let mut app = App::new();
+        for i in 0..50 {
+            app.push_log_t(LogLevel::Info, format!("k{i}"), vec![]);
+        }
+        app.log_view_height.set(20);
+        app.scroll_logs_to_top();
+        assert_eq!(app.log_scroll, 30);
+        app.scroll_logs_up(100);
+        assert_eq!(app.log_scroll, 30);
+        app.scroll_logs_down(5);
+        assert_eq!(app.log_scroll, 25, "вниз двигается сразу, без «залипания»");
+        app.push_log_t(LogLevel::Info, "new", vec![]);
+        assert_eq!(app.log_scroll, 26, "новая строка не уводит читаемое место");
     }
 }

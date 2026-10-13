@@ -42,8 +42,7 @@ pub fn handle_key(app: &mut App, key: KeyCode) -> StepResult {
         KeyCode::PageDown => { app.scroll_logs_down(5); StepResult::Stay(Action::None) }
         KeyCode::Home => {
             if app.focus == Focus::Logs {
-                app.log_autoscroll = false;
-                app.log_scroll = app.logs.len();
+                app.scroll_logs_to_top();
             }
             StepResult::Stay(Action::None)
         }
@@ -415,6 +414,7 @@ fn draw_traffic_graph(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
     let visible_height = area.height.saturating_sub(2) as usize;
     let total = app.logs.len();
+    app.log_view_height.set(visible_height);
 
     // Дальше последнего экрана прокручивать некуда. Раньше здесь стояло
     // `log_scroll.min(total.saturating_sub(h).max(log_scroll))`, что тождественно

@@ -160,7 +160,7 @@ pub fn handle_key(state: &mut DomainsEditorState, key: KeyCode) -> StepResult {
 /// Строки-комментарии пропускаются так же, как в `config::load_bypass_domains`.
 /// Раньше редактор показывал их как домены и учитывал в счётчике.
 pub fn load_domains(list: DomainList) -> Result<Vec<String>, AppError> {
-    let text = crate::config::paths::read_to_string(list.path()).unwrap_or_default();
+    let text = read_list(list)?;
     Ok(text
         .lines()
         .map(|l| l.trim().to_string())
@@ -169,10 +169,26 @@ pub fn load_domains(list: DomainList) -> Result<Vec<String>, AppError> {
 }
 
 pub fn save_domains(list: DomainList, domains: &[String]) -> Result<(), AppError> {
-    let existing = crate::config::paths::read_to_string(list.path()).unwrap_or_default();
+    let existing = read_list(list)?;
     let content = render_domains_file(&existing, domains);
     crate::config::paths::write_atomic(list.path(), &content)
         .map_err(|e| AppError::new("error.domains_write").with("error", e))
+}
+
+/// Текст списка. Нет файла — пустой список; не читается по другой причине
+/// (права, не UTF-8 — например, комментарий в cp1251 из Windows) — ошибка.
+/// Раньше любая ошибка давала пустую строку: редактор открывался пустым, и
+/// первое же сохранение заменяло файл одним доменом.
+fn read_list(list: DomainList) -> Result<String, AppError> {
+    read_named(list.path())
+}
+
+fn read_named(name: &str) -> Result<String, AppError> {
+    match crate::config::paths::read_to_string(name) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(AppError::new("error.domains_read").with("file", name).with("error", e)),
+    }
 }
 
 /// Файл переписывается по месту: комментарии и пустые строки остаются где
@@ -267,6 +283,17 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &DomainsEditorState, proxy_st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Нет файла — пустой список; файл есть, но не читается (cp1251) —
+    /// ошибка, а не пустой список, который потом затёр бы файл.
+    #[test]
+    fn unreadable_list_is_an_error_not_an_empty_list() {
+        assert_eq!(read_named("domains_editor_absent.txt").unwrap(), "");
+        let path = crate::config::paths::resolve("domains_editor_cp1251.txt");
+        std::fs::write(&path, b"# \xcf\xf0\xe8\xe2\xe5\xf2\nyoutube.com\n").unwrap();
+        let err = read_named("domains_editor_cp1251.txt").unwrap_err();
+        assert_eq!(err.key, "error.domains_read");
+    }
 
     #[test]
     fn saving_keeps_comments_in_place_and_does_not_duplicate_them_as_domains() {

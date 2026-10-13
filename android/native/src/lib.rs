@@ -116,7 +116,7 @@ fn log_tx() -> &'static LogSender {
         runtime().spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if let LogPayload::Plain(text) = &msg.payload
-                    && text == "__DIAGNOSTICS_DONE__"
+                    && text.starts_with(nlog::DIAGNOSTICS_DONE)
                 {
                     continue;
                 }

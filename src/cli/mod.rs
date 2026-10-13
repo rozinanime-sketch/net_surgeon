@@ -166,7 +166,20 @@ fn run_app(
     // Some — интерфейс свёрнут, и канал сообщит о нажатии Enter.
     let mut background: Option<std::sync::mpsc::Receiver<()>> = None;
 
+    // Ctrl-C, SIGTERM и закрытие терминала (SIGHUP) — как выход из меню.
+    // В фоне терминал не в raw-режиме, и Ctrl-C приходил сигналом, который
+    // убивал процесс: перехват не снимался (main не доходил до
+    // firewall::release), системный прокси Windows не возвращался,
+    // стратегии за последние полминуты терялись.
+    let quit_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_quit_signals(&rt, Arc::clone(&quit_signal));
+
     loop {
+        if quit_signal.load(std::sync::atomic::Ordering::Relaxed) {
+            app.should_quit = true;
+            break;
+        }
+
         let mut needs_clear = false;
 
         // Единая точка приёма логов из фоновых задач — раньше здесь был
@@ -175,11 +188,16 @@ fn run_app(
         // как есть (app.push_payload), см. cli/log.rs и cli/app.rs.
         while let Ok(msg) = log_rx.try_recv() {
             if let log::LogPayload::Plain(text) = &msg.payload
-                && text == "__DIAGNOSTICS_DONE__"
+                && text.starts_with(log::DIAGNOSTICS_DONE)
             {
-                app.diagnostics_running = false;
-                if let screen::Screen::Diagnostics(state) = &mut app.screen {
-                    state.running = false;
+                // Только маркер текущего прогона: поздний маркер прошлого
+                // (если флаг сняли по таймауту и запустили новый) иначе
+                // снял бы флаг идущего, и два прогона пошли бы разом.
+                if log::diagnostics_done_run(text) == Some(app.diagnostics_run) {
+                    app.diagnostics_running = false;
+                    if let screen::Screen::Diagnostics(state) = &mut app.screen {
+                        state.running = false;
+                    }
                 }
                 continue;
             }
@@ -227,6 +245,10 @@ fn run_app(
         {
             app.diagnostics_running = false;
             diagnostics_started_at = None;
+            // И экран: иначе «идёт…» висело бы на нём вечно.
+            if let screen::Screen::Diagnostics(state) = &mut app.screen {
+                state.running = false;
+            }
         }
         if !app.diagnostics_running {
             diagnostics_started_at = None;
@@ -278,6 +300,18 @@ fn run_app(
                 continue;
             }
 
+            // Ctrl/Alt с буквой — не та же буква: Ctrl+Q закрывал программу
+            // вместе с перехватом, Ctrl+D удалял домен, Ctrl+A запускал
+            // массовую диагностику. Ctrl+C — выход, как везде в терминале.
+            use crossterm::event::{KeyCode, KeyModifiers};
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                app.should_quit = true;
+                break;
+            }
+            if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                continue;
+            }
+
             let action = screen::handle_key(app, key.code);
 
             match action {
@@ -303,6 +337,38 @@ fn run_app(
     }
 
     Ok(())
+}
+
+/// Поднимает флаг выхода по Ctrl-C, SIGTERM и SIGHUP (в Windows — по Ctrl-C;
+/// закрытие окна ловит system_proxy).
+fn spawn_quit_signals(rt: &tokio::runtime::Handle, flag: Arc<std::sync::atomic::AtomicBool>) {
+    rt.spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).ok();
+            let mut hup = signal(SignalKind::hangup()).ok();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = recv_or_never(&mut term) => {}
+                _ = recv_or_never(&mut hup) => {}
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// Ждёт сигнал; не подписались — не завершается никогда.
+#[cfg(unix)]
+async fn recv_or_never(signal: &mut Option<tokio::signal::unix::Signal>) {
+    match signal {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {

@@ -63,6 +63,28 @@ pub fn channel() -> (LogSender, LogReceiver) {
 }
 
 /// Простое сообщение без перевода (маркеры, готовый текст).
+/// Служебный маркер «прогон диагностики окончен»: интерфейсу, а не в лог.
+/// С номером прогона — чтобы поздний маркер старого прогона не снял флаг
+/// уже идущего нового.
+pub const DIAGNOSTICS_DONE: &str = "__DIAGNOSTICS_DONE__";
+
+pub fn diagnostics_done_marker(run: u64) -> String {
+    format!("{DIAGNOSTICS_DONE}:{run}")
+}
+
+/// Номер прогона из маркера; `None` — это не маркер.
+pub fn diagnostics_done_run(text: &str) -> Option<u64> {
+    text.strip_prefix(DIAGNOSTICS_DONE)?.strip_prefix(':')?.parse().ok()
+}
+
+#[cfg(test)]
+#[test]
+fn diagnostics_marker_carries_its_run() {
+    assert_eq!(diagnostics_done_run(&diagnostics_done_marker(7)), Some(7));
+    assert_eq!(diagnostics_done_run(DIAGNOSTICS_DONE), None, "старый маркер без номера — не текущий прогон");
+    assert_eq!(diagnostics_done_run("обычная строка"), None);
+}
+
 pub fn log(tx: &LogSender, level: LogLevel, text: impl Into<String>) {
     let _ = tx.send(LogMessage { level, payload: LogPayload::Plain(text.into()) });
 }

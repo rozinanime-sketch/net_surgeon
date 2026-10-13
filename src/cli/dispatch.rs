@@ -110,53 +110,30 @@ fn report_diagnostics(log_tx: &LogSender, domain: &str, result: &crate::engine::
     ]);
 
     // Каждая техника — отдельной строкой, с числами, а не сводным вердиктом.
-    log::log_t(log_tx, LogLevel::Info, "log.tls_record_score", vec![
-        ("domain", domain.to_string()),
-        ("successes", result.tls_record.successes.to_string()),
-        ("attempts", result.tls_record.attempts.to_string()),
-        ("confidence", format!("{:.2}", result.tls_record.confidence)),
-        ("median", fmt_ms(result.tls_record.median_ms)),
-    ]);
-
-    log::log_t(log_tx, LogLevel::Info, "log.oob_score", vec![
-        ("domain", domain.to_string()),
-        ("successes", result.oob.successes.to_string()),
-        ("attempts", result.oob.attempts.to_string()),
-        ("confidence", format!("{:.2}", result.oob.confidence)),
-        ("median", fmt_ms(result.oob.median_ms)),
-    ]);
-
-    log::log_t(log_tx, LogLevel::Info, "log.disorder_score", vec![
-        ("domain", domain.to_string()),
-        ("successes", result.disorder.successes.to_string()),
-        ("attempts", result.disorder.attempts.to_string()),
-        ("confidence", format!("{:.2}", result.disorder.confidence)),
-        ("median", fmt_ms(result.disorder.median_ms)),
-    ]);
-
-    log::log_t(log_tx, LogLevel::Info, "log.sni_score", vec![
-        ("domain", domain.to_string()),
-        ("successes", result.sni_split.successes.to_string()),
-        ("attempts", result.sni_split.attempts.to_string()),
-        ("confidence", format!("{:.2}", result.sni_split.confidence)),
-        ("median", fmt_ms(result.sni_split.median_ms)),
-    ]);
-
-    log::log_t(log_tx, LogLevel::Info, "log.fake_score", vec![
-        ("domain", domain.to_string()),
-        ("successes", result.fake.successes.to_string()),
-        ("attempts", result.fake.attempts.to_string()),
-        ("confidence", format!("{:.2}", result.fake.confidence)),
-        ("median", fmt_ms(result.fake.median_ms)),
-    ]);
-
-    log::log_t(log_tx, LogLevel::Info, "log.fake_multidisorder_score", vec![
-        ("domain", domain.to_string()),
-        ("successes", result.fake_multidisorder.successes.to_string()),
-        ("attempts", result.fake_multidisorder.attempts.to_string()),
-        ("confidence", format!("{:.2}", result.fake_multidisorder.confidence)),
-        ("median", fmt_ms(result.fake_multidisorder.median_ms)),
-    ]);
+    // Все, из которых выбирает `choose_from_diagnostics`, — и seqovl тоже:
+    // раньше он мог быть выбран без единой строки о том, как он прошёл.
+    let scores = [
+        ("log.tls_record_score", &result.tls_record),
+        ("log.oob_score", &result.oob),
+        ("log.disorder_score", &result.disorder),
+        ("log.sni_score", &result.sni_split),
+        ("log.fake_score", &result.fake),
+        ("log.fake_multidisorder_score", &result.fake_multidisorder),
+        ("log.seqovl_score", &result.seqovl),
+    ];
+    for (key, score) in scores {
+        // Не мерялась вовсе (недоступна здесь или прогон остановился раньше).
+        if score.attempts == 0 {
+            continue;
+        }
+        log::log_t(log_tx, LogLevel::Info, key, vec![
+            ("domain", domain.to_string()),
+            ("successes", score.successes.to_string()),
+            ("attempts", score.attempts.to_string()),
+            ("confidence", format!("{:.2}", score.confidence)),
+            ("median", fmt_ms(score.median_ms)),
+        ]);
+    }
 
     log::log_nested_t(log_tx, LogLevel::Info, "log.diag_quic", "verdict", result.quic.description_key(), vec![
         ("domain", domain.to_string()),
@@ -195,6 +172,8 @@ pub fn run(
             // напрямую, и вывод записывался на имя, которого в бою не бывает.
             let domain = domain.trim().trim_end_matches('.').to_lowercase();
             app.diagnostics_running = true;
+            app.diagnostics_run += 1;
+            let run_id = app.diagnostics_run;
             let log_tx = log_tx.clone();
             let config = Arc::clone(config);
             let strategies = Arc::clone(strategies);
@@ -207,7 +186,18 @@ pub fn run(
                     gap_max_ms: config.probe_gap_max_ms,
                     hello_size: crate::engine::diagnostics::browser_hello_size(),
                 };
-                let result = crate::engine::diagnostics::diagnose(&domain, &config.bypass, timing).await;
+                let mut result = crate::engine::diagnostics::diagnose(&domain, &config.bypass, timing).await;
+                // Ничего не прошло, хотя сервер досягаем, — перепроверка
+                // тщательной диагностикой, как во втором проходе массового
+                // прогона: быстрый проход с досрочным прекращением промахивается
+                // по вероятностной технике, и рабочая запись иначе сменилась бы
+                // на «ничего не помогло».
+                if strategy::choose_from_diagnostics(&result).is_none()
+                    && result.direct != crate::engine::diagnostics::ProbeOutcome::ConnectFailed
+                {
+                    log::log_t(&log_tx, LogLevel::Info, "log.diag_retry_started", vec![("count", "1".to_string())]);
+                    result = crate::engine::diagnostics::diagnose_thorough(&domain, &config.bypass, timing).await;
+                }
 
                 report_diagnostics(&log_tx, &domain, &result);
 
@@ -275,12 +265,14 @@ pub fn run(
                     log::log_t(&log_tx, LogLevel::Info, "log.diag_quic_works", vec![("domain", domain.clone())]);
                 }
 
-                log::log(&log_tx, LogLevel::Info, "__DIAGNOSTICS_DONE__");
+                log::log(&log_tx, LogLevel::Info, log::diagnostics_done_marker(run_id));
             });
         }
 
         Action::RunDiagnosticsAll => {
             app.diagnostics_running = true;
+            app.diagnostics_run += 1;
+            let run_id = app.diagnostics_run;
             // Массовый прогон не пишет разбор одного домена — стираем прошлый,
             // иначе после прогона экран показал бы его как свежий итог.
             crate::engine::domain_check::clear();
@@ -473,49 +465,42 @@ pub fn run(
                     }
                 }
 
-                log::log(&log_tx, LogLevel::Info, "__DIAGNOSTICS_DONE__");
+                log::log(&log_tx, LogLevel::Info, log::diagnostics_done_marker(run_id));
             });
         }
 
-        Action::SaveConfigField(path, new_value) => {
-            let log_tx = log_tx.clone();
-            let proxy_started = app.proxy_started;
-            rt.spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    config_editor::save_field(path, &new_value)
-                }).await;
-
-                match result {
-                    Ok(Ok(())) => {
-                        if proxy_started {
-                            log::log_t(&log_tx, LogLevel::Warning, "config.field_restart", vec![("field", path.to_string())]);
-                        } else {
-                            log::log_t(&log_tx, LogLevel::Success, "config.field_saved", vec![("field", path.to_string())]);
-                        }
-                    }
-                    Ok(Err(e)) => log::log_err(&log_tx, LogLevel::Error, e),
-                    Err(e) => log::log_t(&log_tx, LogLevel::Error, "log.save_task_error", vec![("error", e.to_string())]),
+        // Тоже прямо здесь: при отказе (не тот тип, конфиг не прочитался бы)
+        // поле нужно вернуть к тому, что на диске. Раньше экран продолжал
+        // показывать отвергнутое значение как сохранённое.
+        Action::SaveConfigField(path, new_value) => match config_editor::save_field(path, &new_value) {
+            Ok(()) => {
+                let key = if app.proxy_started { "config.field_restart" } else { "config.field_saved" };
+                let level = if app.proxy_started { LogLevel::Warning } else { LogLevel::Success };
+                app.push_log_t(level, key, vec![("field".to_string(), path.to_string())]);
+            }
+            Err(e) => {
+                app.push_err(e);
+                if let crate::cli::screen::Screen::ConfigEditor(state) = &mut app.screen
+                    && let Ok(fields) = config_editor::load_fields()
+                {
+                    state.fields = fields;
                 }
-            });
-        }
+            }
+        },
 
+        // Прямо здесь, а не фоновой задачей: файл маленький, а порядок
+        // важен. Раньше каждое сохранение уходило в свой поток, и при двух
+        // быстрых удалениях старый снимок мог лечь на диск последним —
+        // удалённый домен возвращался в файл.
         Action::SaveDomains(list, domains_snapshot) => {
-            let log_tx = log_tx.clone();
-            let proxy_started = app.proxy_started;
-            rt.spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    domains_editor::save_domains(list, &domains_snapshot)
-                }).await;
-
-                match result {
-                    Ok(Ok(())) => {
-                        let level = if proxy_started { LogLevel::Warning } else { LogLevel::Success };
-                        log::log_t(&log_tx, level, list.saved_key(proxy_started), vec![]);
-                    }
-                    Ok(Err(e)) => log::log_err(&log_tx, LogLevel::Error, e),
-                    Err(e) => log::log_t(&log_tx, LogLevel::Error, "log.save_task_error", vec![("error", e.to_string())]),
+            match domains_editor::save_domains(list, &domains_snapshot) {
+                Ok(()) => {
+                    let proxy_started = app.proxy_started;
+                    let level = if proxy_started { LogLevel::Warning } else { LogLevel::Success };
+                    app.push_log_t(level, list.saved_key(proxy_started), vec![]);
                 }
-            });
+                Err(e) => app.push_err(e),
+            }
         }
 
         Action::RefreshStrategies => {
@@ -604,11 +589,18 @@ fn reload(app: &mut App, config: &mut Arc<Config>, domains: &mut Arc<HashSet<Str
 
     let (fresh_domains, domains_error) = crate::config::load_bypass_domains();
     if let Some(reason) = domains_error {
+        // Список не прочитался — работаем с прежним. Пустой выключил бы
+        // обход для всех сайтов, хотя рабочий список в памяти был.
         app.push_log_t(LogLevel::Error, "startup.domains_missing", vec![("error".to_string(), reason)]);
-    } else if fresh_domains.is_empty() {
-        app.push_log_t(LogLevel::Warning, "startup.domains_empty", vec![]);
+        if !domains.is_empty() {
+            app.push_log_t(LogLevel::Warning, "startup.domains_kept", vec![("count".to_string(), domains.len().to_string())]);
+        }
+    } else {
+        if fresh_domains.is_empty() {
+            app.push_log_t(LogLevel::Warning, "startup.domains_empty", vec![]);
+        }
+        *domains = Arc::new(fresh_domains);
     }
-    *domains = Arc::new(fresh_domains);
 
     app.status.domains_count = domains.len();
     app.status.tcp_port = config.port;
