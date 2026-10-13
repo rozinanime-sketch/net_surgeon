@@ -10,6 +10,7 @@ use crate::bypass::{extract_domain, matches_list, needs_bypass, fragment};
 use crate::observability::logging::{LogSender, log_t, LogLevel};
 use crate::observability::metrics::Metrics;
 use crate::dns::ip_cache::IpDomainCache;
+use crate::proxy::verdict::{End, Exchange, Flow, Side};
 use crate::engine::strategy::{apply::Applied, Strategy, StrategyStore};
 use super::tcp::parse_connect_target;
 use super::adaptive::Selected;
@@ -83,6 +84,9 @@ pub async fn handle_connect(
         }
         Err(e) => {
             log_t(&log_tx, LogLevel::Error, "log.https_connect_error", vec![("target", target.clone()), ("error", e.to_string())]);
+            if needs {
+                crate::proxy::verdict::report_connect_fail(&log_tx, &domain);
+            }
             let mut cs = client_stream;
             let _ = cs.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return;
@@ -152,7 +156,7 @@ pub async fn handle_connect(
         if first.is_empty() {
             let mut buffer = [0u8; 4096];
             match client_reader.read(&mut buffer).await {
-                Ok(0) | Err(_) => { let _ = server_writer.shutdown().await; return Selected::DIRECT; }
+                Ok(0) | Err(_) => { let _ = server_writer.shutdown().await; return (Selected::DIRECT, 0, Flow::default()); }
                 Ok(n) => first.extend_from_slice(&buffer[..n]),
             }
         }
@@ -180,6 +184,7 @@ pub async fn handle_connect(
             Selected::DIRECT
         };
         let strategy = selected.strategy;
+        let hello_len = crate::proxy::verdict::tls_hello_len(&first);
 
         metrics_c2s.add_rx(first.len() as u64);
         rx_total_c2s.fetch_add(first.len() as u64, Ordering::Relaxed);
@@ -235,26 +240,30 @@ pub async fn handle_connect(
                         Applied::None => {}
                     }
                 }
-                Err(_) => return selected,
+                Err(e) => return (selected, hello_len, Flow { end: Some(End::new(Side::Server, &e)), ..Flow::default() }),
             }
-        } else if server_writer.write_all(&first).await.is_err() {
-            return selected;
+        } else if let Err(e) = server_writer.write_all(&first).await {
+            return (selected, hello_len, Flow { end: Some(End::new(Side::Server, &e)), ..Flow::default() });
         }
 
         // Дальше стратегия уже ни при чём — обычное перекладывание байт.
+        let mut up = Flow::default();
+        up.add(first.len());
         let mut buffer = [0u8; crate::proxy::PUMP_BUF];
-        loop {
+        let end = loop {
             match client_reader.read(&mut buffer).await {
-                Ok(0) => { let _ = server_writer.shutdown().await; break; }
+                Ok(0) => { let _ = server_writer.shutdown().await; break End::fin(Side::Client); }
                 Ok(n) => {
                     metrics_c2s.add_rx(n as u64);
                     rx_total_c2s.fetch_add(n as u64, Ordering::Relaxed);
-                    if server_writer.write_all(&buffer[..n]).await.is_err() { break; }
+                    if let Err(e) = server_writer.write_all(&buffer[..n]).await { break End::new(Side::Server, &e); }
+                    up.add(n);
                 }
-                Err(_) => break,
+                Err(e) => break End::new(Side::Client, &e),
             }
-        }
-        selected
+        };
+        up.end = Some(end);
+        (selected, hello_len, up)
     };
 
     // Ответил ли сервер хоть чем-то. Это и есть проверка стратегии в бою:
@@ -268,9 +277,10 @@ pub async fn handle_connect(
     let server_to_client = async move {
         let mut buffer = [0u8; crate::proxy::PUMP_BUF];
         let mut first_byte_seen = false;
-        loop {
+        let mut down = Flow::default();
+        let end = loop {
             match server_reader.read(&mut buffer).await {
-                Ok(0) => { let _ = client_writer.shutdown().await; break; }
+                Ok(0) => { let _ = client_writer.shutdown().await; break End::fin(Side::Server); }
                 Ok(bytes_read) => {
                     window.on_received(bytes_read);
                     if !first_byte_seen {
@@ -284,14 +294,18 @@ pub async fn handle_connect(
                     let data = &buffer[..bytes_read];
                     metrics_s2c.add_tx(bytes_read as u64);
                     tx_total_s2c.fetch_add(bytes_read as u64, Ordering::Relaxed);
-                    if client_writer.write_all(data).await.is_err() { break; }
+                    down.add(bytes_read);
+                    if let Err(e) = client_writer.write_all(data).await { break End::new(Side::Client, &e); }
                 }
-                Err(_) => break,
+                Err(e) => break End::new(Side::Server, &e),
             }
-        }
+        };
+        down.end = Some(end);
+        down
     };
 
-    let (selected, _) = tokio::join!(client_to_server, server_to_client);
+    let ((selected, hello_len, up), down) = tokio::join!(client_to_server, server_to_client);
+    let responded = responded.load(Ordering::Relaxed);
 
     // Трафик соединения — его домену, один раз (см. record_domain_traffic).
     metrics.record_domain_traffic(&domain, rx_total.load(Ordering::Relaxed), tx_total.load(Ordering::Relaxed));
@@ -304,6 +318,13 @@ pub async fn handle_connect(
         ttl_hours: strategy_ttl_hours,
         log_tx: &log_tx,
     };
-    let worked = super::adaptive::handshake_completed(&selected, responded.load(Ordering::Relaxed), rx_total.load(Ordering::Relaxed));
+    let worked = super::adaptive::handshake_completed(&selected, responded, rx_total.load(Ordering::Relaxed));
     super::adaptive::record_outcome(&ctx, &domain, selected, worked);
+
+    // Итог соединения — только с обходом, иначе лог утонет.
+    if needs {
+        crate::proxy::verdict::report(&log_tx, &domain, selected.strategy, Exchange {
+            opened: started, hello_len, up, down, accepted: responded,
+        });
+    }
 }

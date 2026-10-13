@@ -8,6 +8,7 @@ pub mod telegram;
 mod transparent;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod transparent_udp;
+mod verdict;
 // pub, потому что подмодули ходят друг к другу (socks5/udp.rs читает
 // udp::quic_parser) и на них смотрят интеграционные тесты.
 pub mod socks5;

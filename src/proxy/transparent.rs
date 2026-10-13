@@ -54,6 +54,7 @@ use crate::config::BypassParams;
 use crate::dns::ip_cache::IpDomainCache;
 use crate::observability::logging::{log_t, LogLevel, LogSender};
 use crate::observability::metrics::Metrics;
+use crate::proxy::verdict::{End, Exchange, Flow, Side};
 use crate::engine::strategy::{Strategy, StrategyStore};
 
 /// Адрес для IPv6-соединений, парный к `listen_host`.
@@ -432,7 +433,8 @@ async fn handle(
     let adaptive_ctx = crate::proxy::adaptive::Context {
         strategies, bypass_params, ttl_hours: strategy_ttl_hours, log_tx,
     };
-    let selected = if !payload.is_empty() && needs_bypass(is_enabled, &domain, bypass_domains) {
+    let wants_bypass = needs_bypass(is_enabled, &domain, bypass_domains);
+    let selected = if !payload.is_empty() && wants_bypass {
         crate::proxy::adaptive::select(&adaptive_ctx, &domain, crate::bypass::tls::client_hello_len(&payload))
     } else {
         crate::proxy::adaptive::Selected::DIRECT
@@ -455,6 +457,9 @@ async fn handle(
                 ("target", target_addr.to_string()),
                 ("error", e.to_string()),
             ]);
+            if wants_bypass {
+                crate::proxy::verdict::report_connect_fail(log_tx, &domain);
+            }
             return;
         }
     };
@@ -504,9 +509,11 @@ async fn handle(
     let to_client = async move {
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
         let mut first = true;
-        loop {
+        let mut down = Flow::default();
+        let end = loop {
             match server_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break End::fin(Side::Server),
+                Err(e) => break End::new(Side::Server, &e),
                 Ok(len) => {
                     window.on_received(len);
                     if first {
@@ -516,44 +523,61 @@ async fn handle(
                     }
                     metrics_s2c.add_tx(len as u64);
                     tx_total_s2c.fetch_add(len as u64, Ordering::Relaxed);
-                    if client_writer.write_all(&buf[..len]).await.is_err() {
-                        break;
+                    down.add(len);
+                    if let Err(e) = client_writer.write_all(&buf[..len]).await {
+                        break End::new(Side::Client, &e);
                     }
                 }
             }
-        }
+        };
         // Полузакрытие, а не обрыв: в HTTPS-туннеле это делалось, здесь — нет,
         // и вторая сторона висела до собственного таймаута.
         let _ = client_writer.shutdown().await;
+        down.end = Some(end);
+        down
     };
 
     let metrics_c2s = Arc::clone(metrics);
     let rx_total_c2s = Arc::clone(&rx_total);
+    let mut up = Flow::default();
+    up.add(payload.len());
     let to_server = async move {
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
-        loop {
+        let end = loop {
             match client_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break End::fin(Side::Client),
+                Err(e) => break End::new(Side::Client, &e),
                 Ok(len) => {
                     metrics_c2s.add_rx(len as u64);
                     rx_total_c2s.fetch_add(len as u64, Ordering::Relaxed);
-                    if server_writer.write_all(&buf[..len]).await.is_err() {
-                        break;
+                    if let Err(e) = server_writer.write_all(&buf[..len]).await {
+                        break End::new(Side::Server, &e);
                     }
+                    up.add(len);
                 }
             }
-        }
+        };
         let _ = server_writer.shutdown().await;
+        up.end = Some(end);
+        up
     };
 
-    let _ = tokio::join!(to_server, to_client);
+    let (up, down) = tokio::join!(to_server, to_client);
+    let responded = responded.load(Ordering::Relaxed);
 
     // Трафик соединения — его домену (см. Metrics::record_domain_traffic).
     metrics.record_domain_traffic(&domain, rx_total.load(Ordering::Relaxed), tx_total.load(Ordering::Relaxed));
 
     // Обратная связь по стратегии — та же, что в остальных режимах.
-    let worked = crate::proxy::adaptive::handshake_completed(&selected, responded.load(Ordering::Relaxed), rx_total.load(Ordering::Relaxed));
+    let worked = crate::proxy::adaptive::handshake_completed(&selected, responded, rx_total.load(Ordering::Relaxed));
     crate::proxy::adaptive::record_outcome(&adaptive_ctx, &domain, selected, worked);
+
+    // Итог соединения — только с обходом, иначе лог утонет.
+    if wants_bypass {
+        crate::proxy::verdict::report(log_tx, &domain, strategy, Exchange {
+            opened: started, hello_len: crate::proxy::verdict::tls_hello_len(&payload), up, down, accepted: responded,
+        });
+    }
 }
 
 /// Сколько помнить адрес, который не ответил на подключение.

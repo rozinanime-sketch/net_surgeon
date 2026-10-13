@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use crate::bypass::{extract_domain, matches_list, needs_bypass};
 use crate::dns::ip_cache::IpDomainCache;
-use crate::observability::logging::{LogSender, log_nested_t, log_t, LogLevel};
+use crate::observability::logging::{LogSender, log_t, LogLevel};
+use crate::proxy::verdict::{End, Exchange, Flow, Side};
 use crate::config::BypassParams;
 use crate::observability::metrics::Metrics;
 use crate::engine::strategy::StrategyStore;
@@ -310,11 +311,15 @@ async fn handle_connect(
 
     // Окно приёма — до подключения (объявляется в SYN), только для доменов с
     // обходом. Раньше в SOCKS5 window_clamp не применялся вовсе.
-    let clamp = if needs_bypass(is_enabled, &extract_domain(&target), bypass_domains) { bypass_params.window_clamp } else { 0 };
+    let target_bypass = needs_bypass(is_enabled, &requested, bypass_domains);
+    let clamp = if target_bypass { bypass_params.window_clamp } else { 0 };
     let mut server = match crate::dns::resolver::with_window_clamp(clamp, crate::dns::resolver::connect(&target)).await {
         Ok(s) => s,
         Err(e) => {
             log_t(log_tx, LogLevel::Error, "log.socks5_connect_error", vec![("target", target.clone()), ("error", e.to_string())]);
+            if target_bypass {
+                crate::proxy::verdict::report_connect_fail(log_tx, &requested);
+            }
             let _ = stream.write_all(&[SOCKS5_VERSION, 0x04, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]).await;
             return;
         }
@@ -407,7 +412,8 @@ async fn handle_connect(
         };
         let wants_bypass = needs_bypass(is_enabled, &domain, bypass_domains);
 
-        let is_tls = initial.len() >= 5 && initial[0] == 0x16 && initial[1] == 0x03;
+        let hello_len = crate::proxy::verdict::tls_hello_len(&initial);
+        let is_tls = hello_len > 0;
         let mut selected = crate::proxy::adaptive::Selected::DIRECT;
 
         if is_tls {
@@ -433,16 +439,17 @@ async fn handle_connect(
                 }
                 Err(e) => {
                     let _ = sw.shutdown().await;
-                    let end = End::new(Side::Server, &e);
-                    return ClientSide { selected, domain, bypass: wants_bypass, sent: 0, end: Some(end) };
+                    let up = Flow { end: Some(End::new(Side::Server, &e)), ..Flow::default() };
+                    return ClientSide { selected, domain, bypass: wants_bypass, hello_len, up };
                 }
             }
         } else if let Err(e) = sw.write_all(&initial).await {
-            let end = End::new(Side::Server, &e);
-            return ClientSide { selected, domain, bypass: wants_bypass, sent: 0, end: Some(end) };
+            let up = Flow { end: Some(End::new(Side::Server, &e)), ..Flow::default() };
+            return ClientSide { selected, domain, bypass: wants_bypass, hello_len, up };
         }
 
-        let mut sent = initial.len() as u64;
+        let mut up = Flow::default();
+        up.add(initial.len());
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
         let end = loop {
             match cr.read(&mut buf).await {
@@ -450,23 +457,23 @@ async fn handle_connect(
                 Err(e) => break End::new(Side::Client, &e),
                 Ok(n) => {
                     metrics_c2s.add_rx(n as u64);
-                    sent += n as u64;
                     if let Err(e) = sw.write_all(&buf[..n]).await {
                         break End::new(Side::Server, &e);
                     }
+                    up.add(n);
                 }
             }
         };
         // Полузакрытие, а не обрыв: клиент договорил, но сервер ещё может
         // досылать ответ.
         let _ = sw.shutdown().await;
-        ClientSide { selected, domain, bypass: wants_bypass, sent, end: Some(end) }
+        up.end = Some(end);
+        ClientSide { selected, domain, bypass: wants_bypass, hello_len, up }
     };
     let mut window = crate::bypass::fragment::WindowRelease::new(server_fd, clamp > 0);
     let to_client = async {
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
-        let mut received = 0u64;
-        let mut last_rx = None;
+        let mut down = Flow::default();
         let end = loop {
             match sr.read(&mut buf).await {
                 Ok(0) => break End::fin(Side::Server),
@@ -475,12 +482,11 @@ async fn handle_connect(
                     window.on_received(n);
                     // По первому куску: alert о повреждённых данных — не ответ,
                     // а провал стратегии (см. tls::is_corruption_alert).
-                    if received == 0 {
+                    if down.bytes == 0 {
                         responded_flag.store(crate::bypass::tls::server_accepted(&buf[..n]), Ordering::Relaxed);
                     }
                     metrics_s2c.add_tx(n as u64);
-                    received += n as u64;
-                    last_rx = Some(Instant::now());
+                    down.add(n);
                     if let Err(e) = cw.write_all(&buf[..n]).await {
                         break End::new(Side::Client, &e);
                     }
@@ -488,7 +494,8 @@ async fn handle_connect(
             }
         };
         let _ = cw.shutdown().await;
-        (received, last_rx, end)
+        down.end = Some(end);
+        down
     };
 
     // join, а не select: select бросает вторую половину, как только закончилась
@@ -496,33 +503,25 @@ async fn handle_connect(
     // для HTTP-подобных протоколов), тем самым обрывал ещё идущий ответ сервера
     // на середине. HTTPS-туннель здесь всегда использовал join — SOCKS5-путь
     // расходился с ним без всякой причины.
-    let (client, (received, last_rx, server_end)) = tokio::join!(to_server, to_client);
+    let (client, down) = tokio::join!(to_server, to_client);
+    let responded = responded.load(Ordering::Relaxed);
 
     // Обратная связь по применённой стратегии — та же, что в HTTPS-туннеле.
-    let worked = crate::proxy::adaptive::handshake_completed(&client.selected, responded.load(Ordering::Relaxed), client.sent);
+    let worked = crate::proxy::adaptive::handshake_completed(&client.selected, responded, client.up.bytes);
     crate::proxy::adaptive::record_outcome(&adaptive_ctx, &client.domain, client.selected, worked);
 
     // Трафик соединения — его домену. Итоги уже посчитаны обоими
-    // направлениями (client.sent / received), лишних счётчиков не нужно.
-    metrics.record_domain_traffic(&client.domain, client.sent, received);
+    // направлениями, лишних счётчиков не нужно.
+    metrics.record_domain_traffic(&client.domain, client.up.bytes, down.bytes);
 
     // Итог соединения — только для доменов с обходом, иначе лог утонет.
-    // Без него обрыв после рукопожатия не виден: стратегия считается
-    // сработавшей, как только сервер ответил хоть чем-то, а блокировка,
-    // которая пропускает начало ответа и потом глушит поток, выглядит
-    // в логе как успех.
+    // Без него обрыв после рукопожатия не виден: блокировка, которая
+    // пропускает начало ответа и потом глушит поток, выглядела бы в логе
+    // как успех.
     if client.bypass {
-        let first = client.end.into_iter().chain([server_end]).min_by_key(|e| e.at).expect("есть конец сервера");
-        let life = first.at.duration_since(opened);
-        let idle = first.at.duration_since(last_rx.unwrap_or(opened));
-        log_nested_t(log_tx, LogLevel::Info, "log.conn_closed", "end", first.key(), vec![
-            ("domain", client.domain),
-            ("life", format!("{:.1}", life.as_secs_f64())),
-            ("sent", client.sent.to_string()),
-            ("received", received.to_string()),
-            ("idle", format!("{:.1}", idle.as_secs_f64())),
-            ("detail", first.error.map(|e| format!(" ({e})")).unwrap_or_default()),
-        ]);
+        crate::proxy::verdict::report(log_tx, &client.domain, client.selected.strategy, Exchange {
+            opened, hello_len: client.hello_len, up: client.up, down, accepted: responded,
+        });
     }
 }
 
@@ -532,63 +531,14 @@ struct ClientSide {
     domain: String,
     /// Включён ли обход — только такие соединения попадают в итог.
     bypass: bool,
-    sent: u64,
-    /// `None` — до пересылки дело не дошло.
-    end: Option<End>,
+    /// Длина ClientHello; 0 — не TLS.
+    hello_len: u64,
+    up: Flow,
 }
 
 impl ClientSide {
     fn untouched(domain: String) -> Self {
-        ClientSide { selected: crate::proxy::adaptive::Selected::DIRECT, domain, bypass: false, sent: 0, end: None }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Client,
-    Server,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum How {
-    Fin,
-    Reset,
-    Error,
-}
-
-/// Чем и когда кончилось одно направление пересылки.
-#[derive(Debug)]
-struct End {
-    side: Side,
-    how: How,
-    error: Option<String>,
-    at: Instant,
-}
-
-impl End {
-    fn fin(side: Side) -> Self {
-        End { side, how: How::Fin, error: None, at: Instant::now() }
-    }
-
-    fn new(side: Side, e: &std::io::Error) -> Self {
-        // Сброс отдельно от прочих ошибок: RST посреди потока — почерк DPI,
-        // а сервер так закрывается редко.
-        let how = match e.kind() {
-            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => How::Reset,
-            _ => How::Error,
-        };
-        End { side, how, error: Some(e.to_string()), at: Instant::now() }
-    }
-
-    fn key(&self) -> &'static str {
-        match (self.side, self.how) {
-            (Side::Server, How::Fin) => "close.server_fin",
-            (Side::Server, How::Reset) => "close.server_rst",
-            (Side::Server, How::Error) => "close.server_error",
-            (Side::Client, How::Fin) => "close.client_fin",
-            (Side::Client, How::Reset) => "close.client_rst",
-            (Side::Client, How::Error) => "close.client_error",
-        }
+        ClientSide { selected: crate::proxy::adaptive::Selected::DIRECT, domain, bypass: false, hello_len: 0, up: Flow::default() }
     }
 }
 
@@ -683,16 +633,6 @@ mod tests {
         let list: HashSet<String> = ["example.com".to_string()].into();
         let (log_tx, _rx) = crate::observability::logging::channel();
         connection_name(requested, first_packet, cache, &list, true, &log_tx)
-    }
-
-    #[test]
-    fn reset_is_told_apart_from_other_failures() {
-        use std::io::{Error, ErrorKind};
-        let rst = End::new(Side::Server, &Error::from(ErrorKind::ConnectionReset));
-        assert_eq!(rst.key(), "close.server_rst");
-        let other = End::new(Side::Server, &Error::from(ErrorKind::TimedOut));
-        assert_eq!(other.key(), "close.server_error");
-        assert_eq!(End::fin(Side::Client).key(), "close.client_fin");
     }
 
     #[test]
