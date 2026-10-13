@@ -192,20 +192,31 @@ pub fn set_ttl(fd: RawSock, ttl: u32) -> bool {
     ok
 }
 
+/// Чем кончилось ожидание отправки (`wait_sent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Queue {
+    /// Всё записанное ушло в сеть хотя бы раз.
+    Sent,
+    /// Срок вышел, а в очереди ещё есть неотправленное: ушло ли записанное
+    /// с нужными опциями — неизвестно.
+    Stuck,
+    /// Ядро не отвечает на запрос (на Android его запрещает SELinux).
+    Unknown,
+}
+
 /// Ждёт, пока все записанные в сокет байты уйдут в сеть хотя бы раз
-/// (`SIOCOUTQNSD` = 0), но не дольше `max`. `false` — ядро не отвечает на
-/// запрос: узнать, ушли ли данные, нельзя.
+/// (`SIOCOUTQNSD` = 0), но не дольше `max`.
 ///
 /// Нужна там, где опции сокета (TTL, MD5) меняются на время одного
 /// сегмента: опция берётся в момент передачи, а не записи в очередь.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub async fn wait_sent(fd: RawSock, max: std::time::Duration) -> bool {
+pub async fn wait_sent(fd: RawSock, max: std::time::Duration) -> Queue {
     let deadline = std::time::Instant::now() + max;
     loop {
         match unsent_bytes(fd) {
-            None => return false,
-            Some(0) => return true,
-            Some(_) if std::time::Instant::now() >= deadline => return true,
+            None => return Queue::Unknown,
+            Some(0) => return Queue::Sent,
+            Some(_) if std::time::Instant::now() >= deadline => return Queue::Stuck,
             Some(_) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
         }
     }
@@ -218,9 +229,9 @@ pub const UNKNOWN_QUEUE_PAUSE: std::time::Duration = std::time::Duration::from_m
 /// Без `SIOCOUTQNSD` узнать нельзя — пауза в несколько миллисекунд, которой
 /// на свежем соединении обычно хватает.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub async fn wait_sent(_fd: RawSock, _max: std::time::Duration) -> bool {
+pub async fn wait_sent(_fd: RawSock, _max: std::time::Duration) -> Queue {
     tokio::time::sleep(UNKNOWN_QUEUE_PAUSE).await;
-    true
+    Queue::Unknown
 }
 
 /// Отправляет один байт как out-of-band (флаг URG).
@@ -439,7 +450,10 @@ pub fn md5sig_available(requested: bool) -> bool {
 /// `Ok(false)` — техника здесь не сработала до отправки чего-либо (не та
 /// длина, не вышло выделить память или сменить TTL): вызывающий может
 /// откатиться на другую. Ошибка — приманка могла уйти частично, и
-/// соединение лучше не продолжать.
+/// соединение лучше не продолжать. `Ok(true)` значит «данные в сокете», а не
+/// «DPI видел приманку»: если очередь застряла ([`Queue::Stuck`]), вместо
+/// приманки уйдут сразу настоящие данные. Отвечать тут `Ok(false)` нельзя:
+/// откат на другую технику записал бы те же байты в поток второй раз.
 ///
 /// Настоящие данные уходят только ретрансмитом, поэтому соединение
 /// начинается позже на время RTO: у Linux не меньше 200 мс.
@@ -467,7 +481,8 @@ pub async fn send_fake(fd: RawSock, decoy: &[u8], real: &[u8], ttl: u32, md5sig:
     }
 
     let sent = splice_page(fd, &page).await;
-    if sent.is_ok() && !wait_sent(fd, FAKE_SEND_WAIT).await {
+    let queue = if sent.is_ok() { wait_sent(fd, FAKE_SEND_WAIT).await } else { Queue::Unknown };
+    if sent.is_ok() && queue == Queue::Unknown {
         // TTL берётся в момент передачи, а не записи в очередь: вернуть его
         // раньше — и приманка уйдёт с обычным и дойдёт до сервера. Ядро не
         // говорит, ушла ли она (на Android SELinux не даёт приложению
@@ -477,8 +492,9 @@ pub async fn send_fake(fd: RawSock, decoy: &[u8], real: &[u8], ttl: u32, md5sig:
         // Telegram шло без неё и замерзало после пары килобайт.
         tokio::time::sleep(UNKNOWN_QUEUE_PAUSE).await;
     }
-    // Если приманка так и не ушла, подмена безвредна: уйдут сразу настоящие
-    // данные, просто без обмана DPI.
+    // Если приманка так и не ушла (Stuck), подмена безвредна: уйдут сразу
+    // настоящие данные, просто без обмана DPI. Дольше ждать нельзя — это
+    // задержка соединения, а TTL вернуть всё равно придётся.
     page.overwrite(real);
     // Подпись снимается вместе с TTL: повтор с настоящими данными сервер
     // должен принять.

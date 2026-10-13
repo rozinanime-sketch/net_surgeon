@@ -21,6 +21,12 @@ use crate::observability::logging::{log_nested_t, LogLevel, LogSender};
 /// десятки; меньше — и медленный сервер сошёл бы за блокировку.
 const STALL_SILENCE: Duration = Duration::from_secs(10);
 
+/// Сколько получить, чтобы ответ был больше самого рукопожатия. Ответ
+/// сервера на ClientHello (сертификаты, билеты сессии) — обычно 2–4 КБ, и
+/// столько же приходит, когда DPI глушит поток сразу после рукопожатия.
+/// Тот же порог у zapret2 (`standard_success_detector`, inseq=4096).
+const PAST_HANDSHAKE: u64 = 4 * 1024;
+
 /// Сколько получить, чтобы успех был несомненным. Заморозка DPI бьёт в
 /// первых ~16 КБ ответа (см. engine::freeze); поток, прошедший дальше с
 /// запасом, через неё уже прошёл.
@@ -202,7 +208,9 @@ pub(crate) fn classify(f: &Facts) -> Finding {
         // Клиент написал и закрыл, не дождавшись: ни успеха, ни провала.
         Some(_) => finding(Verdict::Unknown, Confidence::Low, "verdict.closed_early"),
         None if f.received >= PAST_FREEZE => finding(Verdict::Ok, Confidence::High, "verdict.ok_past_freeze"),
-        None => finding(Verdict::Ok, Confidence::Medium, "verdict.ok"),
+        None if f.received > PAST_HANDSHAKE => finding(Verdict::Ok, Confidence::Medium, "verdict.ok"),
+        // Последними могли быть билеты сессии, а не ответ приложения.
+        None => finding(Verdict::Unknown, Confidence::Low, "verdict.handshake_sized"),
     }
 }
 
@@ -338,9 +346,11 @@ mod tests {
     }
 
     #[test]
-    fn small_traffic_alone_is_not_a_stall() {
-        // Мало байт, но последним говорил сервер: обмен закончился штатно
-        assert_eq!(verdict(Facts { sent: 723, received: 2773, ..done() }), (Verdict::Ok, Confidence::Medium));
+    fn small_traffic_alone_is_neither_a_stall_nor_a_success() {
+        // Последним говорил сервер, но пришло не больше рукопожатия: это
+        // могли быть билеты сессии, а не ответ
+        assert_eq!(verdict(Facts { sent: 723, received: 2773, ..done() }).0, Verdict::Unknown);
+        assert_eq!(verdict(Facts { sent: 723, received: 6000, ..done() }), (Verdict::Ok, Confidence::Medium));
         // Клиент написал и сразу закрыл — судить не о чем
         let early = Facts { unanswered: Some(Duration::from_secs(2)), ..done() };
         assert_eq!(verdict(early).0, Verdict::Unknown);

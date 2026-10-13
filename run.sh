@@ -732,8 +732,12 @@ if command -v nft >/dev/null && command -v getcap >/dev/null && [[ -z ${NET_SURG
     grant_privileges
 
     say "Запуск. Перехват снимется сам при любом выходе, даже при закрытии окна."
-    "$BIN" --firewall || true
-    exit 0
+    # Код выхода программы — наружу: ошибка запуска не должна выглядеть
+    # успехом. `|| status=$?`, а не голый вызов: под `set -e` скрипт
+    # оборвался бы до exit, а так ясно, откуда код.
+    status=0
+    "$BIN" --firewall || status=$?
+    exit "$status"
 fi
 
 # --- старый путь: iptables через sudo --------------------------------------

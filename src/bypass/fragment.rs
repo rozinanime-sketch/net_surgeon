@@ -112,7 +112,7 @@ where
     // сегмент ушёл, он уйдёт с нормальным TTL, дойдёт до сервера, и disorder
     // молча выродится в обычный сплит. Поэтому не пауза наугад, а очередь
     // сокета; если ядро о ней не отвечает — прежние несколько миллисекунд.
-    if !socket::wait_sent(fd, DISORDER_SEND_WAIT).await {
+    if socket::wait_sent(fd, DISORDER_SEND_WAIT).await == socket::Queue::Unknown {
         tokio::time::sleep(socket::UNKNOWN_QUEUE_PAUSE).await;
     }
 

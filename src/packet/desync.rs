@@ -357,17 +357,25 @@ fn build(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
         Technique::FakedSplit { pos, decoy } => {
             let pos = (*pos).clamp(1, payload.len() - 1);
             // Подделка куска [a, b): байты приманки на тех же позициях, номер
-            // сдвинут назад — сервер отбросит.
-            let fake = |a: usize, b: usize| {
+            // сдвинут назад — сервер отбросит. Режется, как настоящие части:
+            // кусок ClientHello с Kyber длиннее MTU.
+            let fake = |a: usize, b: usize| -> Vec<Vec<u8>> {
                 let mut bytes = decoy.get(a..b.min(decoy.len())).unwrap_or_default().to_vec();
                 bytes.resize(b - a, 0);
-                with_payload(pkt, t, &bytes, t.seq.wrapping_add(a as u32).wrapping_sub(BADSEQ_SHIFT), t.flags & !TCP_PSH)
+                bytes
+                    .chunks(MAX_SEGMENT)
+                    .enumerate()
+                    .map(|(i, chunk)| {
+                        let seq = t.seq.wrapping_add((a + i * MAX_SEGMENT) as u32).wrapping_sub(BADSEQ_SHIFT);
+                        with_payload(pkt, t, chunk, seq, t.flags & !TCP_PSH)
+                    })
+                    .collect()
             };
             let mut out = Vec::new();
             for (a, b) in [(0, pos), (pos, payload.len())] {
-                out.push(fake(a, b));
+                out.extend(fake(a, b));
                 out.extend(segments(a, b));
-                out.push(fake(a, b));
+                out.extend(fake(a, b));
             }
             out
         }
@@ -622,6 +630,21 @@ mod tests {
         assert_eq!(parse(&parts[0]).unwrap().seq, 1000u32.wrapping_sub(BADSEQ_SHIFT));
         assert_eq!((payload(3), payload(4), payload(5)), (b"EFGHIJ".to_vec(), b"456789".to_vec(), b"EFGHIJ".to_vec()));
         assert_eq!(reassemble(&parts, 1000), b"0123456789");
+    }
+
+    /// Подделки fakedsplit режутся так же, как настоящие части: при большом
+    /// ClientHello ни один пакет не длиннее MAX_SEGMENT.
+    #[test]
+    fn faked_split_fakes_never_exceed_mtu() {
+        for len in [1800, 4000] {
+            let hello = crate::bypass::tls::build_client_hello_sized("discord.com", len);
+            let pkt = v4(&hello, TCP_ACK | TCP_PSH);
+            let t = parse(&pkt).unwrap();
+            let decoy = crate::bypass::tls::build_client_hello_sized("www.google.com", len);
+            let parts = apply(&pkt, &t, &Technique::FakedSplit { pos: 130, decoy });
+            assert!(parts.iter().all(|p| parse(p).unwrap().payload(p).len() <= MAX_SEGMENT));
+            assert_eq!(deliver(&parts, 1000), hello);
+        }
     }
 
     /// hostfakesplit: начало, поддельное имя, имя, поддельное имя, конец.
