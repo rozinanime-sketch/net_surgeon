@@ -38,6 +38,8 @@ fn reward_table(
         (Strategy::Disorder, &result.disorder),
         (Strategy::Fake, &result.fake),
         (Strategy::FakeMultiDisorder, &result.fake_multidisorder),
+        (Strategy::HostFakeSplit, &result.host_fake_split),
+        (Strategy::FakedSplit, &result.faked_split),
         (Strategy::Seqovl, &result.seqovl),
     ]
     .into_iter()
@@ -119,6 +121,8 @@ fn report_diagnostics(log_tx: &LogSender, domain: &str, result: &crate::engine::
         ("log.sni_score", &result.sni_split),
         ("log.fake_score", &result.fake),
         ("log.fake_multidisorder_score", &result.fake_multidisorder),
+        ("log.host_fake_split_score", &result.host_fake_split),
+        ("log.faked_split_score", &result.faked_split),
         ("log.seqovl_score", &result.seqovl),
     ];
     for (key, score) in scores {

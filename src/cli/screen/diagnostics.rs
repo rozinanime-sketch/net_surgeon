@@ -184,13 +184,15 @@ fn result_lines(c: &DomainCheck) -> Vec<Line<'static>> {
         t!("check.techniques").to_string(),
         Style::default().fg(Color::DarkGray),
     )));
-    let probes: [(&str, &SplitScore); 7] = [
+    let probes: [(&str, &SplitScore); 9] = [
         ("tls_record", &c.result.tls_record),
         ("sni_split", &c.result.sni_split),
         ("disorder", &c.result.disorder),
         ("oob", &c.result.oob),
         ("fake", &c.result.fake),
         ("fake_multidisorder", &c.result.fake_multidisorder),
+        ("hostfakesplit", &c.result.host_fake_split),
+        ("fakedsplit", &c.result.faked_split),
         ("seqovl", &c.result.seqovl),
     ];
     for (name, s) in probes {

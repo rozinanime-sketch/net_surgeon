@@ -298,6 +298,65 @@ where
     Ok(Some(FakeDisorderInfo { decoy, first: first.len(), second: second.len() }))
 }
 
+/// Как прошёл hostfakesplit — для лога вызывающей стороны.
+pub struct HostFakeInfo {
+    /// До имени, само имя, после имени.
+    pub before: usize,
+    pub host: usize,
+    pub after: usize,
+}
+
+/// hostfakesplit (как у zapret): ClientHello режется по границам имени в
+/// SNI, и на месте имени сначала уходит поддельное той же длины — с низким
+/// TTL, как приманка fake.
+///
+/// 1. До имени — как есть.
+/// 2. Поддельное имя (`fake_host`) — с низким TTL: доходит до DPI и умирает
+///    за ним, а номера занимает те же, что настоящее имя.
+/// 3. После имени — как есть, сразу.
+/// 4. Настоящее имя — повтором ядра на своих номерах.
+///
+/// В отличие от fake, DPI видит не чужой ClientHello целиком, а ТОТ ЖЕ, где
+/// отличается только имя: размер, расширения, ключи — всё настоящее. DPI,
+/// собирающий поток и сверяющий его, обмануть так труднее. Платит, как fake,
+/// временем ретрансмита.
+pub async fn split_with_host_fake<W>(
+    server_writer: &mut W,
+    fd: RawSock,
+    data: &[u8],
+    params: &crate::config::BypassParams,
+) -> std::io::Result<Option<HostFakeInfo>>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    if !socket::fake_supported() {
+        return Ok(None);
+    }
+    let Some(loc) = super::tls::find_sni(data) else {
+        return Ok(None);
+    };
+    let (start, end) = (loc.offset, (loc.offset + loc.len).min(data.len()));
+    if start == 0 || start >= end {
+        return Ok(None);
+    }
+    let (before, rest) = data.split_at(start);
+    let (host, after) = rest.split_at(end - start);
+    let fake = super::tls::fake_host(&params.fake_sni, host.len());
+
+    server_writer.write_all(before).await?;
+    // Всё до имени — до подмены, с обычным TTL.
+    server_writer.flush().await?;
+    if !socket::send_fake(fd, &fake, host, params.fake_ttl, params.fake_md5sig).await? {
+        // Начало уже ушло — отказываться поздно: остальное как есть.
+        server_writer.write_all(rest).await?;
+        server_writer.flush().await?;
+        return Ok(Some(HostFakeInfo { before: before.len(), host: 0, after: rest.len() }));
+    }
+    server_writer.write_all(after).await?;
+    server_writer.flush().await?;
+    Ok(Some(HostFakeInfo { before: before.len(), host: host.len(), after: after.len() }))
+}
+
 /// OOB: между половинами ClientHello вставляется мусорный байт с флагом URG.
 ///
 /// Получатель без `SO_OOBINLINE` его отбрасывает, то есть сервер видит

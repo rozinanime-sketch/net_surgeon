@@ -82,6 +82,10 @@ pub trait Env {
     fn remember(&self, ip: IpAddr, domain: &str);
     fn lookup(&self, ip: IpAddr) -> Option<String>;
     fn decoy(&self, len: usize) -> Vec<u8>;
+    /// Поддельное имя ровно в `len` байт для hostfakesplit.
+    fn fake_host(&self, len: usize) -> Vec<u8> {
+        crate::bypass::tls::fake_host("www.google.com", len)
+    }
     fn log_intercepted(&self, domain: &str, dst: IpAddr, bypass: bool);
     fn log_applied(&self, domain: &str, detail: &str);
     fn log_blocked(&self, domain: &str);
@@ -272,6 +276,12 @@ fn technique_for(strategy: Strategy, payload: &[u8], env: &impl Env) -> Techniqu
             positions: desync::multidisorder_positions(payload),
             decoy: env.decoy(payload.len()),
         },
+        Strategy::FakedSplit => Technique::FakedSplit { pos, decoy: env.decoy(payload.len()) },
+        // Имени в сегменте нет (подключение по IP, ECH) — обычный сплит.
+        Strategy::HostFakeSplit => match desync::host_range(payload) {
+            Some(host) => Technique::HostFakeSplit { fake_host: env.fake_host(host.len()), host },
+            None => Technique::Split { pos },
+        },
     }
 }
 
@@ -290,6 +300,10 @@ fn describe(technique: &Technique, len: usize) -> Option<String> {
                 .map(|w| (w[1] - w[0]).to_string())
                 .collect();
             Some(format!("fake+multidisorder {}/{}", decoy.len(), parts.join("+")))
+        }
+        Technique::FakedSplit { pos, .. } => Some(format!("fakedsplit ~{pos}~+~{}~", len - pos)),
+        Technique::HostFakeSplit { host, .. } => {
+            Some(format!("hostfakesplit {}+~{}~+{}", host.start, host.len(), len.saturating_sub(host.end)))
         }
     }
 }

@@ -104,7 +104,7 @@ fn choose(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) -> Se
     // не задать); прочие пакетные техники — как раньше: под перехватом лишь
     // те, что он умеет применить.
     let usable = |s: Strategy| match s {
-        Strategy::Seqovl => packet,
+        Strategy::Seqovl | Strategy::FakedSplit => packet,
         _ => !packet || crate::bypass::packet_mode::supports(s),
     };
     let class = HelloClass::of(hello_len);

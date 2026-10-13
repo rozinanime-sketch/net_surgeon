@@ -47,7 +47,10 @@ pub fn socks_port() -> Option<u16> {
 /// Техника, подставляющая разрешённое имя в начало потока. Только она
 /// переживает заморозку после 16 КБ.
 pub fn is_decoy(strategy: Strategy) -> bool {
-    matches!(strategy, Strategy::Fake | Strategy::Seqovl | Strategy::FakeMultiDisorder)
+    matches!(
+        strategy,
+        Strategy::Fake | Strategy::Seqovl | Strategy::FakeMultiDisorder | Strategy::HostFakeSplit | Strategy::FakedSplit
+    )
 }
 
 /// Что показала freeze-проба.
@@ -214,7 +217,7 @@ pub async fn escalate_on_freeze(
 
 /// Приманки сокетного пути по возрастанию цены (seqovl без перехвата пакетов
 /// недоступен).
-const SOCKET_DECOYS: [Strategy; 2] = [Strategy::Fake, Strategy::FakeMultiDisorder];
+const SOCKET_DECOYS: [Strategy; 3] = [Strategy::HostFakeSplit, Strategy::Fake, Strategy::FakeMultiDisorder];
 
 /// Чистое решение эскалации: по вердиктам проб (через `probe_fn`) выбирает
 /// итоговую технику и говорит, обнаружена ли заморозка. Без сети и глобалов —
@@ -369,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_escalates_only_on_freeze_and_when_a_decoy_survives() {
-        use Strategy::{Fake, FakeMultiDisorder, TlsRecord};
+        use Strategy::{Fake, FakeMultiDisorder, HostFakeSplit, TlsRecord};
         use Verdict::{Frozen, Inconclusive, Survived};
         // Прогоняет resolve с заранее заданными вердиктами проб по порядку.
         async fn go(chosen: Option<Strategy>, verdicts: &[Verdict]) -> (Option<Strategy>, bool) {
@@ -389,12 +392,14 @@ mod tests {
         assert_eq!(go(Some(Fake), &[]).await, (Some(Fake), false));
         // Дешёвая техника переживает 16 КБ — оставляем, заморозки нет.
         assert_eq!(go(Some(TlsRecord), &[Survived]).await, (Some(TlsRecord), false));
-        // Заморозка + fake проходит → fake, флаг ставится.
-        assert_eq!(go(Some(TlsRecord), &[Frozen, Survived]).await, (Some(Fake), true));
-        // fake не проверился, fake+multidisorder прошёл → он.
-        assert_eq!(go(Some(TlsRecord), &[Frozen, Inconclusive, Survived]).await, (Some(FakeMultiDisorder), true));
-        // Обе приманки морозят → остаёмся, но заморозку зафиксировали.
-        assert_eq!(go(Some(TlsRecord), &[Frozen, Frozen, Frozen]).await, (Some(TlsRecord), true));
+        // Заморозка + hostfakesplit проходит → он первым, флаг ставится.
+        assert_eq!(go(Some(TlsRecord), &[Frozen, Survived]).await, (Some(HostFakeSplit), true));
+        // hostfakesplit морозит, fake проходит → fake.
+        assert_eq!(go(Some(TlsRecord), &[Frozen, Frozen, Survived]).await, (Some(Fake), true));
+        // Не проверились hostfakesplit и fake, fake+multidisorder прошёл → он.
+        assert_eq!(go(Some(TlsRecord), &[Frozen, Inconclusive, Inconclusive, Survived]).await, (Some(FakeMultiDisorder), true));
+        // Все приманки морозят → остаёмся, но заморозку зафиксировали.
+        assert_eq!(go(Some(TlsRecord), &[Frozen, Frozen, Frozen, Frozen]).await, (Some(TlsRecord), true));
     }
 
     #[test]

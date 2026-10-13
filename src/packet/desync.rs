@@ -203,6 +203,19 @@ pub enum Technique {
     /// `positions` — отсортированные точки реза внутри данных (0 и конец
     /// добавляются сами); обычно их две: начало записи и центр имени в SNI.
     FakeMultiDisorder { positions: Vec<usize>, decoy: Vec<u8> },
+    /// fakedsplit (zapret `--dpi-desync=fakedsplit`): данные режутся на две
+    /// части по `pos`, и каждая настоящая часть обрамлена подделками того же
+    /// размера — до и после неё: подделка, часть, подделка. Подделки — куски
+    /// `decoy` (ClientHello с разрешённым именем) на тех же позициях, с
+    /// номером, сдвинутым назад: сервер их отбросит, а DPI, собирающий поток,
+    /// получает мешанину из настоящих и поддельных байт.
+    FakedSplit { pos: usize, decoy: Vec<u8> },
+    /// hostfakesplit (zapret `--dpi-desync=hostfakesplit`): данные режутся по
+    /// границам имени в SNI (`host`), и настоящее имя обрамлено поддельным той
+    /// же длины (`fake_host`, на основе разрешённого) — до и после: начало,
+    /// поддельное имя, имя, поддельное имя, конец. DPI видит тот же
+    /// ClientHello, где разрешённое имя стоит рядом с настоящим.
+    HostFakeSplit { host: std::ops::Range<usize>, fake_host: Vec<u8> },
 }
 
 /// Точки реза для multidisorder: начало данных и центр имени в SNI.
@@ -341,7 +354,45 @@ fn build(pkt: &[u8], t: &Tcp, technique: &Technique) -> Vec<Vec<u8>> {
             }
             out
         }
+        Technique::FakedSplit { pos, decoy } => {
+            let pos = (*pos).clamp(1, payload.len() - 1);
+            // Подделка куска [a, b): байты приманки на тех же позициях, номер
+            // сдвинут назад — сервер отбросит.
+            let fake = |a: usize, b: usize| {
+                let mut bytes = decoy.get(a..b.min(decoy.len())).unwrap_or_default().to_vec();
+                bytes.resize(b - a, 0);
+                with_payload(pkt, t, &bytes, t.seq.wrapping_add(a as u32).wrapping_sub(BADSEQ_SHIFT), t.flags & !TCP_PSH)
+            };
+            let mut out = Vec::new();
+            for (a, b) in [(0, pos), (pos, payload.len())] {
+                out.push(fake(a, b));
+                out.extend(segments(a, b));
+                out.push(fake(a, b));
+            }
+            out
+        }
+        Technique::HostFakeSplit { host, fake_host } => {
+            let (start, end) = (host.start.min(payload.len()), host.end.min(payload.len()));
+            if start == 0 || start >= end {
+                return segments(0, payload.len());
+            }
+            let mut name = fake_host.clone();
+            name.resize(end - start, b'a');
+            let fake = with_payload(pkt, t, &name, t.seq.wrapping_add(start as u32).wrapping_sub(BADSEQ_SHIFT), t.flags & !TCP_PSH);
+            let mut out = segments(0, start);
+            out.push(fake.clone());
+            out.extend(segments(start, end));
+            out.push(fake);
+            out.extend(segments(end, payload.len()));
+            out
+        }
     }
+}
+
+/// Границы имени в SNI для hostfakesplit; `None` — имени в сегменте нет.
+pub fn host_range(payload: &[u8]) -> Option<std::ops::Range<usize>> {
+    let loc = crate::bypass::tls::find_sni_prefix(payload)?;
+    (loc.offset > 0 && loc.offset + loc.len <= payload.len()).then(|| loc.offset..loc.offset + loc.len)
 }
 
 #[cfg(test)]
@@ -554,6 +605,35 @@ mod tests {
         assert_eq!(fake.seq, 1000u32.wrapping_sub(BADSEQ_SHIFT));
         assert_eq!(fake.payload(&parts[0]), &decoy[..]);
         assert_eq!(reassemble(&parts, 1000), b"0123456789");
+    }
+
+    /// fakedsplit: подделка, часть, подделка — для каждой из двух частей;
+    /// подделки вне окна сервера, настоящие части собираются без дыр.
+    #[test]
+    fn faked_split_frames_each_part_with_fakes() {
+        let pkt = v4(b"0123456789", TCP_ACK | TCP_PSH);
+        let t = parse(&pkt).unwrap();
+        let decoy = b"ABCDEFGHIJ".to_vec();
+        let parts = apply(&pkt, &t, &Technique::FakedSplit { pos: 4, decoy });
+        assert_eq!(parts.len(), 6);
+        let payload = |i: usize| parse(&parts[i]).unwrap().payload(&parts[i]).to_vec();
+        // Подделки первой части — «ABCD» на сдвинутом номере, вокруг «0123».
+        assert_eq!((payload(0), payload(1), payload(2)), (b"ABCD".to_vec(), b"0123".to_vec(), b"ABCD".to_vec()));
+        assert_eq!(parse(&parts[0]).unwrap().seq, 1000u32.wrapping_sub(BADSEQ_SHIFT));
+        assert_eq!((payload(3), payload(4), payload(5)), (b"EFGHIJ".to_vec(), b"456789".to_vec(), b"EFGHIJ".to_vec()));
+        assert_eq!(reassemble(&parts, 1000), b"0123456789");
+    }
+
+    /// hostfakesplit: начало, поддельное имя, имя, поддельное имя, конец.
+    #[test]
+    fn host_fake_split_surrounds_the_host_with_a_fake_one() {
+        let pkt = v4(b"xx.real.namexx", TCP_ACK | TCP_PSH);
+        let t = parse(&pkt).unwrap();
+        let parts = apply(&pkt, &t, &Technique::HostFakeSplit { host: 2..12, fake_host: b"fake.allow".to_vec() });
+        let payloads: Vec<Vec<u8>> = parts.iter().map(|p| parse(p).unwrap().payload(p).to_vec()).collect();
+        assert_eq!(payloads, [b"xx".to_vec(), b"fake.allow".to_vec(), b".real.name".to_vec(), b"fake.allow".to_vec(), b"xx".to_vec()]);
+        assert_eq!(parse(&parts[1]).unwrap().seq, 1002u32.wrapping_sub(BADSEQ_SHIFT));
+        assert_eq!(reassemble(&parts, 1000), b"xx.real.namexx");
     }
 
     #[test]

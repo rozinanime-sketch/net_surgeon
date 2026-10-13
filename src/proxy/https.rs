@@ -226,6 +226,12 @@ pub async fn handle_connect(
                             ("second", second.to_string()),
                             ("domain", domain_c2s.clone()),
                         ]),
+                        Applied::HostFakeSplit { before, host, after } => log_t(&log_tx_c2s, LogLevel::Warning, "log.hostfakesplit_applied", vec![
+                            ("before", before.to_string()),
+                            ("host", host.to_string()),
+                            ("after", after.to_string()),
+                            ("domain", domain_c2s.clone()),
+                        ]),
                         Applied::None => {}
                     }
                 }

@@ -90,6 +90,10 @@ pub enum FragStrategy {
     Seqovl,
     /// Приманка плюс перестановка настоящих данных (fake + multidisorder).
     FakeMultiDisorder,
+    /// Поддельное имя рядом с настоящим (hostfakesplit).
+    HostFakeSplit,
+    /// Части, обрамлённые подделками (fakedsplit). Только перехватом пакетов.
+    FakedSplit,
 }
 
 impl FragStrategy {
@@ -104,6 +108,8 @@ impl FragStrategy {
             FragStrategy::TlsRecord => Strategy::TlsRecord,
             FragStrategy::Seqovl => Strategy::Seqovl,
             FragStrategy::FakeMultiDisorder => Strategy::FakeMultiDisorder,
+            FragStrategy::HostFakeSplit => Strategy::HostFakeSplit,
+            FragStrategy::FakedSplit => Strategy::FakedSplit,
         }
     }
 }
@@ -326,6 +332,11 @@ pub struct DiagnosticResult {
     /// Меряется там же, где fake, но после него: платит и приманкой, и
     /// ретрансмитом переставленных частей.
     pub fake_multidisorder: SplitScore,
+    /// Поддельное имя той же длины рядом с настоящим (hostfakesplit).
+    pub host_fake_split: SplitScore,
+    /// Части, обрамлённые подделками (fakedsplit). Только под перехватом
+    /// пакетов.
+    pub faked_split: SplitScore,
 }
 
 fn classify_write_error(_e: &std::io::Error) -> ProbeOutcome { ProbeOutcome::ResetOnWrite }
@@ -345,7 +356,10 @@ fn classify_reply(reply: &[u8], strategy: FragStrategy) -> ProbeOutcome {
     // отказ значит другое: сервер получил приманку с чужим именем, а
     // настоящий ClientHello выбросил как повтор. Раньше это засчитывалось
     // успехом, и fake «проходил» 3/3 там, где соединение рвалось.
-    let decoy_reached_server = matches!(strategy, FragStrategy::Fake | FragStrategy::FakeMultiDisorder)
+    let decoy_reached_server = matches!(
+        strategy,
+        FragStrategy::Fake | FragStrategy::FakeMultiDisorder | FragStrategy::HostFakeSplit | FragStrategy::FakedSplit
+    )
         && crate::bypass::tls::is_fatal_alert(reply);
     if decoy_reached_server || crate::bypass::tls::is_corruption_alert(reply) {
         ProbeOutcome::Mangled
@@ -476,9 +490,13 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
             Ok(None) => writer.write_all(hello).await,
             r => r.map(|_| ()),
         },
-        // Пакетная: применяется только перехватом (ветка `_ if packet_mode`
+        FragStrategy::HostFakeSplit => match fragment::split_with_host_fake(&mut writer, fd, hello, bypass_params).await {
+            Ok(None) => writer.write_all(hello).await,
+            r => r.map(|_| ()),
+        },
+        // Пакетные: применяются только перехватом (ветка `_ if packet_mode`
         // выше), а без него мерить нечего — отправляем как есть.
-        FragStrategy::Seqovl => writer.write_all(hello).await,
+        FragStrategy::Seqovl | FragStrategy::FakedSplit => writer.write_all(hello).await,
     };
 
     if let Err(e) = write_result {
@@ -716,6 +734,8 @@ async fn diagnose_with(
             fake: empty,
             seqovl: empty,
             fake_multidisorder: empty,
+            host_fake_split: empty,
+            faked_split: empty,
         };
     }
 
@@ -742,6 +762,8 @@ async fn diagnose_with(
             fake: empty,
             seqovl: empty,
             fake_multidisorder: empty,
+            host_fake_split: empty,
+            faked_split: empty,
         };
     }
 
@@ -758,6 +780,8 @@ async fn diagnose_with(
             fake: empty,
             seqovl: empty,
             fake_multidisorder: empty,
+            host_fake_split: empty,
+            faked_split: empty,
         };
     }
 
@@ -780,6 +804,8 @@ async fn diagnose_with(
             fake: empty,
             seqovl: empty,
             fake_multidisorder: empty,
+            host_fake_split: empty,
+            faked_split: empty,
         };
     }
 
@@ -857,7 +883,28 @@ async fn diagnose_with(
         empty
     };
 
-    // Ступень 8: seqovl. Только под перехватом пакетов: сокет не задаёт номер
+    // Ступень 8: hostfakesplit. Та же приманка с низким TTL, что у fake, но
+    // подделано одно имя: DPI видит настоящий ClientHello с разрешённым
+    // именем. TTL — подтверждённый свипом, как у fake + multidisorder.
+    let host_fake_split = if packet_mode {
+        trials(&target, domain, FragStrategy::HostFakeSplit, bypass_params, trials_count, early_abandon, timing).await
+    } else if crate::bypass::socket::fake_supported() {
+        let mut probe_params = bypass_params.clone();
+        probe_params.fake_ttl = swept_ttl.unwrap_or_else(|| crate::bypass::fake_ttl::effective(bypass_params.fake_ttl));
+        trials(&target, domain, FragStrategy::HostFakeSplit, &probe_params, trials_count, early_abandon, timing).await
+    } else {
+        empty
+    };
+
+    // Ступень 9: fakedsplit — только под перехватом пакетов: на сокете
+    // подделку ПОСЛЕ настоящих данных на тех же номерах не отправить.
+    let faked_split = if packet_mode {
+        trials(&target, domain, FragStrategy::FakedSplit, bypass_params, trials_count, early_abandon, timing).await
+    } else {
+        empty
+    };
+
+    // Ступень 10: seqovl. Только под перехватом пакетов: сокет не задаёт номер
     // последовательности, а без перехвата технику вообще нечем применить.
     // Приманку в бой ставит тот же перехват (env.decoy), так что отдельной
     // проверки «есть ли чем отправить» не нужно.
@@ -876,7 +923,7 @@ async fn diagnose_with(
         probe_quic(domain).await
     };
 
-    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake, seqovl, fake_multidisorder }
+    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake, seqovl, fake_multidisorder, host_fake_split, faked_split }
 }
 
 #[cfg(test)]

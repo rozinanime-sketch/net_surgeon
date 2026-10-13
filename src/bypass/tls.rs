@@ -375,6 +375,32 @@ fn wrap_client_hello(body: &[u8]) -> Vec<u8> {
 /// Приманка для техники fake: ClientHello с именем `sni` ровно в `target`
 /// байт. `None` — такой короткий не собрать (меньше ~80 байт).
 ///
+/// Поддельное имя ровно в `len` байт на основе разрешённого `allowed`
+/// (`www.google.com`) — для hostfakesplit: подделка занимает в потоке те же
+/// номера, что настоящее имя, поэтому длина обязана совпасть.
+///
+/// Длиннее разрешённого — спереди случайная метка: `k3x9.www.google.com`;
+/// короче — случайная метка с `.com`. Имя выглядит правдоподобно и для DPI
+/// разбирается как обычный домен.
+pub fn fake_host(allowed: &str, len: usize) -> Vec<u8> {
+    let label = |n: usize| -> Vec<u8> {
+        super::random::bytes(n).iter().map(|b| b"abcdefghijklmnopqrstuvwxyz0123456789"[*b as usize % 36]).collect()
+    };
+    let allowed = allowed.trim_end_matches('.').as_bytes();
+    if len >= allowed.len() + 2 {
+        let mut out = label(len - allowed.len() - 1);
+        out.push(b'.');
+        out.extend_from_slice(allowed);
+        out
+    } else if len >= 5 {
+        let mut out = label(len - 4);
+        out.extend_from_slice(b".com");
+        out
+    } else {
+        label(len)
+    }
+}
+
 /// Приманка должна занять в потоке ровно те номера, что и настоящий
 /// пакет. Обычный [`build_client_hello_sized`] короче ~300 байт не бывает,
 /// а у программы обновления Discord (rustls) ClientHello — 268: для него
@@ -498,6 +524,18 @@ pub fn split_into_records(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Поддельное имя ровно нужной длины и похоже на домен.
+    #[test]
+    fn fake_host_has_the_requested_length() {
+        for len in [3, 5, 9, 14, 16, 30, 60] {
+            let h = fake_host("www.google.com", len);
+            assert_eq!(h.len(), len, "длина {len}");
+            assert!(h.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'.'));
+        }
+        assert!(fake_host("www.google.com", 30).ends_with(b".www.google.com"));
+        assert!(fake_host("www.google.com", 9).ends_with(b".com"));
+    }
 
     #[test]
     fn tls_reply_is_told_apart_from_an_injected_one() {

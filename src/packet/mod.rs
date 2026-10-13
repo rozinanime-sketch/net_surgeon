@@ -359,6 +359,9 @@ mod imp {
         fn decoy(&self, len: usize) -> Vec<u8> {
             crate::bypass::tls::build_client_hello_sized(&self.tcp.bypass_params.fake_sni, len)
         }
+        fn fake_host(&self, len: usize) -> Vec<u8> {
+            crate::bypass::tls::fake_host(&self.tcp.bypass_params.fake_sni, len)
+        }
         fn log_intercepted(&self, domain: &str, dst: IpAddr, bypass: bool) {
             log_t(&self.log_tx, LogLevel::Success, "log.transparent_tunnel", vec![
                 ("domain", domain.to_string()),

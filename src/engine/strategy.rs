@@ -153,6 +153,19 @@ pub enum Strategy {
     /// честно получаются два сегмента — приманка на первой половине, затем
     /// вторая половина раньше ретрансмита первой.
     FakeMultiDisorder,
+    /// hostfakesplit (как у zapret): ClientHello режется по границам имени в
+    /// SNI, и рядом с настоящим именем идёт поддельное той же длины на основе
+    /// разрешённого. DPI видит тот же ClientHello, где отличается только имя,
+    /// — в отличие от fake, подсовывающего чужой целиком.
+    ///
+    /// На сокете поддельное имя уходит с низким TTL и настоящее — повтором,
+    /// как у fake; под перехватом пакетов — до и после настоящего имени.
+    HostFakeSplit,
+    /// fakedsplit (как у zapret): две части, каждая обрамлена подделками того
+    /// же размера — подделка, часть, подделка. Только под перехватом пакетов:
+    /// на сокете ядро не отправит подделку ПОСЛЕ настоящих данных на тех же
+    /// номерах.
+    FakedSplit,
 }
 
 impl Strategy {
@@ -166,6 +179,8 @@ impl Strategy {
             Strategy::Fake => "fake",
             Strategy::Seqovl => "seqovl",
             Strategy::FakeMultiDisorder => "fake_multidisorder",
+            Strategy::HostFakeSplit => "hostfakesplit",
+            Strategy::FakedSplit => "fakedsplit",
         }
     }
 
@@ -189,6 +204,8 @@ impl Strategy {
             "fake" => Some(Strategy::Fake),
             "seqovl" => Some(Strategy::Seqovl),
             "fake_multidisorder" => Some(Strategy::FakeMultiDisorder),
+            "hostfakesplit" => Some(Strategy::HostFakeSplit),
+            "fakedsplit" => Some(Strategy::FakedSplit),
             // Техника убрана как нерабочая; записи из старых strategies.txt
             // не распознаются, и домен просто продиагностируется заново.
             "tiny_chunks" | "socks5_style" => None,
@@ -212,6 +229,8 @@ impl Strategy {
             Strategy::Fake => "strategy.fake",
             Strategy::Seqovl => "strategy.seqovl",
             Strategy::FakeMultiDisorder => "strategy.fake_multidisorder",
+            Strategy::HostFakeSplit => "strategy.hostfakesplit",
+            Strategy::FakedSplit => "strategy.fakedsplit",
         }
     }
 }
@@ -285,6 +304,8 @@ pub fn choose_best(
         (Strategy::Disorder, &result.disorder),
         (Strategy::Fake, &result.fake),
         (Strategy::FakeMultiDisorder, &result.fake_multidisorder),
+        (Strategy::HostFakeSplit, &result.host_fake_split),
+        (Strategy::FakedSplit, &result.faked_split),
         (Strategy::Seqovl, &result.seqovl),
     ];
 
@@ -308,12 +329,20 @@ pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
         if result.seqovl.is_convincing() {
             return Some(Strategy::Seqovl);
         }
+        // Поддельное имя в настоящем ClientHello убедительнее для DPI, чем
+        // чужой ClientHello целиком, а стоит столько же.
+        if result.host_fake_split.is_convincing() {
+            return Some(Strategy::HostFakeSplit);
+        }
         if result.fake.is_convincing() {
             return Some(Strategy::Fake);
         }
         // Приманка одна не прошла, но с перестановкой — прошла: берём её.
         if result.fake_multidisorder.is_convincing() {
             return Some(Strategy::FakeMultiDisorder);
+        }
+        if result.faked_split.is_convincing() {
+            return Some(Strategy::FakedSplit);
         }
     }
     // TLS-record split — первым после direct: он единственный не боится
@@ -335,6 +364,11 @@ pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
     if result.disorder.is_convincing() {
         return Some(Strategy::Disorder);
     }
+    // Приманки — дальше: все платят ретрансмитом. hostfakesplit первым из них:
+    // стоит как fake, а DPI видит настоящий ClientHello, где подделано одно имя.
+    if result.host_fake_split.is_convincing() {
+        return Some(Strategy::HostFakeSplit);
+    }
     // Fake последним: он ждёт ретрансмита, как disorder, и вдобавок шлёт
     // лишний пакет, так что при любой другой рабочей технике брать его
     // незачем. Зато он единственный проходит DPI, который собирает поток,
@@ -347,6 +381,10 @@ pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
     // Дороже fake (ещё и ретрансмит переставленных частей), поэтому после него.
     if result.fake_multidisorder.is_convincing() {
         return Some(Strategy::FakeMultiDisorder);
+    }
+    // fakedsplit (пакетный режим) — мешанина из настоящих и поддельных частей.
+    if result.faked_split.is_convincing() {
+        return Some(Strategy::FakedSplit);
     }
     // Seqovl — тоже последней надеждой (пакетный режим): как и fake, подставляет
     // разрешённое имя, но вдобавок снимает заморозку после ~16 КБ там, где имя
@@ -1039,6 +1077,8 @@ pub fn confidence_of(result: &DiagnosticResult, chosen: Strategy) -> f64 {
         Strategy::Fake => result.fake.confidence,
         Strategy::Seqovl => result.seqovl.confidence,
         Strategy::FakeMultiDisorder => result.fake_multidisorder.confidence,
+        Strategy::HostFakeSplit => result.host_fake_split.confidence,
+        Strategy::FakedSplit => result.faked_split.confidence,
         Strategy::None => 1.0,
     }
 }
@@ -1065,6 +1105,8 @@ mod tests {
             fake: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             seqovl: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             fake_multidisorder: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
+            host_fake_split: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
+            faked_split: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
         }
     }
 
@@ -1723,6 +1765,7 @@ pub mod apply {
         Oob { first: usize, second: usize },
         Fake { decoy: usize, real: usize },
         FakeMultiDisorder { decoy: usize, first: usize, second: usize },
+        HostFakeSplit { before: usize, host: usize, after: usize },
         Split { first: usize, second: usize },
     }
 
@@ -1738,6 +1781,7 @@ pub mod apply {
                 Applied::Oob { first, second } => format!("oob {first}+{second}"),
                 Applied::Fake { decoy, real } => format!("fake {decoy}+{real}"),
                 Applied::FakeMultiDisorder { decoy, first, second } => format!("fake+multidisorder {decoy}/{first}+{second}"),
+                Applied::HostFakeSplit { before, host, after } => format!("hostfakesplit {before}+{host}~+{after}"),
             })
         }
     }
@@ -1786,9 +1830,14 @@ pub mod apply {
             // задать. Сюда она попадать не должна (adaptive не выбирает её вне
             // перехвата пакетов), но на случай устаревшей записи откатываемся
             // на fake — ближайшую по смыслу (та же приманка с чужим именем).
-            Strategy::Fake | Strategy::Seqovl => fragment::split_with_fake(writer, fd, data, &decoy_params())
+            // fakedsplit — тоже пакетная (подделку после настоящих данных на
+            // сокете не отправить): для устаревшей записи — fake.
+            Strategy::Fake | Strategy::Seqovl | Strategy::FakedSplit => fragment::split_with_fake(writer, fd, data, &decoy_params())
                 .await?
                 .map(|info| Applied::Fake { decoy: info.decoy, real: info.real }),
+            Strategy::HostFakeSplit => fragment::split_with_host_fake(writer, fd, data, &decoy_params())
+                .await?
+                .map(|info| Applied::HostFakeSplit { before: info.before, host: info.host, after: info.after }),
             Strategy::FakeMultiDisorder => fragment::split_with_fake_disorder(writer, fd, data, &decoy_params())
                 .await?
                 .map(|info| Applied::FakeMultiDisorder { decoy: info.decoy, first: info.first, second: info.second }),
