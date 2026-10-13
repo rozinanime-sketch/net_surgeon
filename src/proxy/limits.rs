@@ -18,16 +18,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::observability::logging::{log_t, LogLevel, LogSender};
 
 /// Сколько дескрипторов оставить на всё прочее: файлы данных, DoH-клиент,
-/// пробы диагностики, слушатели.
+/// пробы диагностики, слушатели. При скупом лимите — четверть его.
 const FD_RESERVE: u64 = 256;
 
 /// Верхние пределы — даже если дескрипторов хватает на больше: за ними уже
 /// память на буферы пересылки (по 32 КБ на соединение).
 const TCP_CEILING: usize = 8192;
 const UDP_CEILING: usize = 4096;
-/// Нижние — чтобы при скупом лимите прокси всё же работал.
-const TCP_FLOOR: usize = 128;
-const UDP_FLOOR: usize = 64;
 
 /// DNS-запросы в работе. Каждый — задача и поход к DoH; браузер отправляет
 /// десятки разом, а тысячи — это уже не браузер.
@@ -77,8 +74,12 @@ fn split_budget(fds: Option<u64>) -> (usize, usize) {
     let Some(fds) = fds else {
         return (TCP_CEILING, UDP_CEILING);
     };
-    let budget = fds.saturating_sub(FD_RESERVE) as usize;
-    ((budget / 4).clamp(TCP_FLOOR, TCP_CEILING), (budget / 8).clamp(UDP_FLOOR, UDP_CEILING))
+    // Пределы не больше того, что дескрипторы реально позволяют. Раньше
+    // здесь были нижние пороги (128 и 64), и при лимите в 100 дескрипторов
+    // прокси разрешал больше соединений, чем мог открыть.
+    let reserve = FD_RESERVE.min(fds / 4);
+    let budget = fds.saturating_sub(reserve) as usize;
+    ((budget / 4).clamp(1, TCP_CEILING), (budget / 8).clamp(1, UDP_CEILING))
 }
 
 /// Лимит дескрипторов процесса; `None` — у системы его нет (Windows).
@@ -176,8 +177,11 @@ mod tests {
         assert!(2 * tcp + 2 * udp + FD_RESERVE as usize <= 1024);
         // Лимит поднят до жёсткого — упираемся в потолки
         assert_eq!(split_budget(Some(1_048_576)), (TCP_CEILING, UDP_CEILING));
-        // Скупой лимит — всё равно хоть что-то
-        assert_eq!(split_budget(Some(100)), (TCP_FLOOR, UDP_FLOOR));
+        // Скупой лимит: запас — четверть, и пределы в него укладываются
+        let (tcp, udp) = split_budget(Some(100));
+        assert_eq!((tcp, udp), (18, 9));
+        assert!(2 * tcp + 2 * udp <= 100);
+        assert_eq!(split_budget(Some(0)), (1, 1));
         // Лимита нет
         assert_eq!(split_budget(None), (TCP_CEILING, UDP_CEILING));
     }

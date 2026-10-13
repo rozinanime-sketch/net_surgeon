@@ -35,4 +35,11 @@ fuzz_target!(|data: &[u8]| {
         assert!((out.len() - data.len()).is_multiple_of(5));
         assert_eq!(out[0], 0x16);
     }
+
+    // Копия для приманки обязана занять ровно те же байты, что настоящий
+    // ClientHello, и сама разбираться: по ней DPI читает подставленное имя.
+    if let Some(copy) = tls::clone_client_hello(data, "www.google.com") {
+        assert_eq!(copy.len(), data.len());
+        assert!(tls::sni_host(&copy).is_some());
+    }
 });

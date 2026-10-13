@@ -402,7 +402,10 @@ impl<'a> ParsedHello<'a> {
         if record_len(data)? != data.len() || data.get(5)? != &0x01 {
             return None;
         }
-        let hs_len = u32::from_be_bytes([0, data[6], data[7], data[8]]) as usize;
+        // Через get: запись из шести байт проходит проверки выше, а длины
+        // handshake в ней нет — прямой индекс паниковал бы на чужих данных.
+        let hs = data.get(6..9)?;
+        let hs_len = u32::from_be_bytes([0, hs[0], hs[1], hs[2]]) as usize;
         if 9 + hs_len != data.len() {
             return None;
         }
@@ -761,6 +764,28 @@ mod tests {
         let copy = clone_client_hello(&real, "google.com").unwrap();
         assert_eq!(copy.len(), real.len());
         assert_eq!(ext_types(&copy), vec![0x0000, 0x0015, 0x0029]);
+    }
+
+    /// Обрывки любой длины, даже с заголовком записи, подогнанным под
+    /// обрывок, — не паника, а отказ.
+    #[test]
+    fn clone_never_panics_on_truncated_hellos() {
+        for len in 0..=8 {
+            let mut data = vec![0x16, 0x03, 0x03, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+            data.truncate(len);
+            if len >= 5 {
+                data[3..5].copy_from_slice(&((len - 5) as u16).to_be_bytes());
+            }
+            assert!(clone_client_hello(&data, "www.google.com").is_none(), "{len} байт");
+        }
+        let real = build_client_hello_sized("discord.com", 600);
+        for len in 0..real.len() {
+            let mut cut = real[..len].to_vec();
+            if len >= 5 {
+                cut[3..5].copy_from_slice(&((len - 5) as u16).to_be_bytes());
+            }
+            assert!(clone_client_hello(&cut, "www.google.com").is_none(), "обрывок {len} байт");
+        }
     }
 
     #[test]
