@@ -386,26 +386,42 @@ fn wrap_client_hello(body: &[u8]) -> Vec<u8> {
 /// (`www.google.com`) — для hostfakesplit: подделка занимает в потоке те же
 /// номера, что настоящее имя, поэтому длина обязана совпасть.
 ///
-/// Длиннее разрешённого — спереди случайная метка: `k3x9.www.google.com`;
-/// короче — случайная метка с `.com`. Имя выглядит правдоподобно и для DPI
-/// разбирается как обычный домен.
+/// Берётся самое длинное окончание разрешённого имени, которое помещается:
+/// само имя той же длины, иначе со случайной меткой спереди
+/// (`k3x9.www.google.com`), иначе его часть (`ab12x.google.com`), в худшем
+/// случае — случайная метка с зоной (`abcdefg.com`). Имя выглядит
+/// правдоподобно и для DPI разбирается как обычный домен.
+///
+/// Раньше окончания не перебирались, а имя ровно той же длины не бралось:
+/// для `discord.com` (11 байт) при `fake_sni = "www.google.com"` подделкой
+/// было случайное `xxxxxxx.com` — Google в нём не было вовсе. Что вышло
+/// на деле, видно в логе (см. [`keeps_allowed`]).
 pub fn fake_host(allowed: &str, len: usize) -> Vec<u8> {
     let label = |n: usize| -> Vec<u8> {
         super::random::bytes(n).iter().map(|b| b"abcdefghijklmnopqrstuvwxyz0123456789"[*b as usize % 36]).collect()
     };
-    let allowed = allowed.trim_end_matches('.').as_bytes();
-    if len >= allowed.len() + 2 {
-        let mut out = label(len - allowed.len() - 1);
-        out.push(b'.');
-        out.extend_from_slice(allowed);
-        out
-    } else if len >= 5 {
-        let mut out = label(len - 4);
-        out.extend_from_slice(b".com");
-        out
-    } else {
-        label(len)
+    let allowed = allowed.trim_end_matches('.');
+    let suffixes = std::iter::once(allowed).chain(allowed.match_indices('.').map(|(i, _)| &allowed[i + 1..]));
+    for suffix in suffixes.filter(|s| !s.is_empty()) {
+        if len == suffix.len() {
+            return suffix.as_bytes().to_vec();
+        }
+        if len >= suffix.len() + 2 {
+            let mut out = label(len - suffix.len() - 1);
+            out.push(b'.');
+            out.extend_from_slice(suffix.as_bytes());
+            return out;
+        }
     }
+    label(len)
+}
+
+/// Сохранила ли подделка разрешённое имя целиком. Нет — имя длиннее
+/// настоящего, и DPI видит лишь его окончание или случайное имя: смена
+/// `fake_sni` тогда проверяет не то, что задумано.
+pub fn keeps_allowed(fake: &[u8], allowed: &str) -> bool {
+    let allowed = allowed.trim_end_matches('.').as_bytes();
+    fake == allowed || (fake.ends_with(allowed) && fake.len() > allowed.len() && fake[fake.len() - allowed.len() - 1] == b'.')
 }
 
 /// Приманка должна занять в потоке ровно те номера, что и настоящий
@@ -542,6 +558,23 @@ mod tests {
         }
         assert!(fake_host("www.google.com", 30).ends_with(b".www.google.com"));
         assert!(fake_host("www.google.com", 9).ends_with(b".com"));
+        // Та же длина — само имя; на один короче — окончание
+        assert_eq!(fake_host("www.google.com", 14), b"www.google.com");
+        assert_eq!(fake_host("www.google.com", 10), b"google.com");
+        assert!(fake_host("www.google.com", 13).ends_with(b".google.com"));
+        // discord.com (11): от google.com не поместится ничего, кроме зоны
+        assert!(fake_host("www.google.com", 11).ends_with(b".com"));
+        assert!(fake_host("cloudflare.com", 19).ends_with(b".cloudflare.com"));
+    }
+
+    #[test]
+    fn keeps_allowed_tells_whether_the_whole_name_survived() {
+        assert!(keeps_allowed(b"www.google.com", "www.google.com"));
+        assert!(keeps_allowed(b"k3x9.www.google.com", "www.google.com."));
+        assert!(!keeps_allowed(b"ab12x.google.com", "www.google.com"));
+        assert!(!keeps_allowed(b"abcdefg.com", "cloudflare.com"));
+        // Окончание совпало, но не по границе метки
+        assert!(!keeps_allowed(b"xcloudflare.com", "cloudflare.com"));
     }
 
     #[test]

@@ -105,6 +105,28 @@ pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// память при множестве соединений.
 pub(crate) const PUMP_BUF: usize = 16 * 1024;
 
+/// Предупреждает, если hostfakesplit не смог сохранить `fake_sni` целиком:
+/// имя настоящего сайта короче, и DPI получил лишь окончание или случайное
+/// имя. Иначе смена `fake_sni` выглядела бы проверкой, а не проверяла
+/// ничего. Не чаще раза в минуту — соединений с той же картиной много.
+pub(crate) fn fake_sni_note(log_tx: &LogSender, applied: &crate::engine::strategy::apply::Applied, fake_sni: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let crate::engine::strategy::apply::Applied::HostFakeSplit { fake, .. } = applied else { return };
+    if fake.is_empty() || crate::bypass::tls::keeps_allowed(fake.as_bytes(), fake_sni) {
+        return;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 60 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        log_t(log_tx, LogLevel::Warning, "log.fake_sni_unfit", vec![
+            ("fake_sni", fake_sni.to_string()),
+            ("fake", fake.clone()),
+            ("len", fake.len().to_string()),
+        ]);
+    }
+}
+
 pub async fn run_all(
     config: Arc<Config>,
     domains: Arc<HashSet<String>>,

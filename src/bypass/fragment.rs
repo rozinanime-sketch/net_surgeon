@@ -318,6 +318,8 @@ pub struct HostFakeInfo {
     pub before: usize,
     pub host: usize,
     pub after: usize,
+    /// Что DPI получил вместо имени: по нему видно, сохранился ли `fake_sni`.
+    pub fake: String,
 }
 
 /// hostfakesplit (как у zapret): ClientHello режется по границам имени в
@@ -364,11 +366,16 @@ where
         // Начало уже ушло — отказываться поздно: остальное как есть.
         server_writer.write_all(rest).await?;
         server_writer.flush().await?;
-        return Ok(Some(HostFakeInfo { before: before.len(), host: 0, after: rest.len() }));
+        return Ok(Some(HostFakeInfo { before: before.len(), host: 0, after: rest.len(), fake: String::new() }));
     }
     server_writer.write_all(after).await?;
     server_writer.flush().await?;
-    Ok(Some(HostFakeInfo { before: before.len(), host: host.len(), after: after.len() }))
+    Ok(Some(HostFakeInfo {
+        before: before.len(),
+        host: host.len(),
+        after: after.len(),
+        fake: String::from_utf8_lossy(&fake).into_owned(),
+    }))
 }
 
 /// OOB: между половинами ClientHello вставляется мусорный байт с флагом URG.

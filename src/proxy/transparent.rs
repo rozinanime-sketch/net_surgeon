@@ -486,6 +486,7 @@ async fn handle(
     // Первый пакет уходит по выбранной стратегии — здесь и происходит обход.
     match crate::engine::strategy::apply::first_packet(&mut server_writer, server_fd, &payload, strategy, bypass_params).await {
         Ok(applied) => {
+            crate::proxy::fake_sni_note(log_tx, &applied, &bypass_params.fake_sni);
             // Без обхода писать нечего: «bypass: false» уже есть в строке
             // перехвата выше. Иначе каждое постороннее соединение давало
             // лишнее предупреждение и топило в логе настоящие. Так же

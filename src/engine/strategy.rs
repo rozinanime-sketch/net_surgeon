@@ -1765,7 +1765,8 @@ pub mod apply {
         Oob { first: usize, second: usize },
         Fake { decoy: usize, real: usize },
         FakeMultiDisorder { decoy: usize, first: usize, second: usize },
-        HostFakeSplit { before: usize, host: usize, after: usize },
+        /// `fake` — имя, которое получил DPI; пусто — подделка не ушла.
+        HostFakeSplit { before: usize, host: usize, after: usize, fake: String },
         Split { first: usize, second: usize },
     }
 
@@ -1781,7 +1782,8 @@ pub mod apply {
                 Applied::Oob { first, second } => format!("oob {first}+{second}"),
                 Applied::Fake { decoy, real } => format!("fake {decoy}+{real}"),
                 Applied::FakeMultiDisorder { decoy, first, second } => format!("fake+multidisorder {decoy}/{first}+{second}"),
-                Applied::HostFakeSplit { before, host, after } => format!("hostfakesplit {before}+{host}~+{after}"),
+                Applied::HostFakeSplit { before, host, after, fake } if fake.is_empty() => format!("hostfakesplit {before}+{host}~+{after}"),
+                Applied::HostFakeSplit { before, host, after, fake } => format!("hostfakesplit {before}+{host}~+{after}, {fake}"),
             })
         }
     }
@@ -1837,7 +1839,7 @@ pub mod apply {
                 .map(|info| Applied::Fake { decoy: info.decoy, real: info.real }),
             Strategy::HostFakeSplit => fragment::split_with_host_fake(writer, fd, data, &decoy_params())
                 .await?
-                .map(|info| Applied::HostFakeSplit { before: info.before, host: info.host, after: info.after }),
+                .map(|info| Applied::HostFakeSplit { before: info.before, host: info.host, after: info.after, fake: info.fake }),
             Strategy::FakeMultiDisorder => fragment::split_with_fake_disorder(writer, fd, data, &decoy_params())
                 .await?
                 .map(|info| Applied::FakeMultiDisorder { decoy: info.decoy, first: info.first, second: info.second }),
