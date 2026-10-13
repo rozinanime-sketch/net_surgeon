@@ -226,10 +226,24 @@ where
 
     // Всё записанное раньше должно уйти до приманки, мимо подмены.
     server_writer.flush().await?;
-    if !socket::send_fake(fd, &decoy, real, params.fake_ttl, params.fake_md5sig).await? {
+    if !send_fake_signed_or_not(fd, &decoy, real, params).await? {
         return Ok(None);
     }
     Ok(Some(decoy.len()))
+}
+
+/// Приманка с подписью, если её просили и ядро умеет; ядро отказало — та же
+/// приманка без подписи, на одном TTL.
+async fn send_fake_signed_or_not(fd: RawSock, decoy: &[u8], real: &[u8], params: &crate::config::BypassParams) -> std::io::Result<bool> {
+    let md5sig = socket::md5sig_available(params.fake_md5sig);
+    if socket::send_fake(fd, decoy, real, params.fake_ttl, md5sig).await? {
+        return Ok(true);
+    }
+    // Отказ именно в подписи — повтор без неё; иной отказ повторять незачем.
+    if md5sig && !socket::md5sig_available(true) {
+        return socket::send_fake(fd, decoy, real, params.fake_ttl, false).await;
+    }
+    Ok(false)
 }
 
 /// Как прошла техника fake + disorder — для лога вызывающей стороны.
@@ -346,7 +360,7 @@ where
     server_writer.write_all(before).await?;
     // Всё до имени — до подмены, с обычным TTL.
     server_writer.flush().await?;
-    if !socket::send_fake(fd, &fake, host, params.fake_ttl, params.fake_md5sig).await? {
+    if !send_fake_signed_or_not(fd, &fake, host, params).await? {
         // Начало уже ушло — отказываться поздно: остальное как есть.
         server_writer.write_all(rest).await?;
         server_writer.flush().await?;

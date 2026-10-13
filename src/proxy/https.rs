@@ -175,7 +175,7 @@ pub async fn handle_connect(
                 ttl_hours: strategy_ttl_hours,
                 log_tx: &log_tx_c2s,
             };
-            super::adaptive::select(&ctx, &domain_c2s, first.len())
+            super::adaptive::select(&ctx, &domain_c2s, crate::bypass::tls::client_hello_len(&first))
         } else {
             Selected::DIRECT
         };
@@ -304,5 +304,6 @@ pub async fn handle_connect(
         ttl_hours: strategy_ttl_hours,
         log_tx: &log_tx,
     };
-    super::adaptive::record_outcome(&ctx, &domain, selected, responded.load(Ordering::Relaxed));
+    let worked = super::adaptive::handshake_completed(&selected, responded.load(Ordering::Relaxed), rx_total.load(Ordering::Relaxed));
+    super::adaptive::record_outcome(&ctx, &domain, selected, worked);
 }

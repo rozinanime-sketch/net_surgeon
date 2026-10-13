@@ -420,7 +420,7 @@ async fn handle_connect(
             if let Some(forced) = client_port.and_then(crate::engine::probe_force::take) {
                 selected = crate::proxy::adaptive::Selected::new(forced, None);
             } else if wants_bypass {
-                selected = crate::proxy::adaptive::select(&adaptive_ctx, &domain, initial.len());
+                selected = crate::proxy::adaptive::select(&adaptive_ctx, &domain, crate::bypass::tls::client_hello_len(&initial));
             }
 
             match crate::engine::strategy::apply::first_packet(&mut sw, server_fd, &initial, selected.strategy, bypass_params).await {
@@ -499,7 +499,8 @@ async fn handle_connect(
     let (client, (received, last_rx, server_end)) = tokio::join!(to_server, to_client);
 
     // Обратная связь по применённой стратегии — та же, что в HTTPS-туннеле.
-    crate::proxy::adaptive::record_outcome(&adaptive_ctx, &client.domain, client.selected, responded.load(Ordering::Relaxed));
+    let worked = crate::proxy::adaptive::handshake_completed(&client.selected, responded.load(Ordering::Relaxed), client.sent);
+    crate::proxy::adaptive::record_outcome(&adaptive_ctx, &client.domain, client.selected, worked);
 
     // Трафик соединения — его домену. Итоги уже посчитаны обоими
     // направлениями (client.sent / received), лишних счётчиков не нужно.

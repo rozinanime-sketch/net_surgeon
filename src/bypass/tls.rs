@@ -57,6 +57,13 @@ pub fn record_len(data: &[u8]) -> Option<usize> {
     Some(5 + u16::from_be_bytes([data[3], data[4]]) as usize)
 }
 
+/// Размер ClientHello по заголовку его TLS-записи, а не по первому
+/// прочитанному куску: большой ClientHello приходит несколькими кусками, и
+/// остаток сошёл бы за данные после рукопожатия. Не TLS — длина куска.
+pub fn client_hello_len(first: &[u8]) -> usize {
+    record_len(first).unwrap_or(first.len())
+}
+
 /// Похож ли ответ сервера на TLS: запись рукопожатия (ServerHello) или
 /// alert, с версией 3.x во втором байте.
 ///

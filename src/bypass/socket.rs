@@ -421,6 +421,17 @@ fn set_md5sig(fd: RawSock, key_len: u16) -> bool {
     rc == 0
 }
 
+/// Ядро отказало в MD5-подписи TCP хотя бы раз (на Android её обычно нет).
+static MD5SIG_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Подписывать ли приманку: просили в конфиге и ядро не отказывало. Иначе
+/// приманка — только на TTL. Раньше при `fake_md5sig = true` на телефоне без
+/// подписи приманка не уходила вовсе, и fake, hostfakesplit и
+/// fake+multidisorder молча не работали.
+pub fn md5sig_available(requested: bool) -> bool {
+    requested && !MD5SIG_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Отправляет `decoy` с TTL `ttl` так, что ядро потом повторит на тех же
 /// номерах `real`. Длины должны совпадать. `md5sig` — вдобавок пометить
 /// приманку MD5-подписью (см. [`set_md5sig`]); повтор уходит уже без неё.
@@ -448,6 +459,9 @@ pub async fn send_fake(fd: RawSock, decoy: &[u8], real: &[u8], ttl: u32, md5sig:
     if md5sig && !set_md5sig(fd, 5) {
         // Ядро без CONFIG_TCP_MD5SIG или запрет на живом соединении: без
         // подписи приманка дошла бы до сервера — лучше не отправлять вовсе.
+        // Отказ запоминается: общие техники дальше шлют приманку без подписи
+        // (см. `md5sig_available`), полагаясь на TTL.
+        MD5SIG_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
         set_ttl(fd, original_ttl);
         return Ok(false);
     }

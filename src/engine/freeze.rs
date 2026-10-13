@@ -78,6 +78,16 @@ const READ_POLL: Duration = Duration::from_secs(2);
 /// не просто пауза мобильной сети. Порог высокий намеренно: ложный `Frozen`
 /// выключил бы дешёвые техники на неморозящей сети.
 const STALL_CONFIRM: Duration = Duration::from_secs(12);
+/// Сколько ждать рукопожатия TLS в пробе: дольше — значит, оно заморожено.
+const HANDSHAKE_LIMIT: Duration = Duration::from_secs(12);
+
+/// Рукопожатие оборвано по дороге (сброс, обрыв, тишина), а не отвергнуто
+/// сервером по существу (сертификат, протокол).
+fn cut_mid_handshake(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(e.kind(), ConnectionReset | ConnectionAborted | UnexpectedEof | TimedOut | BrokenPipe)
+}
+
 /// Общий предел на пробу, чтобы она не висела вечно.
 const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -112,14 +122,23 @@ async fn probe_inner(socks_port: u16, host: &str, strategy: Strategy) -> Verdict
             return Verdict::Inconclusive;
         }
     };
-    let mut tls = match connector().connect(name, tcp).await {
-        Ok(s) => s,
-        // Рукопожатие не прошло — не улика о заморозке. Метку снимаем на случай,
-        // если соединение оборвалось до отправки ClientHello (тогда прокси её
-        // не забрал); если ClientHello ушёл, take уже вернул None — вреда нет.
-        Err(_) => {
+    // Метку снимаем при любом исходе неудачи: если соединение оборвалось до
+    // отправки ClientHello, прокси её не забрал; если ушёл — take вернёт
+    // None, вреда нет.
+    let mut tls = match tokio::time::timeout(HANDSHAKE_LIMIT, connector().connect(name, tcp)).await {
+        Ok(Ok(s)) => s,
+        // TCP до сервера открыт (прокси ответил на CONNECT), а рукопожатие
+        // зависло или оборвалось — это та же заморозка, только раньше:
+        // DPI пропускает начало ответа сервера и глушит остальное. Раньше
+        // это считалось «непонятно», и на приманку не переключались — так
+        // висел Discord. Ошибки сертификата — не заморозка: сервер ответил.
+        Ok(Err(e)) if !cut_mid_handshake(&e) => {
             crate::engine::probe_force::take(local.port());
             return Verdict::Inconclusive;
+        }
+        Ok(Err(_)) | Err(_) => {
+            crate::engine::probe_force::take(local.port());
+            return Verdict::Frozen;
         }
     };
 

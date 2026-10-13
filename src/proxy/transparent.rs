@@ -433,7 +433,7 @@ async fn handle(
         strategies, bypass_params, ttl_hours: strategy_ttl_hours, log_tx,
     };
     let selected = if !payload.is_empty() && needs_bypass(is_enabled, &domain, bypass_domains) {
-        crate::proxy::adaptive::select(&adaptive_ctx, &domain, payload.len())
+        crate::proxy::adaptive::select(&adaptive_ctx, &domain, crate::bypass::tls::client_hello_len(&payload))
     } else {
         crate::proxy::adaptive::Selected::DIRECT
     };
@@ -552,7 +552,8 @@ async fn handle(
     metrics.record_domain_traffic(&domain, rx_total.load(Ordering::Relaxed), tx_total.load(Ordering::Relaxed));
 
     // Обратная связь по стратегии — та же, что в остальных режимах.
-    crate::proxy::adaptive::record_outcome(&adaptive_ctx, &domain, selected, responded.load(Ordering::Relaxed));
+    let worked = crate::proxy::adaptive::handshake_completed(&selected, responded.load(Ordering::Relaxed), rx_total.load(Ordering::Relaxed));
+    crate::proxy::adaptive::record_outcome(&adaptive_ctx, &domain, selected, worked);
 }
 
 /// Сколько помнить адрес, который не ответил на подключение.

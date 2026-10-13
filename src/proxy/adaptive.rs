@@ -174,6 +174,16 @@ fn unmeasured_default(class: HelloClass) -> Strategy {
 }
 
 /// Отмечает исход соединения и, если запись сброшена, сохраняет это на диск.
+/// Удалось ли соединение со стратегией: сервер ответил TLS, И рукопожатие
+/// завершилось — клиент после ClientHello отправил ещё что-то (Finished и
+/// запрос). Раньше хватало первых байт ответа: DPI, который режет посреди
+/// рукопожатия (ServerHello приходит, дальше тишина), выглядел успехом, и
+/// нерабочая стратегия не сбрасывалась никогда — так висел Discord.
+/// `client_sent` — всё, что клиент отправил серверу за соединение.
+pub fn handshake_completed(selected: &Selected, responded: bool, client_sent: u64) -> bool {
+    responded && (selected.hello_len == 0 || client_sent > selected.hello_len as u64)
+}
+
 pub fn record_outcome(ctx: &Context<'_>, domain: &str, selected: Selected, responded: bool) {
     // Стратегия `None` из собственной записи домена тоже проверяется: это
     // вердикт «прямое соединение работает», и он может оказаться ошибочным.
@@ -303,6 +313,16 @@ mod tests {
             "split_pos_min = 4\nsplit_pos_max = 12\nsplit_delay_ms = 3\nwindow_clamp = 0\n",
         ).expect("параметры обхода");
         (Arc::new(StrategyStore::new()), params, tx)
+    }
+
+    /// Сервер ответил, но клиент после ClientHello не отправил ничего —
+    /// рукопожатие оборвано посреди, это провал, а не успех.
+    #[test]
+    fn cut_handshake_is_not_success() {
+        let selected = Selected { hello_len: 1500, ..Selected::new(Strategy::Disorder, Some(HelloClass::Large)) };
+        assert!(!handshake_completed(&selected, true, 1500), "только ClientHello");
+        assert!(handshake_completed(&selected, true, 1580), "ClientHello и Finished");
+        assert!(!handshake_completed(&selected, false, 5000), "сервер не ответил TLS");
     }
 
     /// Сброс записи запускает передиагностику сразу, даже в паузу
