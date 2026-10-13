@@ -379,16 +379,43 @@ where
     Ok(Some(info))
 }
 
-/// Window clamp на TCP-сокете сервера. Возвращает true, если setsockopt
-/// прошёл успешно — раньше результат молча игнорировался, и о неудаче
-/// нельзя было узнать никак.
-///
-/// `TCP_WINDOW_CLAMP` — опция Linux; на других платформах возвращается false.
+// --- Окно приёма (как wssize у zapret, но для ответа сервера) -------------
+//
+// Маленькое окно приёма заставляет сервер слать ответ — ServerHello и
+// сертификат — мелкими порциями, и DPI, который читает их целиком, не может
+// этого сделать. На исходящий ClientHello (SNI) окно не влияет.
+//
+// Окно ставится ДО подключения: оно и коэффициент масштабирования
+// объявляются в SYN, а уже объявленное окно Linux не уменьшает. Раньше
+// `TCP_WINDOW_CLAMP` ставился после рукопожатия, и первая порция ответа —
+// как раз ServerHello с сертификатом — приходила целиком.
+//
+// Цена: с маленьким окном в SYN ядро не включает масштабирование окна, и
+// после отпускания ([`WindowRelease`]) окно не больше 64 КБ — на далёком
+// сервере это потолок скорости (64 КБ за RTT: ~10 Мбит/с при 50 мс).
+
+/// Сколько байт ответа сервер шлёт при маленьком окне. Больше рукопожатия
+/// TLS с сертификатом; дальше окно отпускается.
+pub const WINDOW_CLAMP_CUTOFF: usize = 16 * 1024;
+/// Окно после отпускания: наибольшее без масштабирования.
+const WINDOW_RELEASED: u32 = u16::MAX as u32;
+
+/// Подключается к `addr` с окном приёма `clamp`, выставленным до SYN.
+/// 0 — обычное подключение. Где окно не выставить (не Linux), — тоже
+/// обычное.
+pub async fn connect_clamped(addr: std::net::SocketAddr, clamp: u32) -> std::io::Result<TcpStream> {
+    if clamp == 0 {
+        return TcpStream::connect(addr).await;
+    }
+    let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    set_window_clamp(super::socket::raw_sock(&socket), clamp);
+    socket.connect(addr).await
+}
+
+/// `TCP_WINDOW_CLAMP` на сокете; false — не вышло или не Linux.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn apply_window_clamp(stream: &TcpStream, window: u32) -> bool {
+fn set_window_clamp(fd: super::socket::RawSock, window: u32) -> bool {
     let rc = unsafe {
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
         libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
@@ -401,8 +428,33 @@ pub fn apply_window_clamp(stream: &TcpStream, window: u32) -> bool {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn apply_window_clamp(_stream: &TcpStream, _window: u32) -> bool {
+fn set_window_clamp(_fd: super::socket::RawSock, _window: u32) -> bool {
     false
+}
+
+/// Отпускает окно после первых [`WINDOW_CLAMP_CUTOFF`] байт ответа, как
+/// `wssize-cutoff` у zapret: иначе маленькое окно тормозило бы всё
+/// соединение. Без окна (`clamped = false`) ничего не делает.
+pub struct WindowRelease {
+    fd: super::socket::RawSock,
+    left: Option<usize>,
+}
+
+impl WindowRelease {
+    pub fn new(fd: super::socket::RawSock, clamped: bool) -> Self {
+        Self { fd, left: clamped.then_some(WINDOW_CLAMP_CUTOFF) }
+    }
+
+    /// Пришло `n` байт от сервера.
+    pub fn on_received(&mut self, n: usize) {
+        let Some(left) = self.left else { return };
+        if n >= left {
+            set_window_clamp(self.fd, WINDOW_RELEASED);
+            self.left = None;
+        } else {
+            self.left = Some(left - n);
+        }
+    }
 }
 
 // `fragment_http_request` и `apply_udp_jitter` удалены.
@@ -494,4 +546,49 @@ pub fn build_fake_discord_voice() -> Vec<u8> {
     out.extend_from_slice(&[0x00, 0x01, 0x00, 70]); // тип запроса + длина тела
     out.extend_from_slice(&random::bytes(70)); // SSRC + адрес + порт — шум
     out
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// Окно уходит в SYN: с ним ядро не включает масштабирование окна, без
+    /// него — включает. Раньше окно ставилось после рукопожатия и в SYN не
+    /// попадало вовсе.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[tokio::test]
+    async fn window_clamp_is_announced_in_syn() {
+        fn rcv_wscale(stream: &TcpStream) -> u8 {
+            let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+            let fd = super::super::socket::raw_sock(stream);
+            let rc = unsafe { libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_INFO, (&raw mut info).cast(), &mut len) };
+            assert_eq!(rc, 0);
+            info.tcpi_snd_rcv_wscale >> 4
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let a = listener.accept().await.unwrap().0;
+            let b = listener.accept().await.unwrap().0;
+            (a, b)
+        });
+        let clamped = connect_clamped(addr, 1024).await.unwrap();
+        let plain = connect_clamped(addr, 0).await.unwrap();
+        let _servers = accept.await.unwrap();
+        assert_eq!(rcv_wscale(&clamped), 0, "с окном в SYN масштабирования нет");
+        assert!(rcv_wscale(&plain) > 0, "без окна масштабирование есть");
+    }
+
+    #[test]
+    fn window_is_released_after_the_cutoff() {
+        let mut w = WindowRelease::new(Default::default(), true);
+        w.on_received(WINDOW_CLAMP_CUTOFF - 1);
+        assert!(w.left.is_some());
+        w.on_received(1);
+        assert!(w.left.is_none());
+        let mut off = WindowRelease::new(Default::default(), false);
+        off.on_received(1);
+        assert!(off.left.is_none());
+    }
 }

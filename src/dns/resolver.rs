@@ -478,6 +478,19 @@ pub async fn connect(target: &str) -> std::io::Result<TcpStream> {
     }
 }
 
+tokio::task_local! {
+    /// Окно приёма для подключений этой задачи (см. [`with_window_clamp`]).
+    static WINDOW_CLAMP: u32;
+}
+
+/// Подключения внутри `f` — с окном приёма `clamp`, выставленным до SYN
+/// (см. `bypass::fragment::connect_clamped`). Через область задачи, а не
+/// параметром: подключение проходит резолвер насквозь (DoH, перебор
+/// адресов, откат на систему), и тащить окно через каждую функцию незачем.
+pub async fn with_window_clamp<F: std::future::Future>(clamp: u32, f: F) -> F::Output {
+    WINDOW_CLAMP.scope(clamp, f).await
+}
+
 /// Подключается к одному адресу, но не дольше [`PER_ADDRESS_CONNECT_TIMEOUT`].
 ///
 /// Для прозрачного режима, где адрес уже известен из conntrack.
@@ -487,7 +500,8 @@ pub async fn connect_addr(addr: SocketAddr) -> std::io::Result<TcpStream> {
     if addr_is_dead(addr.ip()) {
         return Err(recently_dead(addr));
     }
-    match tokio::time::timeout(PER_ADDRESS_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+    let clamp = WINDOW_CLAMP.try_with(|w| *w).unwrap_or(0);
+    match tokio::time::timeout(PER_ADDRESS_CONNECT_TIMEOUT, crate::bypass::fragment::connect_clamped(addr, clamp)).await {
         // Все подключения прокси проходят здесь. Метка — чтобы перехват
         // пакетов в Windows не обходил их второй раз (см. packet_mode).
         Ok(Ok(stream)) => {

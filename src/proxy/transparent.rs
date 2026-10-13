@@ -443,7 +443,9 @@ async fn handle(
     // Имя сайта известно только из SNI или кэша; без него запасных адресов
     // не найти.
     let name = (domain.parse::<std::net::IpAddr>().is_err()).then_some(domain.as_str());
-    let (server, target_addr) = match connect_with_fallback(target_addr, name, log_tx).await {
+    // Окно приёма — до подключения (объявляется в SYN), только с обходом.
+    let clamp = if strategy != Strategy::None { bypass_params.window_clamp } else { 0 };
+    let (server, target_addr) = match crate::dns::resolver::with_window_clamp(clamp, connect_with_fallback(target_addr, name, log_tx)).await {
         Ok(pair) => {
             metrics.record_connect_ms(started.elapsed().as_secs_f64() * 1000.0);
             pair
@@ -498,6 +500,7 @@ async fn handle(
     let metrics_s2c = Arc::clone(metrics);
     let tx_total_s2c = Arc::clone(&tx_total);
 
+    let mut window = crate::bypass::fragment::WindowRelease::new(server_fd, clamp > 0);
     let to_client = async move {
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
         let mut first = true;
@@ -505,6 +508,7 @@ async fn handle(
             match server_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(len) => {
+                    window.on_received(len);
                     if first {
                         first = false;
                         responded_flag.store(crate::bypass::tls::server_accepted(&buf[..len]), Ordering::Relaxed);

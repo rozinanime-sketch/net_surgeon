@@ -1,5 +1,5 @@
 use std::time::{Duration, Instant};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::BypassParams;
@@ -390,7 +390,9 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
     let mut connected = None;
     for addr in crate::dns::resolver::resolve_all(target).await.into_iter().take(MAX_PROBE_ADDRESSES) {
         let started = Instant::now();
-        if let Ok(Ok(s)) = tokio::time::timeout(RESPONSE_TIMEOUT_MAX, TcpStream::connect(addr)).await {
+        // Окно — до SYN, как в бою (fragment::connect_clamped).
+        let connecting = fragment::connect_clamped(addr, bypass_params.window_clamp);
+        if let Ok(Ok(s)) = tokio::time::timeout(RESPONSE_TIMEOUT_MAX, connecting).await {
             connected = Some((s, started.elapsed()));
             break;
         }
@@ -414,16 +416,8 @@ async fn probe_tcp_inner(target: &str, hello: &[u8], strategy: FragStrategy, byp
     let response_timeout = (connect_rtt * RESPONSE_TIMEOUT_FACTOR)
         .clamp(RESPONSE_TIMEOUT_MIN, RESPONSE_TIMEOUT_MAX);
 
-    // Clamp применяется ко ВСЕМ пробам одинаково или ни к одной. Раньше он
-    // стоял только на сплит-пробах, и это делало сравнение нечестным: провал
-    // сплита нельзя было отличить от влияния маленького окна.
-    //
-    // Само окно приёма, кстати, влияет не на исходящий ClientHello (где лежит
-    // SNI), а на то, как сервер шлёт ОТВЕТ — техника против DPI, читающего
-    // сертификат. 0 = выключено.
-    if bypass_params.window_clamp > 0 {
-        let _ = fragment::apply_window_clamp(&stream, bypass_params.window_clamp);
-    }
+    // Окно приёма (если задано) стоит на всех пробах одинаково — выставлено
+    // при подключении выше: иначе провал сплита не отличить от влияния окна.
 
     // Дескриптор берём до разделения: техники disorder и oob работают
     // с сокетом напрямую (setsockopt/MSG_OOB), а половины его не отдают.

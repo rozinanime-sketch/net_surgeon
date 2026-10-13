@@ -308,7 +308,10 @@ async fn handle_connect(
 
     log_t(log_tx, LogLevel::Info, "log.socks5_connect_to", vec![("target", target.clone())]);
 
-    let mut server = match crate::dns::resolver::connect(&target).await {
+    // Окно приёма — до подключения (объявляется в SYN), только для доменов с
+    // обходом. Раньше в SOCKS5 window_clamp не применялся вовсе.
+    let clamp = if needs_bypass(is_enabled, &extract_domain(&target), bypass_domains) { bypass_params.window_clamp } else { 0 };
+    let mut server = match crate::dns::resolver::with_window_clamp(clamp, crate::dns::resolver::connect(&target)).await {
         Ok(s) => s,
         Err(e) => {
             log_t(log_tx, LogLevel::Error, "log.socks5_connect_error", vec![("target", target.clone()), ("error", e.to_string())]);
@@ -459,6 +462,7 @@ async fn handle_connect(
         let _ = sw.shutdown().await;
         ClientSide { selected, domain, bypass: wants_bypass, sent, end: Some(end) }
     };
+    let mut window = crate::bypass::fragment::WindowRelease::new(server_fd, clamp > 0);
     let to_client = async {
         let mut buf = [0u8; crate::proxy::PUMP_BUF];
         let mut received = 0u64;
@@ -468,6 +472,7 @@ async fn handle_connect(
                 Ok(0) => break End::fin(Side::Server),
                 Err(e) => break End::new(Side::Server, &e),
                 Ok(n) => {
+                    window.on_received(n);
                     // По первому куску: alert о повреждённых данных — не ответ,
                     // а провал стратегии (см. tls::is_corruption_alert).
                     if received == 0 {

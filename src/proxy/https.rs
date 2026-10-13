@@ -73,7 +73,10 @@ pub async fn handle_connect(
     // время после установки соединения.
     let started = Instant::now();
 
-    let server_stream = match crate::dns::resolver::connect(&target).await {
+    // Окно приёма — до подключения: оно объявляется в SYN (см.
+    // fragment::connect_clamped). Только для доменов с обходом.
+    let clamp = if needs { bypass_params.window_clamp } else { 0 };
+    let server_stream = match crate::dns::resolver::with_window_clamp(clamp, crate::dns::resolver::connect(&target)).await {
         Ok(s) => {
             metrics.record_connect_ms(started.elapsed().as_secs_f64() * 1000.0);
             s
@@ -112,15 +115,8 @@ pub async fn handle_connect(
 
     log_t(&log_tx, LogLevel::Success, "log.https_tunnel", vec![("target", target.clone()), ("bypass", needs.to_string())]);
 
-    // Clamp — независимая от стратегии настройка (действует на ОТВЕТ сервера),
-    // поэтому применяется по значению в конфиге, а не по типу обхода. 0 = выкл.
-    if needs && bypass_params.window_clamp > 0 {
-        let ok = fragment::apply_window_clamp(&server_stream, bypass_params.window_clamp);
-        if ok {
-            log_t(&log_tx, LogLevel::Info, "log.window_clamp", vec![("window", bypass_params.window_clamp.to_string())]);
-        } else {
-            log_t(&log_tx, LogLevel::Warning, "log.window_clamp_failed", vec![("window", bypass_params.window_clamp.to_string())]);
-        }
+    if clamp > 0 {
+        log_t(&log_tx, LogLevel::Info, "log.window_clamp", vec![("window", clamp.to_string())]);
     }
 
     let _ = client_stream.set_nodelay(true);
@@ -262,6 +258,7 @@ pub async fn handle_connect(
     let metrics_s2c = Arc::clone(&metrics);
     let responded_s2c = Arc::clone(&responded);
     let tx_total_s2c = Arc::clone(&tx_total);
+    let mut window = fragment::WindowRelease::new(server_fd, clamp > 0);
     let server_to_client = async move {
         let mut buffer = [0u8; crate::proxy::PUMP_BUF];
         let mut first_byte_seen = false;
@@ -269,6 +266,7 @@ pub async fn handle_connect(
             match server_reader.read(&mut buffer).await {
                 Ok(0) => { let _ = client_writer.shutdown().await; break; }
                 Ok(bytes_read) => {
+                    window.on_received(bytes_read);
                     if !first_byte_seen {
                         first_byte_seen = true;
                         responded_s2c.store(crate::bypass::tls::server_accepted(&buffer[..bytes_read]), Ordering::Relaxed);
