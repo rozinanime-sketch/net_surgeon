@@ -105,6 +105,39 @@ pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// память при множестве соединений.
 pub(crate) const PUMP_BUF: usize = 16 * 1024;
 
+/// Как часто сверять шлюз по умолчанию на Linux-десктопе.
+#[cfg(target_os = "linux")]
+const NETWORK_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Следит за сменой сети на Linux-десктопе — то же, что на Android делает
+/// колбэк ConnectivityManager.
+///
+/// Раньше id сети определялся один раз, при запуске прокси. Запущенный до
+/// подключения Wi-Fi прокси жил с пустым id, а после смены сети на ходу
+/// применял и сохранял стратегии прежней под её именем; подобранные под
+/// неё TTL и имя приманки тоже оставались. Сети нет вовсе (обрыв Wi-Fi) —
+/// ничего не меняем: короткий обрыв не должен сбрасывать подобранное.
+#[cfg(target_os = "linux")]
+async fn watch_network(log_tx: LogSender, token: CancellationToken) {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = tokio::time::sleep(NETWORK_CHECK) => {}
+        }
+        if let Some(id) = changed_network(&crate::engine::net_id::current(), crate::engine::net_id::detect()) {
+            log_t(&log_tx, LogLevel::Info, "log.network_changed", vec![("id", crate::engine::net_state::display_net_id(&id))]);
+            crate::engine::net_id::set(id);
+            crate::reset_network_tuning();
+        }
+    }
+}
+
+/// Новый id сети, если сеть сменилась; пустой (сети нет) — не смена.
+#[cfg(target_os = "linux")]
+fn changed_network(current: &str, detected: String) -> Option<String> {
+    (!detected.is_empty() && detected != current).then_some(detected)
+}
+
 /// Предупреждает, если hostfakesplit не смог сохранить `fake_sni` целиком:
 /// имя настоящего сайта короче, и DPI получил лишь окончание или случайное
 /// имя. Иначе смена `fake_sni` выглядела бы проверкой, а не проверяла
@@ -160,7 +193,10 @@ pub async fn run_all(
     // шлюзу. На Android маршрут по умолчанию ведёт в TUN, поэтому там id
     // приходит из Kotlin по колбэку смены сети, а здесь не трогается.
     #[cfg(target_os = "linux")]
-    crate::engine::net_id::set(crate::engine::net_id::detect());
+    {
+        crate::engine::net_id::set(crate::engine::net_id::detect());
+        tokio::spawn(watch_network(log_tx.clone(), token.clone()));
+    }
 
     let host = config.listen_host.clone();
     let listen_address = format!("{}:{}", host, config.port);
@@ -353,4 +389,19 @@ pub async fn run_all(
         transparent_task,
         transparent_udp_task
     );
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::changed_network;
+
+    #[test]
+    fn network_change_is_a_new_non_empty_gateway() {
+        // Запустились до подключения Wi-Fi — первый же шлюз и есть смена
+        assert_eq!(changed_network("", "gw:B2FD170A".into()).as_deref(), Some("gw:B2FD170A"));
+        assert_eq!(changed_network("gw:08EA590A", "gw:B2FD170A".into()).as_deref(), Some("gw:B2FD170A"));
+        // Та же сеть и обрыв (шлюза нет) — не смена
+        assert_eq!(changed_network("gw:B2FD170A", "gw:B2FD170A".into()), None);
+        assert_eq!(changed_network("gw:B2FD170A", String::new()), None);
+    }
 }
