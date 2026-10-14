@@ -27,8 +27,8 @@ android {
         // которую собирается Rust-часть (cargo ndk -P 26).
         minSdk = 26
         targetSdk = 36
-        versionCode = 31
-        versionName = "0.8.0"
+        versionCode = 32
+        versionName = "0.8.1"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
