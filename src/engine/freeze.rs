@@ -236,8 +236,11 @@ pub async fn escalate_on_freeze(
         // Сеть морозит незабелённый TLS: дальше по умолчанию предпочитаем decoy.
         set_prefer_decoy(true);
         log_t(log_tx, LogLevel::Warning, "log.freeze_detected", vec![("domain", domain.to_string())]);
-        if final_strategy != chosen {
-            log_t(log_tx, LogLevel::Success, "log.freeze_escalated", vec![("domain", domain.to_string())]);
+        if let Some(decoy) = final_strategy.filter(|_| final_strategy != chosen) {
+            log_t(log_tx, LogLevel::Success, "log.freeze_escalated", vec![
+                ("domain", domain.to_string()),
+                ("strategy", decoy.as_str().to_string()),
+            ]);
         }
     }
     Escalation { strategy: final_strategy, escalated: final_strategy != chosen }
@@ -260,15 +263,16 @@ where
     Fut: std::future::Future<Output = Verdict>,
 {
     let Some(current) = chosen else { return (chosen, false) };
-    if is_decoy(current) {
-        return (chosen, false); // уже подставляет имя — проверять нечего
-    }
+    // Приманка тоже проверяется: подставленное имя ещё не значит, что поток
+    // пройдёт. На Cloudflare fake проходил рукопожатие и замерзал на данных,
+    // а hostfakesplit — нет; раньше выбранную приманку не проверяли вовсе,
+    // и рабочую hostfakesplit сменяла замерзающая fake.
     if probe_fn(current).await != Verdict::Frozen {
-        return (chosen, false); // дешёвая техника переживает 16 КБ
+        return (chosen, false); // техника переживает заморозку
     }
-    // Дешёвая техника замёрзла: приманке хватает и полного короткого
+    // Выбранная замёрзла: другой приманке хватает и полного короткого
     // ответа — данные после рукопожатия дошли там, где раньше не дошли.
-    for decoy in SOCKET_DECOYS {
+    for decoy in SOCKET_DECOYS.into_iter().filter(|d| *d != current) {
         if matches!(probe_fn(decoy).await, Verdict::Survived | Verdict::Answered) {
             return (Some(decoy), true);
         }
@@ -417,9 +421,13 @@ mod tests {
             assert_eq!(idx.get(), verdicts.len(), "лишние или недостающие пробы");
             result
         }
-        // Нечего эскалировать: нет техники / уже decoy — пробы не запускаются.
+        // Нечего эскалировать: техники нет — пробы не запускаются.
         assert_eq!(go(None, &[]).await, (None, false));
-        assert_eq!(go(Some(Fake), &[]).await, (Some(Fake), false));
+        // Приманка тоже проверяется: прошла — остаётся
+        assert_eq!(go(Some(Fake), &[Survived]).await, (Some(Fake), false));
+        // Замёрзла — пробуются остальные, кроме неё самой
+        assert_eq!(go(Some(Fake), &[Frozen, Survived]).await, (Some(HostFakeSplit), true));
+        assert_eq!(go(Some(Fake), &[Frozen, Frozen, Answered]).await, (Some(FakeMultiDisorder), true));
         // Дешёвая техника переживает 16 КБ — оставляем, заморозки нет.
         assert_eq!(go(Some(TlsRecord), &[Survived]).await, (Some(TlsRecord), false));
         // Заморозка + hostfakesplit проходит → он первым, флаг ставится.

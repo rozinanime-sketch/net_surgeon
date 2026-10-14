@@ -230,7 +230,7 @@ log.strategy_other_size: "%{domain}: no strategy yet for a %{bytes}-byte ClientH
 log.auto_diag_started: "%{domain}: %{bytes}-byte ClientHello has no measured strategy — running diagnostics with the same size"
 log.auto_diag_chosen: "%{domain}: strategy chosen for a %{bytes}-byte ClientHello — %{strategy}"
 log.freeze_detected: "%{domain}: connection freezes after ~16 KB — the network needs a whitelisted decoy"
-log.freeze_escalated: "%{domain}: switched to fake decoy — it survives past 16 KB"
+log.freeze_escalated: "%{domain}: switched to the %{strategy} decoy — data gets past the freeze with it"
 log.auto_diag_nothing: "%{domain}: no technique worked for a %{bytes}-byte ClientHello — leaving it alone, will re-check in an hour"
 log.auto_diag_unreachable: "%{domain}: server unreachable while diagnosing a %{bytes}-byte ClientHello (network or IP block) — not recording a verdict, retrying in 10 minutes"
 strategy.disorder: "disorder"

@@ -230,7 +230,7 @@ log.strategy_other_size: "%{domain}: для ClientHello %{bytes} байт стр
 log.auto_diag_started: "%{domain}: ClientHello %{bytes} байт без измеренной стратегии — запускаю диагностику с таким же размером"
 log.auto_diag_chosen: "%{domain}: для ClientHello %{bytes} байт выбрана стратегия — %{strategy}"
 log.freeze_detected: "%{domain}: соединение замерзает после ~16 КБ — сети нужна приманка с разрешённым именем"
-log.freeze_escalated: "%{domain}: переключено на приманку fake — она проходит за 16 КБ"
+log.freeze_escalated: "%{domain}: переключено на приманку %{strategy} — с ней данные идут дальше заморозки"
 log.auto_diag_nothing: "%{domain}: для ClientHello %{bytes} байт не сработала ни одна техника — домен не трогаю, перепроверю через час"
 log.auto_diag_unreachable: "%{domain}: сервер недоступен во время диагностики ClientHello %{bytes} байт (сеть или блокировка по IP) — вердикт не записываю, повтор через 10 минут"
 strategy.disorder: "перестановка (disorder)"
