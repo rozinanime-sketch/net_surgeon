@@ -355,6 +355,7 @@ async fn handle_connect(
     let client_port = stream.peer_addr().ok().map(|a| a.port());
 
     let (mut cr, mut cw) = stream.split();
+    let server_ip = server.peer_addr().ok().map(|a| a.ip());
     let (mut sr, mut sw) = server.split();
 
     // Байты считаются в обе стороны. Раньше их здесь не считал никто:
@@ -520,6 +521,11 @@ async fn handle_connect(
     // Трафик соединения — его домену. Итоги уже посчитаны обоими
     // направлениями, лишних счётчиков не нужно.
     metrics.record_domain_traffic(&client.domain, client.up.bytes, down.bytes);
+
+    // Белое имя сети: сайт на Cloudflare открылся без обхода и отдал данные.
+    if let Some(ip) = server_ip {
+        crate::bypass::whitelist::observe(&crate::engine::net_id::current(), ip, &client.domain, down.bytes, client.bypass);
+    }
 
     // Итог соединения — только для доменов с обходом, иначе лог утонет.
     // Без него обрыв после рукопожатия не виден: блокировка, которая

@@ -132,6 +132,7 @@ pub async fn handle_connect(
     }
 
     // Дескриптор до разделения: disorder и oob работают с сокетом напрямую.
+    let server_ip = server_stream.peer_addr().ok().map(|a| a.ip());
     let server_fd = crate::bypass::socket::raw_sock(&server_stream);
 
     let (mut client_reader, mut client_writer) = client_stream.into_split();
@@ -320,6 +321,11 @@ pub async fn handle_connect(
 
     // Трафик соединения — его домену, один раз (см. record_domain_traffic).
     metrics.record_domain_traffic(&domain, rx_total.load(Ordering::Relaxed), tx_total.load(Ordering::Relaxed));
+
+    // Белое имя сети: сайт на Cloudflare открылся без обхода и отдал данные.
+    if let Some(ip) = server_ip {
+        crate::bypass::whitelist::observe(&crate::engine::net_id::current(), ip, &domain, tx_total.load(Ordering::Relaxed), needs);
+    }
 
     // Обратная связь по применённой стратегии. Раньше решение принималось
     // по нескольким пробам и дальше жило сутки без единой проверки.

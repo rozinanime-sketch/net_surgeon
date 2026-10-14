@@ -26,9 +26,24 @@ pub fn for_hello(hello: &[u8], config: &str) -> String {
     }
 }
 
-/// Запоминает имя приманки, с которым у домена прошёл обход.
+/// Запоминает имя приманки, с которым у домена прошёл обход: и для домена
+/// (в бою берётся сразу), и в белый список сети (его пробует диагностика
+/// других доменов).
 pub fn note_working(domain: &str, name: &str) {
     net_state::note_decoy_name(domain, name);
+    super::whitelist::note(&net_state::net_id(), name);
+}
+
+/// Имена для перебора приманкой в диагностике: сперва собранные белые имена
+/// текущей сети (`whitelist`), затем запасные из конфига. Без повторов.
+pub fn sweep_candidates(config: &[String]) -> Vec<String> {
+    let mut out = super::whitelist::names(&net_state::net_id());
+    for name in config {
+        if !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            out.push(name.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]

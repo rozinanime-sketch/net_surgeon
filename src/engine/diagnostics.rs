@@ -976,12 +976,13 @@ async fn diagnose_with(
     if !packet_mode && crate::bypass::socket::fake_supported() && decoys_failed {
         let mut probe_params = bypass_params.clone();
         probe_params.fake_ttl = swept_ttl.unwrap_or_else(|| crate::bypass::fake_ttl::effective(bypass_params.fake_ttl));
-        let candidates = bypass_params
-            .fake_sni_candidates
-            .iter()
+        // Сперва собранные белые имена сети, затем запасные из конфига.
+        let candidates: Vec<String> = crate::bypass::fake_sni::sweep_candidates(&bypass_params.fake_sni_candidates)
+            .into_iter()
             .filter(|name| !name.eq_ignore_ascii_case(&bypass_params.fake_sni))
-            .take(MAX_DECOY_CANDIDATES);
-        for name in candidates {
+            .take(MAX_DECOY_CANDIDATES)
+            .collect();
+        for name in &candidates {
             probe_params.fake_sni = name.clone();
             let score = trials(&target, domain, FragStrategy::Fake, &probe_params, trials_count, early_abandon, timing).await;
             if score.is_convincing() {

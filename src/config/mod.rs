@@ -279,7 +279,11 @@ fn default_fake_sni() -> String { "www.google.com".to_string() }
 /// догадка, а не проверенный список: какие имена пропускает DPI конкретной
 /// сети, видно только по диагностике.
 fn default_fake_sni_candidates() -> Vec<String> {
-    ["vk.com", "ya.ru", "www.gosuslugi.ru", "www.ozon.ru", "www.wildberries.ru"]
+    // Короткие имена с Cloudflare: годятся и для hostfakesplit (длина
+    // подделки должна совпасть с коротким именем вроде discord.com). Это
+    // стартовый набор — рабочие имена для сети прокси собирает в
+    // whitelist_sni.txt сам (bypass::whitelist).
+    ["di.fm", "4pda.to", "zoom.us", "roblox.com", "gitlab.com", "notion.so", "fandom.com", "shopify.com"]
         .into_iter()
         .map(String::from)
         .collect()

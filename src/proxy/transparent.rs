@@ -576,6 +576,9 @@ async fn handle(
     // Трафик соединения — его домену (см. Metrics::record_domain_traffic).
     metrics.record_domain_traffic(&domain, rx_total.load(Ordering::Relaxed), tx_total.load(Ordering::Relaxed));
 
+    // Белое имя сети: сайт на Cloudflare открылся без обхода и отдал данные.
+    crate::bypass::whitelist::observe(&crate::engine::net_id::current(), target_addr.ip(), &domain, tx_total.load(Ordering::Relaxed), wants_bypass);
+
     // Обратная связь по стратегии — та же, что в остальных режимах.
     let worked = crate::proxy::adaptive::handshake_completed(&selected, responded, rx_total.load(Ordering::Relaxed));
     crate::proxy::adaptive::record_outcome(&adaptive_ctx, &domain, selected, worked);

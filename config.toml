@@ -182,10 +182,13 @@ fake_clone = true
 hostfakesplit_midhost = false
 hostfakesplit_disorder_after = false
 # Запасные имена для приманки («белый SNI»). Если с fake_sni не прошла ни
-# одна приманка, диагностика пробует эти по очереди и запоминает рабочее для
-# домена до смены сети. Список — догадка: какие имена пропускает DPI вашей
-# сети, видно только по диагностике. Пустой — не перебирать.
-fake_sni_candidates = ["vk.com", "ya.ru", "www.gosuslugi.ru", "www.ozon.ru", "www.wildberries.ru"]
+# одна приманка, диагностика пробует эти по очереди и запоминает рабочее.
+# Короткие имена (≤11 символов) годятся и для hostfakesplit. Это лишь
+# стартовый набор: рабочие для вашей сети имена прокси собирает сам в
+# whitelist_sni.txt (сайты на Cloudflare, что открылись без обхода, плюс
+# имена, с которыми прошла приманка). Тот файл можно и править руками.
+# Пустой список — перебирать только собранные имена.
+fake_sni_candidates = ["di.fm", "4pda.to", "zoom.us", "roblox.com", "gitlab.com", "notion.so", "fandom.com", "shopify.com"]
 
 [socks5_junk]
 count = 6

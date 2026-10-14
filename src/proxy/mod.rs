@@ -220,6 +220,7 @@ pub async fn run_all(
         log_t(&log_tx, LogLevel::Warning, "log.smart_dns_replaced", vec![("provider", config.smart_dns_provider.clone())]);
     }
     crate::dns::smart::reload(&config.smart_dns_provider, &log_tx);
+    crate::bypass::whitelist::reload();
     // Резолверы — по этому же конфигу: провайдер мог смениться.
     crate::dns::resolver::init(
         config.resolve_via_doh,
