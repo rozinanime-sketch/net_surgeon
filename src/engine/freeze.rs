@@ -60,6 +60,11 @@ pub enum Verdict {
     Survived,
     /// Поток встал после начала данных, но раньше порога — заморозка.
     Frozen,
+    /// Сервер ответил целиком, но меньше порога: заморозку так не проверить,
+    /// зато данные после рукопожатия дошли. Для приманки после заморозки
+    /// дешёвой техники — успех: у вебсокет-адресов (gateway.discord.gg)
+    /// ответ на обычный запрос короткий, и 16 КБ не набрать никогда.
+    Answered,
     /// Проверить не удалось (ресурс мал, ошибка сети/TLS) — не улика.
     Inconclusive,
 }
@@ -154,7 +159,11 @@ async fn probe_inner(socks_port: u16, host: &str, strategy: Strategy) -> Verdict
         match tokio::time::timeout(READ_POLL, tls.read(&mut buf)).await {
             // Чистый конец потока: сервер отдал всё.
             Ok(Ok(0)) => {
-                return if total >= 16 * 1024 { Verdict::Survived } else { Verdict::Inconclusive };
+                return match total {
+                    t if t >= 16 * 1024 => Verdict::Survived,
+                    0 => Verdict::Inconclusive,
+                    _ => Verdict::Answered,
+                };
             }
             Ok(Ok(n)) => {
                 total += n;
@@ -165,9 +174,9 @@ async fn probe_inner(socks_port: u16, host: &str, strategy: Strategy) -> Verdict
                 response.feed(&buf[..n]);
                 // Ответ пришёл целиком, а сервер держит соединение вопреки
                 // `Connection: close`: дальше будет тишина, но не заморозка.
-                // Ресурс мал для проверки.
+                // Ресурс мал для проверки, но ответ дошёл.
                 if response.complete() {
-                    return Verdict::Inconclusive;
+                    return Verdict::Answered;
                 }
             }
             // Обрыв, не дождавшись 16 КБ, — та же заморозка, только DPI
@@ -257,8 +266,10 @@ where
     if probe_fn(current).await != Verdict::Frozen {
         return (chosen, false); // дешёвая техника переживает 16 КБ
     }
+    // Дешёвая техника замёрзла: приманке хватает и полного короткого
+    // ответа — данные после рукопожатия дошли там, где раньше не дошли.
     for decoy in SOCKET_DECOYS {
-        if probe_fn(decoy).await == Verdict::Survived {
+        if matches!(probe_fn(decoy).await, Verdict::Survived | Verdict::Answered) {
             return (Some(decoy), true);
         }
     }
@@ -392,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_escalates_only_on_freeze_and_when_a_decoy_survives() {
         use Strategy::{Fake, FakeMultiDisorder, HostFakeSplit, TlsRecord};
-        use Verdict::{Frozen, Inconclusive, Survived};
+        use Verdict::{Answered, Frozen, Inconclusive, Survived};
         // Прогоняет resolve с заранее заданными вердиктами проб по порядку.
         async fn go(chosen: Option<Strategy>, verdicts: &[Verdict]) -> (Option<Strategy>, bool) {
             let idx = std::cell::Cell::new(0);
@@ -417,6 +428,10 @@ mod tests {
         assert_eq!(go(Some(TlsRecord), &[Frozen, Frozen, Survived]).await, (Some(Fake), true));
         // Не проверились hostfakesplit и fake, fake+multidisorder прошёл → он.
         assert_eq!(go(Some(TlsRecord), &[Frozen, Inconclusive, Inconclusive, Survived]).await, (Some(FakeMultiDisorder), true));
+        // Короткий, но полный ответ после приманки — тоже успех
+        assert_eq!(go(Some(TlsRecord), &[Frozen, Answered]).await, (Some(HostFakeSplit), true));
+        // А у дешёвой техники — не повод эскалировать
+        assert_eq!(go(Some(TlsRecord), &[Answered]).await, (Some(TlsRecord), false));
         // Все приманки морозят → остаёмся, но заморозку зафиксировали.
         assert_eq!(go(Some(TlsRecord), &[Frozen, Frozen, Frozen, Frozen]).await, (Some(TlsRecord), true));
     }
