@@ -399,8 +399,14 @@ pub fn is_probe_template(hello: &[u8]) -> bool {
 /// синтетические пробы к Discord проходили почти в половине случаев даже
 /// без обхода, а настоящий ClientHello curl и Discord — ни разу. Диагностика
 /// на синтетике выбирала «рабочую» технику, которая в бою не работала.
-pub fn probe_from(template: &[u8], sni: &str) -> Option<Vec<u8>> {
-    let mut copy = clone_client_hello(template, sni)?;
+///
+/// `size` — нужный размер: шаблон другого класса (короткий ClientHello
+/// программы для браузерной пробы) доводится до него расширением padding.
+/// Не выходит — копия размера шаблона.
+pub fn probe_from(template: &[u8], sni: &str, size: usize) -> Option<Vec<u8>> {
+    let parsed = ParsedHello::parse(template)?;
+    let name = sni.trim_end_matches('.').as_bytes();
+    let mut copy = parsed.rebuild(name, size).or_else(|| clone_client_hello(template, sni))?;
     // session id: длина в байте 43 (после заголовков и random)
     let sid_len = *copy.get(43)? as usize;
     copy.get_mut(44..44 + sid_len)?.copy_from_slice(&super::random::bytes(sid_len));
@@ -849,7 +855,7 @@ mod tests {
     fn probe_copies_the_fingerprint_but_not_the_session() {
         let real = build_client_hello_sized("gateway.discord.gg", 1850);
         assert!(is_probe_template(&real));
-        let probe = probe_from(&real, "discord.com").unwrap();
+        let probe = probe_from(&real, "discord.com", real.len()).unwrap();
         assert_eq!(sni_host(&probe).as_deref(), Some("discord.com"));
         assert_eq!(probe.len(), real.len());
         assert_ne!(session_id(&probe), session_id(&real));
@@ -866,6 +872,18 @@ mod tests {
         body.extend_from_slice(&ext);
         assert!(!is_probe_template(&wrap_client_hello(&body)));
         assert!(!is_probe_template(b"GET / HTTP/1.1\r\n"));
+    }
+
+    /// Короткий шаблон (rustls, как у обновлятора Discord) доводится до
+    /// браузерного размера padding'ом: отпечаток тот же, размер нужный.
+    #[test]
+    fn short_template_is_padded_to_the_probe_size() {
+        let short = build_decoy_hello("updates.discord.com", 268).unwrap();
+        let probe = probe_from(&short, "discord.com", 1850).unwrap();
+        assert_eq!(probe.len(), 1850);
+        assert_eq!(sni_host(&probe).as_deref(), Some("discord.com"));
+        let without_padding = |h: &[u8]| ext_types(h).into_iter().filter(|t| *t != 0x0015).collect::<Vec<_>>();
+        assert_eq!(without_padding(&probe), without_padding(&short));
     }
 
     /// decoy_for: копия, если просили и она подходит по длине; иначе — с нуля.

@@ -200,10 +200,23 @@ fn template_slot(class: crate::engine::strategy::HelloClass) -> &'static std::sy
 /// Discord он проходил почти в половине проб даже без обхода, а настоящий не
 /// прошёл ни разу ни с одной техникой. Диагностика на синтетике выбирала
 /// «рабочую» технику, которая в бою не работала.
+///
+/// Шаблона своего класса нет — берётся другой и доводится до размера: в
+/// пакетном режиме браузерный ClientHello целиком не виден (он длиннее
+/// сегмента, а в очередь попадает только первый), и шаблоном остаётся лишь
+/// короткий — у программ вроде обновлятора Discord.
 pub fn probe_hello(domain: &str, size: usize) -> (Vec<u8>, bool) {
-    let class = crate::engine::strategy::HelloClass::of(size);
-    let template = template_slot(class).lock().unwrap_or_else(|e| e.into_inner()).clone();
-    match template.and_then(|t| crate::bypass::tls::probe_from(&t, domain)) {
+    use crate::engine::strategy::HelloClass;
+    let class = HelloClass::of(size);
+    let other = if class == HelloClass::Large { HelloClass::Small } else { HelloClass::Large };
+    let template = |c| template_slot(c).lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let probe = template(class)
+        .or_else(|| template(other))
+        .and_then(|t| crate::bypass::tls::probe_from(&t, domain, size))
+        // Короче шаблона копию не сделать: проба другого класса мерила бы
+        // не тот пакет, что в бою.
+        .filter(|p| HelloClass::of(p.len()) == class);
+    match probe {
         Some(probe) => (probe, true),
         None => (crate::bypass::tls::build_client_hello_sized(domain, size), false),
     }
