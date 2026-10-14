@@ -139,6 +139,12 @@ fn report_diagnostics(log_tx: &LogSender, domain: &str, result: &crate::engine::
         ]);
     }
 
+    // Синтетический ClientHello DPI видит иначе, чем настоящий: такой
+    // результат может не совпасть с боем (см. diagnostics::probe_hello).
+    log::log_t(log_tx, LogLevel::Info, if result.probe_from_battle { "log.probe_from_battle" } else { "log.probe_synthetic" }, vec![
+        ("domain", domain.to_string()),
+    ]);
+
     if let Some(name) = &result.decoy_sni {
         log::log_t(log_tx, LogLevel::Success, "log.decoy_sni_found", vec![
             ("domain", domain.to_string()),

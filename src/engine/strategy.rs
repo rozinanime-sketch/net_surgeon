@@ -1108,6 +1108,7 @@ mod tests {
             host_fake_split: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             faked_split: SplitScore { successes: 0, attempts: 3, confidence: 0.0, median_ms: None },
             decoy_sni: None,
+            probe_from_battle: false,
         }
     }
 

@@ -361,14 +361,14 @@ impl Env for LinuxEnv {
     fn needs_bypass(&self, domain: &str) -> bool {
         needs_bypass(self.is_enabled, domain, &self.bypass_domains)
     }
-    fn select(&self, domain: &str, hello_len: usize) -> Selected {
+    fn select(&self, domain: &str, hello: &[u8]) -> Selected {
         // Стратегии измеряют сокетные пробы (общий StrategyStore), а пакетный
         // режим их только применяет. Поэтому `source` зануляется: движок
         // считает поток сразу решённым (Kind::Done) и не ждёт входящего ответа
         // для подтверждения — входящие мы намеренно не заворачиваем, чтобы не
         // гнать скачивание через userspace. Без этого поток завис бы в
         // Awaiting и по таймауту записал бы ложный провал.
-        let mut selected = adaptive::select_packet(&self.adaptive(), domain, hello_len);
+        let mut selected = adaptive::select_packet(&self.adaptive(), domain, hello);
         selected.source = None;
         selected
     }
@@ -735,7 +735,7 @@ mod tests {
         fn needs_bypass(&self, _: &str) -> bool {
             false
         }
-        fn select(&self, _: &str, _: usize) -> Selected {
+        fn select(&self, _: &str, _: &[u8]) -> Selected {
             Selected::DIRECT
         }
         fn record(&self, _: &str, _: Selected, _: bool) {}
@@ -797,7 +797,7 @@ mod tests {
         fn needs_bypass(&self, _: &str) -> bool {
             true
         }
-        fn select(&self, _: &str, _: usize) -> Selected {
+        fn select(&self, _: &str, _: &[u8]) -> Selected {
             Selected::new(crate::engine::strategy::Strategy::Disorder, None)
         }
         fn record(&self, _: &str, _: Selected, _: bool) {}

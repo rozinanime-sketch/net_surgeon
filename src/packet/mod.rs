@@ -344,8 +344,8 @@ mod imp {
         fn needs_bypass(&self, domain: &str) -> bool {
             needs_bypass(self.policy.is_enabled, domain, &self.policy.bypass_domains)
         }
-        fn select(&self, domain: &str, hello_len: usize) -> Selected {
-            adaptive::select_packet(&self.adaptive(), domain, hello_len)
+        fn select(&self, domain: &str, hello: &[u8]) -> Selected {
+            adaptive::select_packet(&self.adaptive(), domain, hello)
         }
         fn record(&self, domain: &str, selected: Selected, responded: bool) {
             adaptive::record_outcome(&self.adaptive(), domain, selected, responded);

@@ -167,9 +167,45 @@ const MAX_PROBE_HELLO: usize = 5 + 16384;
 /// байт, и любая зашитая константа рано или поздно устареет так же.
 /// Маленькие пакеты (программы, rustls) не учитываются: их мерит
 /// автодиагностика своим размером, по классам.
-pub fn note_battle_hello(len: usize) {
+///
+/// Сам пакет тоже запоминается — шаблоном проб (см. [`probe_hello`]), по
+/// одному на класс: браузерный и короткий (программы на rustls).
+pub fn note_battle_hello(hello: &[u8]) {
+    let len = crate::bypass::tls::client_hello_len(hello);
     if is_browser_sized(len) {
         OBSERVED_BROWSER_HELLO.store(len, std::sync::atomic::Ordering::Relaxed);
+    }
+    if crate::bypass::tls::is_probe_template(hello) {
+        let slot = template_slot(crate::engine::strategy::HelloClass::of(len));
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hello.to_vec());
+    }
+}
+
+/// Последний ClientHello из боя для класса размера.
+fn template_slot(class: crate::engine::strategy::HelloClass) -> &'static std::sync::Mutex<Option<Vec<u8>>> {
+    use crate::engine::strategy::HelloClass;
+    static LARGE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+    static SMALL: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+    match class {
+        HelloClass::Large => &LARGE,
+        _ => &SMALL,
+    }
+}
+
+/// ClientHello для пробы домена: копия настоящего из боя того же класса
+/// размера с именем `domain` (`tls::probe_from`), а пока в бою не было ни
+/// одного — собранный с нуля. Второе значение — взят ли образец из боя.
+///
+/// Синтетический ClientHello DPI видит не так, как настоящий: в дампе к
+/// Discord он проходил почти в половине проб даже без обхода, а настоящий не
+/// прошёл ни разу ни с одной техникой. Диагностика на синтетике выбирала
+/// «рабочую» технику, которая в бою не работала.
+pub fn probe_hello(domain: &str, size: usize) -> (Vec<u8>, bool) {
+    let class = crate::engine::strategy::HelloClass::of(size);
+    let template = template_slot(class).lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match template.and_then(|t| crate::bypass::tls::probe_from(&t, domain)) {
+        Some(probe) => (probe, true),
+        None => (crate::bypass::tls::build_client_hello_sized(domain, size), false),
     }
 }
 
@@ -340,6 +376,9 @@ pub struct DiagnosticResult {
     /// Имя приманки из `fake_sni_candidates`, с которым прошла приманка, —
     /// если с `fake_sni` не прошла ни одна (см. `bypass::fake_sni`).
     pub decoy_sni: Option<String>,
+    /// Пробы — копии настоящего ClientHello из боя, а не собранные с нуля
+    /// (см. [`probe_hello`]).
+    pub probe_from_battle: bool,
 }
 
 fn classify_write_error(_e: &std::io::Error) -> ProbeOutcome { ProbeOutcome::ResetOnWrite }
@@ -646,7 +685,8 @@ async fn diagnose_with(
     // Раньше один пакет уходил сначала прямой пробой, а затем им же
     // проверялись все техники — и все проваливались: ложный `resigned` там,
     // где браузер (он шлёт свежий ClientHello на каждое соединение) проходил.
-    let fresh_hello = || crate::bypass::tls::build_client_hello_sized(domain, timing.hello_size);
+    let fresh_hello = || probe_hello(domain, timing.hello_size).0;
+    let from_battle = probe_hello(domain, timing.hello_size).1;
 
     let empty = SplitScore {
             successes: 0, attempts: 0, confidence: 0.0, median_ms: None };
@@ -686,7 +726,7 @@ async fn diagnose_with(
                 tokio::time::sleep(Duration::from_millis(gap)).await;
             }
 
-            let hello = crate::bypass::tls::build_client_hello_sized(domain, timing.hello_size);
+            let hello = probe_hello(domain, timing.hello_size).0;
             let (outcome, ms) = probe_tcp(target, &hello, strategy, bypass_params).await;
             if outcome == ProbeOutcome::ConnectFailed {
                 unreachable_in_row += 1;
@@ -745,6 +785,7 @@ async fn diagnose_with(
             host_fake_split: empty,
             faked_split: empty,
             decoy_sni: None,
+            probe_from_battle: from_battle,
         };
     }
 
@@ -774,6 +815,7 @@ async fn diagnose_with(
             host_fake_split: empty,
             faked_split: empty,
             decoy_sni: None,
+            probe_from_battle: from_battle,
         };
     }
 
@@ -793,6 +835,7 @@ async fn diagnose_with(
             host_fake_split: empty,
             faked_split: empty,
             decoy_sni: None,
+            probe_from_battle: from_battle,
         };
     }
 
@@ -818,6 +861,7 @@ async fn diagnose_with(
             host_fake_split: empty,
             faked_split: empty,
             decoy_sni: None,
+            probe_from_battle: from_battle,
         };
     }
 
@@ -971,12 +1015,24 @@ async fn diagnose_with(
         probe_quic(domain).await
     };
 
-    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake, seqovl, fake_multidisorder, host_fake_split, faked_split, decoy_sni }
+    DiagnosticResult { direct, quic, tls_record, sni_split, disorder, oob, fake, seqovl, fake_multidisorder, host_fake_split, faked_split, decoy_sni, probe_from_battle: from_battle }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Увиденный в бою ClientHello становится образцом проб: копия с
+    /// именем проверяемого домена того же размера.
+    #[test]
+    fn probes_copy_the_battle_hello() {
+        let battle = crate::bypass::tls::build_client_hello_sized("gateway.discord.gg", 1850);
+        note_battle_hello(&battle);
+        let (probe, from_battle) = probe_hello("discord.com", 1850);
+        assert!(from_battle);
+        assert_eq!(crate::bypass::tls::sni_host(&probe).as_deref(), Some("discord.com"));
+        assert_eq!(crate::engine::strategy::HelloClass::of(probe.len()), crate::engine::strategy::HelloClass::Large);
+    }
     use tokio::net::TcpListener;
 
     fn params() -> BypassParams {

@@ -431,7 +431,7 @@ async fn handle_connect(
             if let Some(forced) = client_port.and_then(crate::engine::probe_force::take) {
                 selected = crate::proxy::adaptive::Selected::new(forced, None);
             } else if wants_bypass {
-                selected = crate::proxy::adaptive::select(&adaptive_ctx, &domain, crate::bypass::tls::client_hello_len(&initial));
+                selected = crate::proxy::adaptive::select(&adaptive_ctx, &domain, &initial);
             }
 
             match crate::engine::strategy::apply::first_packet(&mut sw, server_fd, &initial, selected.strategy, bypass_params).await {

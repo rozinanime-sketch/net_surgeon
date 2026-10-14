@@ -313,6 +313,8 @@ log.fake_multidisorder_applied: "fake+multidisorder: decoy %{decoy} B, parts %{f
 log.hostfakesplit_applied: "hostfakesplit: %{before} B, host %{host} B after a fake \"%{fake}\"%{options}, %{after} B — %{domain}"
 log.fake_sni_unfit: "hostfakesplit: fake_sni \"%{fake_sni}\" is longer than the site name (%{len} B) and did not fit whole — DPI got \"%{fake}\". To test a fake_sni, pick a name no longer than the target sites' names"
 log.decoy_sni_found: "%{domain}: the decoy got through with the name \"%{name}\" — it will be used in decoys for this domain until the network changes"
+log.probe_from_battle: "Diagnosis of %{domain}: probes are copies of the ClientHello your client sends in battle"
+log.probe_synthetic: "Diagnosis of %{domain}: probes are a synthetic ClientHello (none seen in battle yet): DPI may treat it differently from a real one — open the site and diagnose again"
 log.fake_score: "fake decoy — %{domain}: %{successes}/%{attempts} successes, confidence %{confidence}, median %{median} ms"
 log.fake_multidisorder_score: "fake + multidisorder — %{domain}: %{successes}/%{attempts} successes, confidence %{confidence}, median %{median} ms"
 log.host_fake_split_score: "Fake host (hostfakesplit) — %{domain}: %{successes}/%{attempts} successes, confidence %{confidence}, median %{median} ms"

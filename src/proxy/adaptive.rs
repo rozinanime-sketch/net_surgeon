@@ -79,8 +79,11 @@ pub struct Context<'a> {
 }
 
 /// Стратегия для соединения, которому нужен обход.
-pub fn select(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selected {
-    select_with(ctx, domain, hello_len, false)
+///
+/// `hello` — первый пакет клиента (ClientHello): по его размеру выбирается
+/// класс стратегии, а сам он становится образцом для проб диагностики.
+pub fn select(ctx: &Context<'_>, domain: &str, hello: &[u8]) -> Selected {
+    select_with(ctx, domain, hello, false)
 }
 
 /// То же для перехвата пакетов (Windows): он умеет не всё.
@@ -91,11 +94,15 @@ pub fn select(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selected {
 /// неё что-то «похожее» значило бы получать провалы, сбрасывать запись и
 /// снова мерить то же самое по кругу.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn select_packet(ctx: &Context<'_>, domain: &str, hello_len: usize) -> Selected {
-    select_with(ctx, domain, hello_len, true)
+pub fn select_packet(ctx: &Context<'_>, domain: &str, hello: &[u8]) -> Selected {
+    select_with(ctx, domain, hello, true)
 }
 
-fn select_with(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) -> Selected {
+fn select_with(ctx: &Context<'_>, domain: &str, hello: &[u8], packet: bool) -> Selected {
+    let hello_len = crate::bypass::tls::client_hello_len(hello);
+    // Ручная и массовая диагностика мерят пакетом того же размера и вида,
+    // что шлёт клиент: все боевые пути проходят здесь.
+    diagnostics::note_battle_hello(hello);
     Selected { hello_len, ..choose(ctx, domain, hello_len, packet) }
 }
 
@@ -108,9 +115,6 @@ fn choose(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) -> Se
         _ => !packet || crate::bypass::packet_mode::supports(s),
     };
     let class = HelloClass::of(hello_len);
-    // Ручная и массовая диагностика мерят пакетом того же размера, что
-    // шлёт браузер: все три боевых пути проходят здесь.
-    diagnostics::note_battle_hello(hello_len);
 
     if let Some((cached, kind)) = ctx.strategies.lookup_detailed(domain, class, ctx.ttl_hours)
         && usable(cached)
@@ -313,6 +317,11 @@ fn spawn_diagnosis(ctx: &Context<'_>, domain: &str, class: HelloClass, hello_len
 mod tests {
     use super::*;
 
+    /// ClientHello ровно в `len` байт: по длине выбирается класс стратегии.
+    fn hello(len: usize) -> Vec<u8> {
+        crate::bypass::tls::build_decoy_hello("probe.example", len).expect("ClientHello такой длины")
+    }
+
     fn ctx_parts() -> (Arc<StrategyStore>, BypassParams, LogSender) {
         let (tx, _rx) = crate::observability::logging::channel();
         let params: BypassParams = toml::from_str(
@@ -342,7 +351,7 @@ mod tests {
         store.claim_auto_diagnosis("gateway.discord.gg", HelloClass::Large, AUTO_DIAGNOSIS_COOLDOWN);
         let ctx = Context { strategies: &store, bypass_params: &params, ttl_hours: 24, log_tx: &tx };
 
-        let selected = select(&ctx, "gateway.discord.gg", 1800);
+        let selected = select(&ctx, "gateway.discord.gg", &hello(1800));
         assert_eq!(selected.hello_len, 1800);
         for _ in 0..3 {
             record_outcome(&ctx, "gateway.discord.gg", selected, false);
@@ -359,7 +368,7 @@ mod tests {
         store.claim_auto_diagnosis("updates.discord.com", HelloClass::Small, AUTO_DIAGNOSIS_COOLDOWN);
 
         let ctx = Context { strategies: &store, bypass_params: &params, ttl_hours: 24, log_tx: &tx };
-        let selected = select(&ctx, "updates.discord.com", 273);
+        let selected = select(&ctx, "updates.discord.com", &hello(273));
         assert_eq!(selected.strategy, Strategy::SniSplit);
         assert_eq!(selected.source, None);
 
@@ -379,15 +388,15 @@ mod tests {
         let ctx = Context { strategies: &store, bypass_params: &params, ttl_hours: 24, log_tx: &tx };
 
         // Домен не измерялся вовсе
-        let small = select(&ctx, "stable.dl2.discordapp.net", 274);
+        let small = select(&ctx, "stable.dl2.discordapp.net", &hello(274));
         assert_eq!((small.strategy, small.source), (Strategy::Oob, None));
         // Большому пакету по-прежнему достаются две TLS-записи
-        let large = select(&ctx, "stable.dl2.discordapp.net", 1800);
+        let large = select(&ctx, "stable.dl2.discordapp.net", &hello(1800));
         assert_eq!(large.strategy, Strategy::TlsRecord);
 
         // Две TLS-записи большого пакета маленькому не одалживаются
         store.set("updates.discord.com", HelloClass::Large, Strategy::TlsRecord, 0.44);
-        let borrowed = select(&ctx, "updates.discord.com", 273);
+        let borrowed = select(&ctx, "updates.discord.com", &hello(273));
         assert_eq!((borrowed.strategy, borrowed.source), (Strategy::Oob, None));
     }
 
@@ -400,11 +409,11 @@ mod tests {
         store.claim_auto_diagnosis("stable.dl2.discordapp.net", HelloClass::Small, AUTO_DIAGNOSIS_COOLDOWN);
 
         let ctx = Context { strategies: &store, bypass_params: &params, ttl_hours: 24, log_tx: &tx };
-        let small = select(&ctx, "stable.dl2.discordapp.net", 274);
+        let small = select(&ctx, "stable.dl2.discordapp.net", &hello(274));
         assert_eq!((small.strategy, small.source), (unmeasured_default(HelloClass::Small), None));
 
         // Сам большой пакет отказ соблюдает
-        let large = select(&ctx, "stable.dl2.discordapp.net", 1800);
+        let large = select(&ctx, "stable.dl2.discordapp.net", &hello(1800));
         assert_eq!((large.strategy, large.source), (Strategy::None, Some(HelloClass::Large)));
     }
 
@@ -416,7 +425,7 @@ mod tests {
         store.set("flaky.example.com", HelloClass::Large, Strategy::None, 1.0);
         let ctx = Context { strategies: &store, bypass_params: &params, ttl_hours: 24, log_tx: &tx };
 
-        let selected = select(&ctx, "flaky.example.com", 1800);
+        let selected = select(&ctx, "flaky.example.com", &hello(1800));
         assert_eq!((selected.strategy, selected.source), (Strategy::None, Some(HelloClass::Large)));
         for _ in 0..3 {
             record_outcome(&ctx, "flaky.example.com", selected, false);
@@ -431,9 +440,9 @@ mod tests {
         store.set("updates.discord.com", HelloClass::Small, Strategy::Oob, 0.44);
 
         let ctx = Context { strategies: &store, bypass_params: &params, ttl_hours: 24, log_tx: &tx };
-        let small = select(&ctx, "updates.discord.com", 273);
+        let small = select(&ctx, "updates.discord.com", &hello(273));
         assert_eq!((small.strategy, small.source), (Strategy::Oob, Some(HelloClass::Small)));
-        let large = select(&ctx, "updates.discord.com", 1800);
+        let large = select(&ctx, "updates.discord.com", &hello(1800));
         assert_eq!((large.strategy, large.source), (Strategy::TlsRecord, Some(HelloClass::Large)));
     }
 }

@@ -179,7 +179,7 @@ pub async fn handle_connect(
                 ttl_hours: strategy_ttl_hours,
                 log_tx: &log_tx_c2s,
             };
-            super::adaptive::select(&ctx, &domain_c2s, crate::bypass::tls::client_hello_len(&first))
+            super::adaptive::select(&ctx, &domain_c2s, &first)
         } else {
             Selected::DIRECT
         };

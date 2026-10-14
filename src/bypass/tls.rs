@@ -383,6 +383,30 @@ pub fn clone_client_hello(real: &[u8], sni: &str) -> Option<Vec<u8>> {
     })
 }
 
+/// Годится ли ClientHello из боя шаблоном для проб диагностики: один целый
+/// ClientHello с SNI и без возобновления сессии. С `pre_shared_key` сервер
+/// проверяет подпись билета — на копии она не сойдётся, и сервер откажет:
+/// диагностика приняла бы это за блокировку.
+pub fn is_probe_template(hello: &[u8]) -> bool {
+    ParsedHello::parse(hello).is_some_and(|p| p.extensions.iter().all(|(t, _)| *t != 0x0029))
+}
+
+/// Проба диагностики по образцу настоящего ClientHello: копия с именем
+/// `sni`, своим random и своим session id. Отпечаток (шифры, расширения,
+/// ключи, размер) — как у клиента, который ходит на сайт в бою.
+///
+/// Собранный с нуля ClientHello DPI видит иначе, чем настоящий: в дампе
+/// синтетические пробы к Discord проходили почти в половине случаев даже
+/// без обхода, а настоящий ClientHello curl и Discord — ни разу. Диагностика
+/// на синтетике выбирала «рабочую» технику, которая в бою не работала.
+pub fn probe_from(template: &[u8], sni: &str) -> Option<Vec<u8>> {
+    let mut copy = clone_client_hello(template, sni)?;
+    // session id: длина в байте 43 (после заголовков и random)
+    let sid_len = *copy.get(43)? as usize;
+    copy.get_mut(44..44 + sid_len)?.copy_from_slice(&super::random::bytes(sid_len));
+    Some(copy)
+}
+
 /// ClientHello, разобранный до расширений: то, что нужно для его копии.
 struct ParsedHello<'a> {
     /// Тело ClientHello от версии до длины расширений (не включая её).
@@ -819,6 +843,29 @@ mod tests {
         assert_eq!(session_id(&copy), session_id(&real));
         let without_padding = |h: &[u8]| ext_types(h).into_iter().filter(|t| *t != 0x0015).collect::<Vec<_>>();
         assert_eq!(without_padding(&copy), without_padding(&real));
+    }
+
+    #[test]
+    fn probe_copies_the_fingerprint_but_not_the_session() {
+        let real = build_client_hello_sized("gateway.discord.gg", 1850);
+        assert!(is_probe_template(&real));
+        let probe = probe_from(&real, "discord.com").unwrap();
+        assert_eq!(sni_host(&probe).as_deref(), Some("discord.com"));
+        assert_eq!(probe.len(), real.len());
+        assert_ne!(session_id(&probe), session_id(&real));
+        assert_eq!(ext_types(&probe), ext_types(&real));
+        // Возобновление сессии — не шаблон
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[7u8; 32]);
+        body.extend_from_slice(&[0]);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        let mut ext = Vec::new();
+        push_ext(&mut ext, 0x0000, &server_name_ext("discord.com"));
+        push_ext(&mut ext, 0x0029, &[1, 2, 3, 4]);
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        assert!(!is_probe_template(&wrap_client_hello(&body)));
+        assert!(!is_probe_template(b"GET / HTTP/1.1\r\n"));
     }
 
     /// decoy_for: копия, если просили и она подходит по длине; иначе — с нуля.

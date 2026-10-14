@@ -441,7 +441,7 @@ async fn handle(
     };
     let wants_bypass = needs_bypass(is_enabled, &domain, bypass_domains);
     let selected = if !payload.is_empty() && wants_bypass {
-        crate::proxy::adaptive::select(&adaptive_ctx, &domain, crate::bypass::tls::client_hello_len(&payload))
+        crate::proxy::adaptive::select(&adaptive_ctx, &domain, &payload)
     } else {
         crate::proxy::adaptive::Selected::DIRECT
     };

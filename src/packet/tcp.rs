@@ -77,7 +77,9 @@ pub trait Env {
     fn take_mark(&self, local_port: u16, remote: IpAddr) -> Option<Mark>;
     fn is_blocked(&self, domain: &str) -> bool;
     fn needs_bypass(&self, domain: &str) -> bool;
-    fn select(&self, domain: &str, hello_len: usize) -> Selected;
+    /// `hello` — первый сегмент с ClientHello: класс стратегии берётся по
+    /// длине всей записи из его заголовка, как у прокси.
+    fn select(&self, domain: &str, hello: &[u8]) -> Selected;
     fn record(&self, domain: &str, selected: Selected, responded: bool);
     fn remember(&self, ip: IpAddr, domain: &str);
     fn lookup(&self, ip: IpAddr) -> Option<String>;
@@ -200,10 +202,7 @@ impl Engine {
             return Ok((Kind::Done, Technique::Pass));
         }
 
-        // Размер — всей записи из заголовка, а не сегмента: по нему
-        // выбирается класс стратегии, как у прокси.
-        let hello_len = crate::bypass::tls::record_len(payload).unwrap_or(payload.len());
-        let selected = env.select(&domain, hello_len);
+        let selected = env.select(&domain, payload);
         let technique = technique_for(selected.strategy, payload, env);
         if let Some(detail) = describe(&technique, payload.len()) {
             env.log_applied(&domain, &detail);
@@ -352,7 +351,7 @@ mod tests {
         fn needs_bypass(&self, _: &str) -> bool {
             self.strategy.is_some()
         }
-        fn select(&self, _: &str, _: usize) -> Selected {
+        fn select(&self, _: &str, _: &[u8]) -> Selected {
             Selected::new(self.strategy.unwrap(), Some(HelloClass::Small))
         }
         fn record(&self, _: &str, _: Selected, responded: bool) {
