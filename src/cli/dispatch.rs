@@ -227,12 +227,20 @@ pub fn run(
                     log::log_nested_t(&log_tx, LogLevel::Info, "voice.verdict", "verdict", verdict.description_key(), vec![]);
                 }
 
+                // Пробы диагностики проверяют рукопожатие, а не поток после
+                // него: дешёвая техника его проходит и замерзает на данных.
+                // freeze-проба качает ответ и при заморозке переходит на
+                // приманку — как в автодиагностике. Раньше ручная её не
+                // делала, и Discord получал tls_record, на которой данные
+                // не шли.
+                let escalation = crate::engine::freeze::escalate_on_freeze(&domain, strategy::choose_from_diagnostics(&result), &log_tx).await;
+
                 // Структурный итог — на экран «Диагностика» (последний прогон).
                 crate::engine::domain_check::set(crate::engine::domain_check::DomainCheck {
                     domain: domain.clone(),
                     result: result.clone(),
                     blocked: crate::block::is_blocked(&domain),
-                    chosen: strategy::choose_from_diagnostics(&result),
+                    chosen: escalation.strategy,
                 });
 
                 use crate::engine::diagnostics::ProbeOutcome::*;
@@ -240,13 +248,19 @@ pub fn run(
                 // Итог называет КОНКРЕТНУЮ технику. Раньше здесь было общее
                 // «обход помогает», основанное на сводном флаге, который
                 // на самом деле означал «сработало хоть что-то».
-                match strategy::choose_from_diagnostics(&result) {
+                match escalation.strategy {
                     Some(chosen) => {
                         // Результат сохраняется так же, как в массовом прогоне.
                         // Раньше одиночная диагностика только печатала вердикт:
                         // чтобы стратегия попала в strategies.txt, приходилось
-                        // гонять весь список целиком.
-                        strategies.set(&domain, HelloClass::Large, chosen, strategy::confidence_of(&result, chosen));
+                        // гонять весь список целиком. Приманку, выбранную
+                        // freeze-пробой, диагностика могла не мерить — тогда
+                        // уверенность по одной прошедшей пробе.
+                        let mut confidence = strategy::confidence_of(&result, chosen);
+                        if escalation.escalated {
+                            confidence = confidence.max(crate::observability::stats::wilson_lower_bound(1, 1));
+                        }
+                        strategies.set(&domain, HelloClass::Large, chosen, confidence);
                         if let Err(e) = save_store(&strategies).await {
                             log::log_t(&log_tx, LogLevel::Error, "error.strategy_write", vec![("error", e.to_string())]);
                         }
