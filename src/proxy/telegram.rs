@@ -682,10 +682,16 @@ mod ws {
         Some(stream)
     }
 
-    /// TLS до воркера. С `fake` ClientHello забирается у rustls до начала
-    /// рукопожатия и уходит через [`crate::bypass::fragment::split_with_fake`]
-    /// по второму дескриптору того же сокета; дальше рукопожатие ведёт
+    /// TLS до воркера. ClientHello забирается у rustls до начала рукопожатия
+    /// и уходит через [`crate::bypass::fragment::split_with_host_fake`] по
+    /// второму дескриптору того же сокета; дальше рукопожатие ведёт
     /// tokio-rustls как обычно.
+    ///
+    /// Именно hostfakesplit, а не fake: воркер на Cloudflare, и сеть с
+    /// «ковровым» блоком Cloudflare режет по имени в КАЖДОЙ TLS-записи.
+    /// fake слал бы настоящий ClientHello с `…workers.dev` повтором — DPI
+    /// видел бы его и резал. hostfakesplit прячет само имя: серверу уходит
+    /// `…workers.dev`, а DPI видит разрешённое имя из `fake_sni`.
     async fn handshake(host: &str, fake: Option<&crate::config::BypassParams>) -> std::io::Result<Stream> {
         let tcp = connect_fake_port(host).await?;
         let _ = tcp.set_nodelay(true);
@@ -705,7 +711,7 @@ mod ws {
         // Приманка не ушла (нет md5sig в ядре) — ClientHello не отправлен,
         // решает вызывающий: молча послать его как есть значило бы получить
         // замерзающее соединение вместо отката.
-        if crate::bypass::fragment::split_with_fake(&mut side, fd, &hello, params).await?.is_none() {
+        if crate::bypass::fragment::split_with_host_fake(&mut side, fd, &hello, params).await?.is_none() {
             return Err(std::io::ErrorKind::Unsupported.into());
         }
         drop(side);
