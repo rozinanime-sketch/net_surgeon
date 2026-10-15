@@ -306,7 +306,7 @@ pub fn choose_best(
         (Strategy::FakeMultiDisorder, &result.fake_multidisorder),
         (Strategy::HostFakeSplit, &result.host_fake_split),
         (Strategy::FakedSplit, &result.faked_split),
-        (Strategy::Seqovl, &result.seqovl),
+        // Seqovl намеренно не в списке: из подбора убран (см. diagnostics).
     ];
 
     candidates
@@ -326,9 +326,6 @@ pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
     // прятать бесполезно, сразу предпочитаем decoy, если он проходит рукопожатие.
     // seqovl доступен только под перехватом пакетов, иначе — fake.
     if crate::engine::freeze::prefer_decoy() {
-        if result.seqovl.is_convincing() {
-            return Some(Strategy::Seqovl);
-        }
         // Поддельное имя в настоящем ClientHello убедительнее для DPI, чем
         // чужой ClientHello целиком, а стоит столько же.
         if result.host_fake_split.is_convincing() {
@@ -386,12 +383,7 @@ pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
     if result.faked_split.is_convincing() {
         return Some(Strategy::FakedSplit);
     }
-    // Seqovl — тоже последней надеждой (пакетный режим): как и fake, подставляет
-    // разрешённое имя, но вдобавок снимает заморозку после ~16 КБ там, где имя
-    // спрятать мало. Проверяется, только когда перехват пакетов активен.
-    if result.seqovl.is_convincing() {
-        return Some(Strategy::Seqovl);
-    }
+    // seqovl из подбора убран: живой тест его не пробивал, см. diagnostics.
     None
 }
 
@@ -1169,12 +1161,13 @@ mod tests {
     }
 
     #[test]
-    fn seqovl_is_chosen_when_only_it_works() {
+    fn seqovl_is_never_chosen_even_if_a_stale_score_says_it_works() {
+        // Живой тест seqovl не пробивал; он убран из подбора. Даже со
+        // «сработавшим» счётом (протухшая запись) его не выбирают.
         let mut r = result(ProbeOutcome::SilentDrop, false);
         r.seqovl = SplitScore { successes: 3, attempts: 3, confidence: 0.44, median_ms: Some(90.0) };
-        assert_eq!(choose_from_diagnostics(&r), Some(Strategy::Seqovl));
-        assert_eq!(choose_best(&r, RewardWeights::default()).map(|(s, _)| s), Some(Strategy::Seqovl));
-        assert_eq!(confidence_of(&r, Strategy::Seqovl), 0.44);
+        assert_eq!(choose_from_diagnostics(&r), None);
+        assert_eq!(choose_best(&r, RewardWeights::default()), None);
     }
 
     #[test]

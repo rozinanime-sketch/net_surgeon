@@ -155,10 +155,9 @@ fn choose(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) -> Se
         return Selected::new(other, None);
     }
 
-    // Под перехватом пакетов до конца диагностики берём seqovl: он подставляет
-    // разрешённое имя и снимает заморозку после ~16 КБ там, где спрятать имя
-    // мало, — самый надёжный первый выбор именно на пакетном пути.
-    let fallback = if packet { Strategy::Seqovl } else { unmeasured_default(class) };
+    // Под перехватом пакетов до конца диагностики берём hostfakesplit: он
+    // прячет само имя разрешённым (seqovl убран — живой тест его не пробивал).
+    let fallback = if packet { Strategy::HostFakeSplit } else { unmeasured_default(class) };
     Selected::new(fallback, None)
 }
 
