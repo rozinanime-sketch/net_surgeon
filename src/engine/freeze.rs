@@ -261,8 +261,9 @@ const SOCKET_DECOYS: [Strategy; 3] = [Strategy::HostFakeSplit, Strategy::Fake, S
 /// останавливается на первой прошедшей дешёвой технике и fake обычно не мерит,
 /// и раньше эскалации из-за этого почти не случалось.
 /// Сколько раз пробовать технику на морозящей сети: одна проба там —
-/// монетка (hostfakesplit наблюдался 4/6), поэтому несколько.
-const FROZEN_PROBE_TRIES: usize = 3;
+/// монетка (hostfakesplit наблюдался 4/6), поэтому две. Больше — слишком
+/// медленная диагностика (каждая замёрзшая проба ~12 с).
+const FROZEN_PROBE_TRIES: usize = 2;
 
 /// Приманка «протекает» именем: шлёт весь настоящий ClientHello повтором, и
 /// на ковровом блоке Cloudflare DPI всё равно видит имя. hostfakesplit имя
@@ -299,19 +300,23 @@ where
         return (Some(Strategy::HostFakeSplit), false);
     }
 
-    if probe_tries(&mut probe_fn, current, tries).await.0 {
+    let (cur_alive, cur_frozen) = probe_tries(&mut probe_fn, current, tries).await;
+    if cur_alive {
         return (chosen, false); // техника переживает заморозку
     }
 
-    // Выбранная замёрзла: перебираем приманки, hostfakesplit первой. Другой
-    // приманке хватает и полного короткого ответа — данные после рукопожатия
-    // дошли там, где раньше не дошли.
-    for decoy in SOCKET_DECOYS.into_iter().filter(|d| *d != current) {
-        if probe_tries(&mut probe_fn, decoy, tries).await.0 {
-            return (Some(decoy), true);
+    // На морозящей сети приманки, протекающие именем (fake, fake+multidisorder),
+    // пробовать незачем: на ковровом блоке имя всё равно утечёт. Если hostfakesplit
+    // (его уже проверили выше) не прошёл — оставляем измеренную технику, не тратя
+    // десятки секунд на заведомо негодные приманки.
+    if !name_hiding_preferred {
+        for decoy in SOCKET_DECOYS.into_iter().filter(|d| *d != current) {
+            if probe_tries(&mut probe_fn, decoy, tries).await.0 {
+                return (Some(decoy), true);
+            }
         }
     }
-    (chosen, true) // decoy не помог или недоступен — оставляем измеренную технику
+    (chosen, cur_frozen) // приманка не помогла или недоступна — оставляем измеренную технику
 }
 
 /// Пробует технику до `tries` раз. `(жива, видели_заморозку)`: жива — поток
@@ -507,10 +512,13 @@ mod tests {
         // fake выбран, но сеть морозит: hostfakesplit пробуется ПЕРВЫМ и
         // проходит — берём его, хотя fake мог бы и пройти (он протекает именем).
         assert_eq!(go_frozen(Some(Fake), &[Survived]).await, (Some(HostFakeSplit), false));
-        // hostfakesplit мерцает: не с первой пробы, но из трёх — проходит.
-        assert_eq!(go_frozen(Some(Fake), &[Frozen, Frozen, Survived]).await, (Some(HostFakeSplit), false));
-        // hostfakesplit не прошёл за три пробы — откатываемся на сам fake, если жив.
-        assert_eq!(go_frozen(Some(Fake), &[Frozen, Frozen, Frozen, Survived]).await, (Some(Fake), false));
+        // hostfakesplit мерцает: не с первой пробы, но из двух — проходит.
+        assert_eq!(go_frozen(Some(Fake), &[Frozen, Survived]).await, (Some(HostFakeSplit), false));
+        // hostfakesplit не прошёл за две пробы — откатываемся на сам fake, если жив.
+        assert_eq!(go_frozen(Some(Fake), &[Frozen, Frozen, Survived]).await, (Some(Fake), false));
+        // И hostfakesplit, и fake замёрзли: протекающие приманки на ковровом
+        // блоке не пробуем вовсе — остаёмся на fake, заморозку фиксируем.
+        assert_eq!(go_frozen(Some(Fake), &[Frozen, Frozen, Frozen, Frozen]).await, (Some(Fake), true));
         // Не-протекающую технику (tls_record) не трогаем, пока жива.
         assert_eq!(go_frozen(Some(TlsRecord), &[Survived]).await, (Some(TlsRecord), false));
         // Уже hostfakesplit — не меняем, мерцание переживаем несколькими пробами.
