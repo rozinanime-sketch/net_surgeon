@@ -94,9 +94,9 @@ window and the proxy settings go back to what they were.
 ### 🐧 Linux
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.8.1/net_surgeon-0.8.1-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.8.1-x86_64-linux.tar.gz
-cd net_surgeon-0.8.1
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.8.2/net_surgeon-0.8.2-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.8.2-x86_64-linux.tar.gz
+cd net_surgeon-0.8.2
 ./run.sh
 ```
 
@@ -200,7 +200,7 @@ The script's messages on this path are in Russian:
 Requires Rust 1.88 or newer (easiest via [rustup](https://rustup.rs)).
 
 ```sh
-git clone --branch v0.8.1 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.8.2 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```
