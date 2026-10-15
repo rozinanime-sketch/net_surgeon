@@ -233,8 +233,11 @@ pub async fn escalate_on_freeze(
     let (final_strategy, froze) = resolve(chosen, |s| probe(port, domain, s)).await;
 
     if froze {
-        // Сеть морозит незабелённый TLS: дальше по умолчанию предпочитаем decoy.
+        // Сеть морозит незабелённый TLS: дальше по умолчанию предпочитаем
+        // decoy, и это запоминается в файл — чтобы после перезапуска прямому
+        // снова не поверить (см. net_state::mark_frozen_network).
         set_prefer_decoy(true);
+        crate::engine::net_state::mark_frozen_network(&crate::engine::net_id::current());
         log_t(log_tx, LogLevel::Warning, "log.freeze_detected", vec![("domain", domain.to_string())]);
         if let Some(decoy) = final_strategy.filter(|_| final_strategy != chosen) {
             log_t(log_tx, LogLevel::Success, "log.freeze_escalated", vec![

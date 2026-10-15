@@ -92,6 +92,50 @@ pub fn set_prefer_decoy(on: bool) {
     PREFER_DECOY.store(on, Ordering::Relaxed);
 }
 
+// --- какие сети уже уличены в заморозке (переживает перезапуск) -------------
+
+const FROZEN_FILE: &str = "frozen_nets.txt";
+
+fn frozen_set() -> &'static RwLock<std::collections::HashSet<String>> {
+    static FROZEN: OnceLock<RwLock<std::collections::HashSet<String>>> = OnceLock::new();
+    FROZEN.get_or_init(|| {
+        let text = crate::config::paths::read_to_string(FROZEN_FILE).unwrap_or_default();
+        let set = text.lines().map(|l| l.split('#').next().unwrap_or("").trim().to_string()).filter(|l| !l.is_empty()).collect();
+        RwLock::new(set)
+    })
+}
+
+/// Уличена ли сеть в заморозке незабелённого TLS (из файла): раз морозит,
+/// прямому и дешёвым техникам не верим даже при удачной пробе.
+pub fn is_frozen_network(net_id: &str) -> bool {
+    !net_id.is_empty() && frozen_set().read().is_ok_and(|s| s.contains(net_id))
+}
+
+/// Запоминает сеть как морозящую — и в память, и в файл. Иначе после
+/// перезапуска флаг слетал, и одна удачная «прямая» проба снова записывала
+/// домену «без обхода» (gateway.discord.gg вис на ковровом блоке Cloudflare).
+pub fn mark_frozen_network(net_id: &str) {
+    if net_id.is_empty() {
+        return;
+    }
+    let rendered = {
+        let Ok(mut set) = frozen_set().write() else { return };
+        if !set.insert(net_id.to_string()) {
+            return;
+        }
+        let mut lines: Vec<&str> = set.iter().map(String::as_str).collect();
+        lines.sort_unstable();
+        format!("# Сети, уличённые в заморозке незабелённого TLS (см. engine::freeze).\n{}\n", lines.join("\n"))
+    };
+    let _ = crate::config::paths::write_atomic(FROZEN_FILE, &rendered);
+}
+
+/// Ставит `prefer_decoy` по тому, морозит ли сеть (из файла). Зовётся на
+/// старте и при смене сети, после сброса подобранного.
+pub fn apply_frozen_network(net_id: &str) {
+    set_prefer_decoy(is_frozen_network(net_id));
+}
+
 // --- порт SOCKS5, через который идут freeze-пробы --------------------------
 
 static SOCKS_PORT: AtomicU16 = AtomicU16::new(0);

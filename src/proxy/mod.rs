@@ -126,8 +126,9 @@ async fn watch_network(log_tx: LogSender, token: CancellationToken) {
         }
         if let Some(id) = changed_network(&crate::engine::net_id::current(), crate::engine::net_id::detect()) {
             log_t(&log_tx, LogLevel::Info, "log.network_changed", vec![("id", crate::engine::net_state::display_net_id(&id))]);
-            crate::engine::net_id::set(id);
+            crate::engine::net_id::set(id.clone());
             crate::reset_network_tuning();
+            crate::engine::net_state::apply_frozen_network(&id);
         }
     }
 }
@@ -195,6 +196,7 @@ pub async fn run_all(
     #[cfg(target_os = "linux")]
     {
         crate::engine::net_id::set(crate::engine::net_id::detect());
+        crate::engine::net_state::apply_frozen_network(&crate::engine::net_id::current());
         tokio::spawn(watch_network(log_tx.clone(), token.clone()));
     }
 

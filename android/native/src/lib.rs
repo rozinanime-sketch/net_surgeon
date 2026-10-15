@@ -337,8 +337,9 @@ pub extern "system" fn Java_io_github_netsurgeon_NativeBridge_onNetworkChanged<'
         return;
     }
     push_line(format!("· {}", tr("log.network_changed", &[("id", id.clone())])));
-    net_surgeon::engine::net_id::set(id);
+    net_surgeon::engine::net_id::set(id.clone());
     net_surgeon::reset_network_tuning();
+    net_surgeon::engine::net_state::apply_frozen_network(&id);
 }
 
 /// Поля настроек для экрана «Настройки»: по строке на поле,
