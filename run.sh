@@ -116,6 +116,7 @@ MODE="${1:-transparent}"
 RULE_ADDED=0
 UDP_ADDED=0
 DNS_ADDED=0
+RESOLVED_SET=0
 CLEANED=0
 WATCHDOG_STARTED=0
 SUDO_KEEPALIVE=""
@@ -334,6 +335,8 @@ cleanup() {
     [[ $CLEANED -eq 1 ]] && return 0
     CLEANED=1
 
+    restore_dns
+
     if [[ $RULE_ADDED -eq 1 || $UDP_ADDED -eq 1 || $DNS_ADDED -eq 1 ]]; then
         echo
         say "Снимаю перехват…"
@@ -374,6 +377,42 @@ cleanup() {
 # По сигналу — снять и выйти. Раньше обработчик возвращался, и скрипт
 # продолжал настройку после уборки: ставил правило DNS, которое потом уже
 # никто не снимал (CLEANED=1).
+# systemd-resolved на хотспотах иногда сам отдаёт «нет имени» для части
+# доменов (оператор режет их DNS), а NSS с `resolve [!UNAVAIL=return]` на
+# этом и останавливается — мимо перехвата порта 53. Направляем системный
+# резолвер прямо на DoH-релей net_surgeon: оператор из цепочки выпадает.
+# Нужен systemd-resolved, включённый прозрачный режим и работающий релей.
+resolved_iface() {
+    ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}'
+}
+
+point_dns_at_relay() {
+    command -v resolvectl >/dev/null || return 0
+    [[ -n ${DNS_PORT:-} && $DNS_PORT -gt 0 ]] || return 0
+    # Без bootstrap-адреса релей не разрешит имя своего DoH-сервера, если
+    # резолвер уже указывает на него самого, — будет петля. С ним петли нет.
+    [[ -n ${DOH_BOOTSTRAP:-} ]] || return 0
+    grep -qE '^[[:space:]]*transparent_port[[:space:]]*=[[:space:]]*[1-9]' config.toml || return 0
+    local iface; iface="$(resolved_iface)"
+    [[ -n $iface ]] || return 0
+    # Релей слушает на 127.0.0.1; резолвер шлёт ему обычный DNS, а тот уже
+    # идёт по DoH. Петли нет: релей знает адрес своего DoH по bootstrap.
+    if sudo resolvectl dns "$iface" "127.0.0.1:${DNS_PORT}" 2>/dev/null \
+        && sudo resolvectl domain "$iface" '~.' 2>/dev/null; then
+        sudo resolvectl flush-caches 2>/dev/null || true
+        RESOLVED_SET=1
+        RESOLVED_IFACE="$iface"
+        say "Системный DNS направлен на релей net_surgeon (${iface})."
+    fi
+}
+
+restore_dns() {
+    [[ $RESOLVED_SET -eq 1 ]] || return 0
+    RESOLVED_SET=0
+    sudo resolvectl revert "${RESOLVED_IFACE:-$(resolved_iface)}" 2>/dev/null \
+        && sudo resolvectl flush-caches 2>/dev/null || true
+}
+
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
@@ -731,6 +770,7 @@ if command -v nft >/dev/null && command -v getcap >/dev/null && [[ -z ${NET_SURG
     ensure_config_port
     grant_privileges
 
+    point_dns_at_relay
     say "Запуск. Перехват снимется сам при любом выходе, даже при закрытии окна."
     # Код выхода программы — наружу: ошибка запуска не должна выглядеть
     # успехом. `|| status=$?`, а не голый вызов: под `set -e` скрипт
