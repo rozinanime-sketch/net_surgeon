@@ -1,0 +1,10 @@
+# Закреплённые техники: домен <TAB> техника. Применяется всегда, в обход
+# диагностики и независимо от сети (см. engine::pin). Полезно, когда IP
+# шлюза меняется (телефонный хотспот) и обычные записи сбрасываются.
+#
+# Discord на ковровом блоке Cloudflare: hostfakesplit прячет имя (намерено
+# 4/6), fake протекает именем (1/6). Закрепляем hostfakesplit.
+discord.com	hostfakesplit
+discord.gg	hostfakesplit
+discordapp.com	hostfakesplit
+discordapp.net	hostfakesplit

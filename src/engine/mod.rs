@@ -10,6 +10,7 @@ pub mod domain_check;
 pub mod freeze;
 pub mod net_id;
 pub mod net_state;
+pub mod pin;
 pub mod probe_force;
 pub mod strategy;
 pub mod voice_probe;

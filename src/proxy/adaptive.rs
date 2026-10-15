@@ -116,6 +116,16 @@ fn choose(ctx: &Context<'_>, domain: &str, hello_len: usize, packet: bool) -> Se
     };
     let class = HelloClass::of(hello_len);
 
+    // Закреплённая техника (pin_strategies.txt) — раньше всего: жёстко, в
+    // обход диагностики и кэша, не зависит от сети. Для хотспота с меняющимся
+    // IP шлюза это единственное, что переживает смену ключа сети.
+    if let Some(forced) = crate::engine::pin::pinned(domain).filter(|s| usable(*s)) {
+        log_nested_t(ctx.log_tx, LogLevel::Info, "log.strategy_pinned", "strategy", forced.label_key(), vec![
+            ("domain", domain.to_string()),
+        ]);
+        return Selected::new(forced, None);
+    }
+
     if let Some((cached, kind)) = ctx.strategies.lookup_detailed(domain, class, ctx.ttl_hours)
         && usable(cached)
     {
