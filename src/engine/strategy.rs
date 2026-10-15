@@ -319,7 +319,12 @@ pub fn choose_best(
 /// Лестница: от дешёвой стратегии к дорогой. Первая, давшая Success, побеждает.
 /// `None` означает, что не сработало вообще ничего.
 pub fn choose_from_diagnostics(result: &DiagnosticResult) -> Option<Strategy> {
-    if result.direct == ProbeOutcome::Success {
+    // «Прямое прошло» берём, только если сеть НЕ уличена в заморозке. На сети
+    // с ковровым блоком Cloudflare прямое рукопожатие проходит с перебоями
+    // (разные адреса за одним именем ведут себя по-разному), и одна удачная
+    // проба сохраняла «без обхода» — а в бою discord.com вис. Раз сеть морозит
+    // незабелённый TLS, прямому не верим и прячемся приманкой.
+    if result.direct == ProbeOutcome::Success && !crate::engine::freeze::prefer_decoy() {
         return Some(Strategy::None);
     }
     // Сеть уже уличена в заморозке незабелённого TLS (см. engine::freeze): имя
@@ -1106,7 +1111,24 @@ mod tests {
 
     #[test]
     fn prefers_direct_when_nothing_is_blocked() {
+        let _g = crate::engine::net_state::test_guard();
+        crate::engine::net_state::reset_for_network();
         let r = result(ProbeOutcome::Success, true);
+        assert_eq!(choose_from_diagnostics(&r), Some(Strategy::None));
+    }
+
+    /// На сети с заморозкой прямому не верим даже при удачной пробе: берём
+    /// приманку (discord.com на ковровом блоке Cloudflare).
+    #[test]
+    fn frozen_network_ignores_a_lucky_direct_success() {
+        let _g = crate::engine::net_state::test_guard();
+        crate::engine::net_state::reset_for_network();
+        let mut r = result(ProbeOutcome::Success, true);
+        r.host_fake_split = SplitScore { successes: 3, attempts: 3, confidence: 0.44, median_ms: Some(120.0) };
+        crate::engine::freeze::set_prefer_decoy(true);
+        assert_eq!(choose_from_diagnostics(&r), Some(Strategy::HostFakeSplit));
+        crate::engine::net_state::reset_for_network();
+        // Без заморозки — прямое, как прежде
         assert_eq!(choose_from_diagnostics(&r), Some(Strategy::None));
     }
 
