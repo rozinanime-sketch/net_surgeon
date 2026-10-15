@@ -117,7 +117,7 @@ DIST=dist
 rm -rf "$DIST"
 mkdir -p "$DIST/linux/net_surgeon-$V/target/release" "$DIST/windows/net_surgeon-$V"
 
-COMMON=(LICENSE README.md config.toml bypass_domains.txt block_domains.txt smart_dns_domains.txt)
+COMMON=(LICENSE README.md config.toml bypass_domains.txt block_domains.txt smart_dns_domains.txt pin_strategies.txt)
 cp "${COMMON[@]}" run.sh setup-transparent.sh "$DIST/linux/net_surgeon-$V/"
 cp "$LINUX_BIN" "$TRAY_BIN" "$DIST/linux/net_surgeon-$V/target/release/"
 cp "${COMMON[@]}" "$WIN_BIN" "$DIST/windows/net_surgeon-$V/"

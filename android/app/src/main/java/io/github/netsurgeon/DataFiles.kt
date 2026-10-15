@@ -14,8 +14,9 @@ object DataFiles {
     const val BLOCK = "block_domains.txt"
     const val TELEGRAM_RELAY = "telegram_relay.txt"
     const val SMART_DNS = "smart_dns_domains.txt"
+    const val PIN = "pin_strategies.txt"
     const val CONFIG = "config.toml"
-    private val DEFAULTS = listOf(CONFIG, BYPASS, BLOCK, SMART_DNS)
+    private val DEFAULTS = listOf(CONFIG, BYPASS, BLOCK, SMART_DNS, PIN)
 
     // Ключи, которых нет в старом config.toml (умный DNS), ядро подставляет
     // само теми же значениями (src/config/mod.rs) — дописывать их сюда не
