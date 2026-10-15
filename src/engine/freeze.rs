@@ -230,7 +230,7 @@ pub async fn escalate_on_freeze(
     let Some(port) = socks_port() else { return unchanged };
 
     // Решение отделено от сетевого I/O (тестируется), пробы подставляются здесь.
-    let (final_strategy, froze) = resolve(chosen, |s| probe(port, domain, s)).await;
+    let (final_strategy, froze) = resolve(chosen, prefer_decoy(), |s| probe(port, domain, s)).await;
 
     if froze {
         // Сеть морозит незабелённый TLS: дальше по умолчанию предпочитаем
@@ -260,27 +260,76 @@ const SOCKET_DECOYS: [Strategy; 3] = [Strategy::HostFakeSplit, Strategy::Fake, S
 /// Приманки проверяются самой freeze-пробой, а не по итогам диагностики: та
 /// останавливается на первой прошедшей дешёвой технике и fake обычно не мерит,
 /// и раньше эскалации из-за этого почти не случалось.
-async fn resolve<F, Fut>(chosen: Option<Strategy>, mut probe_fn: F) -> (Option<Strategy>, bool)
+/// Сколько раз пробовать технику на морозящей сети: одна проба там —
+/// монетка (hostfakesplit наблюдался 4/6), поэтому несколько.
+const FROZEN_PROBE_TRIES: usize = 3;
+
+/// Приманка «протекает» именем: шлёт весь настоящий ClientHello повтором, и
+/// на ковровом блоке Cloudflare DPI всё равно видит имя. hostfakesplit имя
+/// прячет — на такой сети он надёжнее, даже если мерцающие пробы дали иначе.
+fn leaks_name(s: Strategy) -> bool {
+    matches!(s, Strategy::Fake | Strategy::FakeMultiDisorder | Strategy::Seqovl | Strategy::FakedSplit)
+}
+
+/// Чистое решение эскалации: по вердиктам проб (через `probe_fn`) выбирает
+/// итоговую технику и говорит, обнаружена ли заморозка. Без сети и глобалов —
+/// поэтому тестируется. `probe_fn(strategy) -> Verdict`.
+///
+/// `name_hiding_preferred` — сеть уже уличена в заморозке (prefer_decoy): тогда
+/// пробуем каждую технику несколько раз и предпочитаем скрывающую имя
+/// hostfakesplit «протекающим» fake/fake+multidisorder, даже если те прошли.
+/// Иначе на мерцающем ковровом блоке диагностика цеплялась за случайно
+/// прошедший fake, который в бою держит ~1 из 6, вместо hostfakesplit (4 из 6).
+///
+/// Приманки проверяются самой freeze-пробой, а не по итогам диагностики: та
+/// останавливается на первой прошедшей дешёвой технике и fake обычно не мерит.
+async fn resolve<F, Fut>(chosen: Option<Strategy>, name_hiding_preferred: bool, mut probe_fn: F) -> (Option<Strategy>, bool)
 where
     F: FnMut(Strategy) -> Fut,
     Fut: std::future::Future<Output = Verdict>,
 {
     let Some(current) = chosen else { return (chosen, false) };
-    // Приманка тоже проверяется: подставленное имя ещё не значит, что поток
-    // пройдёт. На Cloudflare fake проходил рукопожатие и замерзал на данных,
-    // а hostfakesplit — нет; раньше выбранную приманку не проверяли вовсе,
-    // и рабочую hostfakesplit сменяла замерзающая fake.
-    if probe_fn(current).await != Verdict::Frozen {
+    let tries = if name_hiding_preferred { FROZEN_PROBE_TRIES } else { 1 };
+
+    // На морозящей сети «протекающую» приманку сразу меняем на скрывающую имя:
+    // проверять её бесполезно — в бою имя утечёт. hostfakesplit пробуем прямо.
+    if name_hiding_preferred && leaks_name(current) && current != Strategy::HostFakeSplit
+        && probe_tries(&mut probe_fn, Strategy::HostFakeSplit, tries).await.0
+    {
+        return (Some(Strategy::HostFakeSplit), false);
+    }
+
+    if probe_tries(&mut probe_fn, current, tries).await.0 {
         return (chosen, false); // техника переживает заморозку
     }
-    // Выбранная замёрзла: другой приманке хватает и полного короткого
-    // ответа — данные после рукопожатия дошли там, где раньше не дошли.
+
+    // Выбранная замёрзла: перебираем приманки, hostfakesplit первой. Другой
+    // приманке хватает и полного короткого ответа — данные после рукопожатия
+    // дошли там, где раньше не дошли.
     for decoy in SOCKET_DECOYS.into_iter().filter(|d| *d != current) {
-        if matches!(probe_fn(decoy).await, Verdict::Survived | Verdict::Answered) {
+        if probe_tries(&mut probe_fn, decoy, tries).await.0 {
             return (Some(decoy), true);
         }
     }
     (chosen, true) // decoy не помог или недоступен — оставляем измеренную технику
+}
+
+/// Пробует технику до `tries` раз. `(жива, видели_заморозку)`: жива — поток
+/// прошёл хотя бы раз; на мерцающей сети одной пробы мало.
+async fn probe_tries<F, Fut>(probe_fn: &mut F, s: Strategy, tries: usize) -> (bool, bool)
+where
+    F: FnMut(Strategy) -> Fut,
+    Fut: std::future::Future<Output = Verdict>,
+{
+    let mut frozen = false;
+    for _ in 0..tries {
+        match probe_fn(s).await {
+            Verdict::Survived | Verdict::Answered => return (true, frozen),
+            Verdict::Frozen => frozen = true,
+            Verdict::Inconclusive => {}
+        }
+    }
+    (false, frozen)
 }
 
 /// Где кончается HTTP-ответ. Проба просит `Connection: close`, но сервер
@@ -412,9 +461,9 @@ mod tests {
         use Strategy::{Fake, FakeMultiDisorder, HostFakeSplit, TlsRecord};
         use Verdict::{Answered, Frozen, Inconclusive, Survived};
         // Прогоняет resolve с заранее заданными вердиктами проб по порядку.
-        async fn go(chosen: Option<Strategy>, verdicts: &[Verdict]) -> (Option<Strategy>, bool) {
+        async fn run(chosen: Option<Strategy>, frozen_net: bool, verdicts: &[Verdict]) -> (Option<Strategy>, bool) {
             let idx = std::cell::Cell::new(0);
-            let result = resolve(chosen, |_s| {
+            let result = resolve(chosen, frozen_net, |_s| {
                 let i = idx.get();
                 idx.set(i + 1);
                 let v = verdicts[i];
@@ -423,6 +472,14 @@ mod tests {
             .await;
             assert_eq!(idx.get(), verdicts.len(), "лишние или недостающие пробы");
             result
+        }
+        // Обычная сеть (не морозит): одна проба на технику, прежнее поведение.
+        async fn go(chosen: Option<Strategy>, verdicts: &[Verdict]) -> (Option<Strategy>, bool) {
+            run(chosen, false, verdicts).await
+        }
+        // Морозящая сеть: до трёх проб и предпочтение скрывающей имя приманки.
+        async fn go_frozen(chosen: Option<Strategy>, verdicts: &[Verdict]) -> (Option<Strategy>, bool) {
+            run(chosen, true, verdicts).await
         }
         // Нечего эскалировать: техники нет — пробы не запускаются.
         assert_eq!(go(None, &[]).await, (None, false));
@@ -445,6 +502,19 @@ mod tests {
         assert_eq!(go(Some(TlsRecord), &[Answered]).await, (Some(TlsRecord), false));
         // Все приманки морозят → остаёмся, но заморозку зафиксировали.
         assert_eq!(go(Some(TlsRecord), &[Frozen, Frozen, Frozen, Frozen]).await, (Some(TlsRecord), true));
+
+        // --- морозящая сеть: имя-прячущая приманка в приоритете ---
+        // fake выбран, но сеть морозит: hostfakesplit пробуется ПЕРВЫМ и
+        // проходит — берём его, хотя fake мог бы и пройти (он протекает именем).
+        assert_eq!(go_frozen(Some(Fake), &[Survived]).await, (Some(HostFakeSplit), false));
+        // hostfakesplit мерцает: не с первой пробы, но из трёх — проходит.
+        assert_eq!(go_frozen(Some(Fake), &[Frozen, Frozen, Survived]).await, (Some(HostFakeSplit), false));
+        // hostfakesplit не прошёл за три пробы — откатываемся на сам fake, если жив.
+        assert_eq!(go_frozen(Some(Fake), &[Frozen, Frozen, Frozen, Survived]).await, (Some(Fake), false));
+        // Не-протекающую технику (tls_record) не трогаем, пока жива.
+        assert_eq!(go_frozen(Some(TlsRecord), &[Survived]).await, (Some(TlsRecord), false));
+        // Уже hostfakesplit — не меняем, мерцание переживаем несколькими пробами.
+        assert_eq!(go_frozen(Some(HostFakeSplit), &[Frozen, Survived]).await, (Some(HostFakeSplit), false));
     }
 
     #[test]
