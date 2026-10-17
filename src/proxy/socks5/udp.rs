@@ -1,6 +1,5 @@
 use tokio::net::UdpSocket;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
@@ -82,7 +81,7 @@ async fn run_return_path(
     metrics: Arc<Metrics>,
     log_tx: LogSender,
     cancel: CancellationToken,
-    hop: Option<(u64, Arc<AtomicU64>)>,
+    hop: session::HopTag,
 ) {
     let mut buffer = [0u8; MAX_DATAGRAM];
     // Без смены порта тишина не повод уходить — ждём сколько угодно.
@@ -110,6 +109,9 @@ async fn run_return_path(
                         break;
                     }
                 };
+
+                // Входящая идёт в счёт лимита порта (см. session::Hop).
+                session::note_received(&hop);
 
                 let mut datagram = encode_reply_header(from);
                 datagram.extend_from_slice(&buffer[..bytes_read]);
@@ -385,7 +387,7 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
     } else {
         0
     };
-    let generation = (hop_every > 0).then(|| Arc::new(AtomicU64::new(0)));
+    let state = (hop_every > 0).then(|| session::HopState::new(hop_every));
 
     tokio::spawn(run_return_path(
         Arc::clone(&upstream),
@@ -395,20 +397,19 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
         Arc::clone(&ctx.metrics),
         ctx.log_tx.clone(),
         cancel.clone(),
-        generation.as_ref().map(|g| (0, Arc::clone(g))),
+        state.as_ref().map(|st| (0, Arc::clone(st))),
     ));
 
     // У каждого нового сокета свой читатель ответов; все шлют клиенту через
     // слушающий сокет — для клиента это один и тот же сервер.
-    let hop = generation.map(|generation| {
+    let hop = state.map(|state| {
         let server_socket = Arc::clone(&ctx.server_socket);
         let (last_seen, metrics, log_tx, cancel) =
             (Arc::clone(&last_seen), Arc::clone(&ctx.metrics), ctx.log_tx.clone(), cancel.clone());
-        let mine = Arc::clone(&generation);
+        let mine = Arc::clone(&state);
         session::Hop {
-            every: hop_every,
+            state,
             dst: dst_addr,
-            generation,
             on_new: Box::new(move |sock, g| {
                 tokio::spawn(run_return_path(
                     sock,

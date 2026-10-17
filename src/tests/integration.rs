@@ -486,8 +486,8 @@ async fn socks5_udp_sends_no_junk() {
 }
 
 /// SOCKS5 UDP со сменой порта (путь Android): звонок уходит с нового
-/// исходного порта каждые `hop` датаграмм, а ответы со всех портов
-/// доходят до клиента.
+/// исходного порта, когда на текущем набралось `hop` датаграмм в обе
+/// стороны, а ответы со всех портов доходят до клиента.
 #[tokio::test]
 async fn socks5_udp_call_hops_source_port_and_keeps_replies() {
     use std::collections::HashSet;
@@ -555,11 +555,13 @@ async fn socks5_udp_call_hops_source_port_and_keeps_replies() {
     }
     assert_eq!(got, vec![0, 1, 2, 3, 4], "ответ на каждую датаграмму, по порядку");
 
+    // Лимит считается в обе стороны: запрос и эхо-ответ — уже два пакета,
+    // и каждый следующий запрос уходит с нового порта. Повторов (толчков)
+    // нет: следующий запрос приходит раньше KICK_GRACE.
     let ports = ports.lock().unwrap().clone();
     let distinct: HashSet<_> = ports.iter().collect();
-    assert_eq!(distinct.len(), 3, "по два пакета с порта: {ports:?}");
-    assert_eq!(ports[0], ports[1]);
-    assert_ne!(ports[1], ports[2]);
+    assert_eq!(ports.len(), 5, "без повторов: {ports:?}");
+    assert_eq!(distinct.len(), 5, "каждый запрос — с нового порта: {ports:?}");
 
     token.cancel();
 }

@@ -61,7 +61,6 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -498,7 +497,7 @@ async fn open_session(
     let last_seen = Arc::new(std::sync::Mutex::new(Instant::now()));
     let cancel = token.child_token();
     let client = SocketAddr::V4(client_v4);
-    let generation = (hop_every > 0).then(|| Arc::new(AtomicU64::new(0)));
+    let state = (hop_every > 0).then(|| session::HopState::new(hop_every));
 
     tokio::spawn(return_path(
         Arc::clone(&upstream),
@@ -507,18 +506,17 @@ async fn open_session(
         Arc::clone(&last_seen),
         Arc::clone(metrics),
         cancel.clone(),
-        generation.as_ref().map(|g| (0, Arc::clone(g))),
+        state.as_ref().map(|st| (0, Arc::clone(st))),
     ));
 
     // У каждого нового сокета свой читатель ответов; все шлют клиенту
     // через один обратный сокет — для клиента это один и тот же сервер.
-    let hop = generation.map(|generation| {
+    let hop = state.map(|state| {
         let (last_seen, metrics, cancel) = (Arc::clone(&last_seen), Arc::clone(metrics), cancel.clone());
-        let mine = Arc::clone(&generation);
+        let mine = Arc::clone(&state);
         session::Hop {
-            every: hop_every,
+            state,
             dst: orig_dst,
-            generation,
             on_new: Box::new(move |sock, g| {
                 tokio::spawn(return_path(
                     sock,
@@ -559,7 +557,7 @@ async fn return_path(
     last_seen: Arc<std::sync::Mutex<Instant>>,
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
-    hop: Option<(u64, Arc<AtomicU64>)>,
+    hop: session::HopTag,
 ) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     // Без смены порта тишина не повод уходить — ждём сколько угодно.
@@ -578,6 +576,8 @@ async fn return_path(
             },
         };
 
+        // Входящая идёт в счёт лимита порта (см. session::Hop).
+        session::note_received(&hop);
         if reply.send_to(&buf[..n], client_addr).await.is_err() {
             break;
         }

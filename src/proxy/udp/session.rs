@@ -19,7 +19,7 @@
 //! порта ([`Hop`]) тоже живёт здесь.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
@@ -43,7 +43,8 @@ pub struct WriterLog {
     pub forward_error_key: &'static str,
 }
 
-/// Смена исходного порта каждые `every` датаграмм.
+/// Смена исходного порта, когда на текущем набралось `every` датаграмм
+/// в обе стороны.
 ///
 /// Провайдер режет UDP к сетям Cloudflare и AWS (а на них голос Discord,
 /// серверы `c-…`) по счётчику на поток: первые пять пакетов проходят, дальше
@@ -55,18 +56,68 @@ pub struct WriterLog {
 /// Счётчик у провайдера привязан к потоку, и поток просто не доживает
 /// до отсечки.
 ///
+/// Считаются пакеты в ОБЕ стороны. Сначала считались только исходящие, и
+/// пока собеседник молчал, этого хватало. Но сервер Discord шлёт голос
+/// собеседников и ответы на ping на наш последний порт, и тот набирал лимит
+/// встречными: запись звонка 2026-10-17 — ping, перед которым на порту было
+/// 0–2 пакета, отвечен всегда, 5–12 — ни разу; половина ping уходила в
+/// 5000 мс. Поэтому порт меняется по сумме, а если слать нам нечего (ты
+/// молчишь, говорит собеседник), смену подталкивает читатель ответов: см.
+/// [`HopState::received`] и повтор последнего пакета в [`spawn_writer`].
+///
 /// Ответы сервер может слать на любой из недавних портов, поэтому старые
 /// сокеты не закрываются сразу: их читатели живут, пока сокет не замолчит
 /// на [`HOP_IDLE`] (см. `transparent_udp::return_path` и
 /// `socks5::udp::run_return_path`).
 pub struct Hop {
-    pub every: u32,
+    pub state: Arc<HopState>,
     pub dst: SocketAddr,
-    /// Номер текущего сокета. Читатель старого сокета по нему понимает, что
-    /// сокет уже не текущий и при тишине его можно бросить.
-    pub generation: Arc<AtomicU64>,
     /// Запускает читателя ответов для нового сокета (сокет, его номер).
     pub on_new: Box<dyn Fn(Arc<UdpSocket>, u64) + Send + Sync>,
+}
+
+/// Общее состояние смены порта: его видят задача отправки и читатели
+/// ответов всех сокетов сессии.
+pub struct HopState {
+    every: u32,
+    /// Номер текущего сокета. Читатель старого сокета по нему понимает, что
+    /// сокет уже не текущий и при тишине его можно бросить.
+    generation: AtomicU64,
+    /// Сколько датаграмм прошло через текущий сокет в обе стороны.
+    used: AtomicU32,
+    /// «Встречный поток набрал лимит» — будит задачу отправки.
+    kick: tokio::sync::Notify,
+}
+
+impl HopState {
+    pub fn new(every: u32) -> Arc<Self> {
+        Arc::new(HopState { every, generation: AtomicU64::new(0), used: AtomicU32::new(0), kick: tokio::sync::Notify::new() })
+    }
+
+    /// Читатель сокета `mine` получил датаграмму. На текущем сокете она идёт
+    /// в счёт лимита; набрался лимит — пора менять порт.
+    pub fn received(&self, mine: u64) {
+        if mine == self.generation.load(Ordering::Relaxed)
+            && self.used.fetch_add(1, Ordering::Relaxed) + 1 >= self.every
+        {
+            self.kick.notify_one();
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.used.load(Ordering::Relaxed) >= self.every
+    }
+}
+
+/// Что знает читатель ответов о смене порта: (номер своего сокета, общее
+/// состояние). `None` — сессия без смены порта.
+pub type HopTag = Option<(u64, Arc<HopState>)>;
+
+/// Читатель получил датаграмму — учесть её (см. [`HopState::received`]).
+pub fn note_received(hop: &HopTag) {
+    if let Some((mine, state)) = hop {
+        state.received(*mine);
+    }
 }
 
 /// Сколько тишины терпит читатель старого сокета при смене порта. Ответ на
@@ -75,10 +126,22 @@ pub struct Hop {
 /// каждые 4 это дюжина новых портов в секунду.
 pub const HOP_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Старый ли это сокет: `hop` — (номер сокета, номер текущего). Читатель
-/// старого сокета при тишине уходит, текущего — ждёт дальше.
-pub fn is_stale(hop: &Option<(u64, Arc<AtomicU64>)>) -> bool {
-    matches!(hop, Some((mine, current)) if *mine != current.load(Ordering::Relaxed))
+/// Сколько после толчка ждать настоящую датаграмму, прежде чем повторить
+/// последнюю. Голос шлёт кадр каждые 20 мс: пока говоришь, порт сменится на
+/// настоящем пакете, и дубликатов не будет. Повтор — только когда слать
+/// действительно нечего.
+///
+/// Быстрее толкать пробовали — хуже. Толчок после 2 входящих с паузой
+/// 20 мс и смена по таймеру каждые 40 мс (2026-10-18) открывали до 11 новых
+/// портов в секунду, после чего сервер замолкал на минуты: ping без ответа
+/// 21 и 27 из 36 против 5 из 36 у этой схемы. Похоже, провайдер (или сам
+/// Discord) режет и частую смену потоков к одному адресу.
+const KICK_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Старый ли это сокет. Читатель старого сокета при тишине уходит,
+/// текущего — ждёт дальше.
+pub fn is_stale(hop: &HopTag) -> bool {
+    matches!(hop, Some((mine, state)) if *mine != state.generation.load(Ordering::Relaxed))
 }
 
 /// Новый исходящий сокет к тому же назначению — то есть новый исходный порт.
@@ -96,7 +159,8 @@ impl Hop {
         match fresh_upstream(self.dst).await {
             Ok(sock) => {
                 let sock = Arc::new(sock);
-                let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+                let generation = self.state.generation.fetch_add(1, Ordering::Relaxed) + 1;
+                self.state.used.store(0, Ordering::Relaxed);
                 (self.on_new)(Arc::clone(&sock), generation);
                 Some(sock)
             }
@@ -196,29 +260,53 @@ pub fn spawn_writer(
 
     tokio::spawn(async move {
         let mut upstream = upstream;
-        let mut sent: u32 = 0;
+        // Последняя отправленная датаграмма — её повторяет толчок смены порта.
+        let mut last: Option<Vec<u8>> = None;
         loop {
+            let kick = async {
+                match &hop {
+                    Some(h) => h.state.kick.notified().await,
+                    None => std::future::pending().await,
+                }
+            };
             let payload = tokio::select! {
                 _ = cancel.cancelled() => break,
                 p = rx.recv() => match p {
                     Some(p) => p,
                     None => break,
                 },
+                // Встречный поток набрал лимит. Сервер шлёт на наш последний
+                // порт, и тот скоро обрежут: порт надо сменить, а сервер
+                // переходит на новый, только когда получит с него датаграмму.
+                // Пока говоришь, настоящая придёт через миллисекунды. Если за
+                // KICK_GRACE ничего (ты молчишь, говорит собеседник) —
+                // повторяем с нового порта последнюю; дубликат сервер
+                // отбросит, но на новый порт перейдёт.
+                _ = kick => match tokio::time::timeout(KICK_GRACE, rx.recv()).await {
+                    Ok(Some(p)) => p,
+                    Ok(None) => break,
+                    Err(_) => match (&hop, &last) {
+                        (Some(h), Some(p)) if h.state.exhausted() => p.clone(),
+                        _ => continue,
+                    },
+                },
             };
-            if let Some(h) = &hop
-                && sent >= h.every
-            {
-                if let Some(next) = h.next(&log).await {
+            if let Some(h) = &hop {
+                if h.state.exhausted()
+                    && let Some(next) = h.next(&log).await
+                {
                     upstream = next;
                 }
-                sent = 0;
+                h.state.used.fetch_add(1, Ordering::Relaxed);
             }
-            sent += 1;
             if let Err(e) = upstream.send(&payload).await {
                 log_t(&log.log_tx, LogLevel::Warning, log.forward_error_key, vec![
                     ("addr", log.addr.to_string()),
                     ("error", e.to_string()),
                 ]);
+            }
+            if hop.is_some() {
+                last = Some(payload);
             }
         }
     });
@@ -334,11 +422,10 @@ mod tests {
 
         let readers = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = Arc::clone(&readers);
-        let generation = Arc::new(AtomicU64::new(0));
+        let state = HopState::new(2);
         let hop = Hop {
-            every: 2,
+            state: Arc::clone(&state),
             dst,
-            generation: Arc::clone(&generation),
             on_new: Box::new(move |_sock, g| seen.lock().unwrap().push(g)),
         };
 
@@ -370,6 +457,48 @@ mod tests {
         assert_eq!(from[2], from[3]);
         assert_ne!(from[3], from[4]);
         assert_eq!(*readers.lock().unwrap(), vec![1, 2], "у каждого нового сокета свой читатель");
-        assert_eq!(generation.load(Ordering::Relaxed), 2);
+        assert_eq!(state.generation.load(Ordering::Relaxed), 2);
+    }
+
+    /// Мы молчим, а встречный поток набрал лимит: задача отправки сама
+    /// меняет порт и повторяет с нового последнюю датаграмму — иначе сервер
+    /// так и лил бы на порт, который провайдер вот-вот обрежет.
+    #[tokio::test]
+    async fn incoming_flood_pushes_a_port_change() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = server.local_addr().unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        upstream.connect(dst).await.unwrap();
+
+        let state = HopState::new(3);
+        let hop = Hop { state: Arc::clone(&state), dst, on_new: Box::new(|_, _| {}) };
+        let (log_tx, _rx) = crate::observability::logging::channel();
+        let tx = spawn_writer(
+            Arc::new(upstream),
+            Some(hop),
+            CancellationToken::new(),
+            WriterLog { log_tx, addr: dst, forward_error_key: "log.tproxy_forward_error" },
+        );
+
+        let mut buf = [0u8; 16];
+        enqueue(&tx, b"last".to_vec());
+        let (_, first) = server.recv_from(&mut buf).await.unwrap();
+
+        // Ответы на текущий сокет (номер 0): вместе с отправленным — лимит.
+        state.received(0);
+        state.received(0);
+
+        let (n, again) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+            .await
+            .expect("толчка не было")
+            .unwrap();
+        assert_eq!(&buf[..n], b"last", "повтор последней датаграммы");
+        assert_ne!(first.port(), again.port(), "уже с нового порта");
+
+        // Ответы на старый сокет в счёт нового порта не идут.
+        state.received(0);
+        state.received(0);
+        state.received(0);
+        assert!(tokio::time::timeout(Duration::from_millis(300), server.recv_from(&mut buf)).await.is_err());
     }
 }
