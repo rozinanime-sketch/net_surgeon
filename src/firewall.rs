@@ -81,6 +81,15 @@ pub struct Plan {
 /// несёт PSH только в последнем, и первый — с SNI — уходил мимо очереди
 /// необработанным. А любой другой сегмент с PSH (загрузки, HTTP/2,
 /// WebSocket) всё время жизни соединения гонялся через userspace впустую.
+/// Другие HTTPS-порты Cloudflare: туда проксируется всё, что сайт на
+/// Cloudflare держит не на 443. Голос Discord держит на 2083/2087 свой
+/// сигнальный WebSocket (`c-…discord.media`), и мимо обхода его через
+/// ~27 с замораживал ТСПУ: Discord терял heartbeat и каждые полминуты
+/// переподключал голос (замер 2026-10-17, код 4800 «Heartbeat timeout»).
+/// Слушатель от порта не зависит: настоящий адрес с портом он берёт из
+/// conntrack, а не-TLS просто пересылает.
+pub const ALT_TLS_PORTS: &[u16] = &[2053, 2083, 2087, 2096, 8443];
+
 const HELLO_BY_PAYLOAD: &str = "tcp dport 443 @ih,0,16 0x1603 @ih,40,8 0x01";
 /// Прежний признак для nft без `@ih`.
 const HELLO_BY_FLAGS: &str = "tcp dport 443 tcp flags & (fin | syn | rst | psh | ack) == (psh | ack)";
@@ -134,6 +143,10 @@ pub fn ruleset(plan: &Plan) -> String {
     } else {
         add(format!("add rule {t} nat_out tcp dport 443 redirect to :{port}"));
     }
+    // Остальные HTTPS-порты Cloudflare — на слушатель в обоих режимах:
+    // очередь пакетного режима обходит только 443.
+    let alt = ALT_TLS_PORTS.iter().map(u16::to_string).collect::<Vec<_>>().join(", ");
+    add(format!("add rule {t} nat_out tcp dport {{ {alt} }} redirect to :{port}"));
     if dns_port > 0 {
         // Локальные резолверы (systemd-resolved на 127.0.0.53) не трогаем:
         // наружу они ходят на настоящий адрес, там их и поймает правило.
@@ -324,7 +337,8 @@ pub fn install(port: u16, dns_port: u16, calls: bool, packet: bool) -> Result<St
     *held() = Some(Held { child, stdin, routing });
     guard.keep();
 
-    let mut what = vec!["TCP/443".to_string()];
+    let alt = ALT_TLS_PORTS.iter().map(u16::to_string).collect::<Vec<_>>().join(",");
+    let mut what = vec![format!("TCP/443,{alt}")];
     if routing {
         what.push("QUIC".into());
         if calls {
@@ -507,6 +521,7 @@ mod tests {
         assert!(r.starts_with("add table inet net_surgeon { flags owner; }\n"));
         assert!(r.contains("nat_out meta skgid 951 return"));
         assert!(r.contains("tcp dport 443 redirect to :1083"));
+        assert!(r.contains("tcp dport { 2053, 2083, 2087, 2096, 8443 } redirect to :1083"), "порты Cloudflare");
         assert!(r.contains("udp dport 53 redirect to :1053"));
         assert!(r.contains("meta mark set 0x1"));
         assert!(r.contains("tproxy ip to 127.0.0.1:1083 accept"));
@@ -548,6 +563,8 @@ mod tests {
         assert!(!r.contains("tcp flags"));
         // IPv6 — на слушатель.
         assert!(r.contains("nat_out meta nfproto ipv6 tcp dport 443 redirect to :1083"));
+        // Прочие порты Cloudflare очередь не обходит — они на слушателе.
+        assert!(r.contains("nat_out tcp dport { 2053, 2083, 2087, 2096, 8443 } redirect to :1083"));
         // Старый nft — прежнее правило по флагам.
         let old = ruleset(&Plan { gid: 951, port: 1083, dns_port: 0, quic: false, calls: false, packet: true, hello_by_payload: false });
         assert!(old.contains(&format!("meta nfproto ipv4 {HELLO_BY_FLAGS} queue num")));
