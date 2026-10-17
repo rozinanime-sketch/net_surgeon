@@ -88,9 +88,9 @@
 ### 🐧 Linux
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.8.3/net_surgeon-0.8.3-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.8.3-x86_64-linux.tar.gz
-cd net_surgeon-0.8.3
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.9.0/net_surgeon-0.9.0-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.9.0-x86_64-linux.tar.gz
+cd net_surgeon-0.9.0
 ./run.sh
 ```
 
@@ -156,11 +156,12 @@ cd net_surgeon-0.8.3
 <details>
 <summary><b>🐧 Linux: как устроен перехват и почему сеть не должна пропасть</b></summary>
 
-Перехватываются HTTPS (TCP/443), QUIC (UDP/443) и DNS (UDP/53). С
-`[calls] hop = 4` — ещё и UDP звонков: голос Discord (порты 50000–65535),
-STUN и серверы Telegram. Им каждые 4 пакета меняется исходный порт: так
-голос проходит там, где провайдер обрезает UDP к Cloudflare/AWS после
-первых пяти пакетов (в Discord «подключено», но пинг 5000 мс).
+Перехватываются HTTPS (TCP/443 и другие HTTPS-порты Cloudflare: 2053, 2083,
+2087, 2096, 8443), QUIC (UDP/443), DNS (UDP/53) и UDP звонков: голос Discord
+(порты 50000–65535 и 19294–19344), STUN и серверы Telegram. Звонкам каждые
+4 пакета (в обе стороны) меняется исходный порт: так голос проходит там, где
+провайдер обрезает UDP к Cloudflare/AWS после первых нескольких пакетов (в
+Discord «подключено», но пинг 5000 мс). Выключается `[calls] hop = 0`.
 Правила лежат в таблице nftables, которая принадлежит процессу программы:
 ядро удаляет её, как только процесс завершился, даже после `kill -9` или
 падения. Поэтому sudo
@@ -197,7 +198,7 @@ STUN и серверы Telegram. Им каждые 4 пакета меняетс
 Нужен Rust 1.88 или новее (проще всего через [rustup](https://rustup.rs)).
 
 ```sh
-git clone --branch v0.8.3 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.9.0 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```

@@ -94,9 +94,9 @@ window and the proxy settings go back to what they were.
 ### 🐧 Linux
 
 ```sh
-curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.8.3/net_surgeon-0.8.3-x86_64-linux.tar.gz
-tar xzf net_surgeon-0.8.3-x86_64-linux.tar.gz
-cd net_surgeon-0.8.3
+curl -LO https://github.com/rozinanime-sketch/net_surgeon/releases/download/v0.9.0/net_surgeon-0.9.0-x86_64-linux.tar.gz
+tar xzf net_surgeon-0.9.0-x86_64-linux.tar.gz
+cd net_surgeon-0.9.0
 ./run.sh
 ```
 
@@ -162,11 +162,12 @@ In `plain` mode, point your application at the proxy yourself:
 <details>
 <summary><b>🐧 Linux: how interception works and why the network shouldn't break</b></summary>
 
-HTTPS (TCP/443), QUIC (UDP/443) and DNS (UDP/53) are intercepted. With
-`[calls] hop = 4`, so is call UDP (Discord voice on ports 50000–65535, STUN,
-Telegram servers): its source port changes every 4 packets, so voice gets
-through where the ISP cuts UDP to Cloudflare/AWS after the first five
-packets (Discord says "connected" but pings 5000 ms). The rules live
+HTTPS (TCP/443 and Cloudflare's other HTTPS ports: 2053, 2083, 2087, 2096,
+8443), QUIC (UDP/443), DNS (UDP/53) and call UDP (Discord voice on ports
+50000–65535 and 19294–19344, STUN, Telegram servers) are intercepted. Calls
+change their source port every 4 packets (both ways), so voice gets through
+where the ISP cuts UDP to Cloudflare/AWS after the first few packets (Discord
+says "connected" but pings 5000 ms). Turn it off with `[calls] hop = 0`. The rules live
 in an nftables table owned by the program's process: the kernel deletes it
 as soon as the process exits, even after `kill -9` or a crash. That's why
 sudo is needed only once after download or build — to grant the program
@@ -202,7 +203,7 @@ The script's messages on this path are in Russian:
 Requires Rust 1.88 or newer (easiest via [rustup](https://rustup.rs)).
 
 ```sh
-git clone --branch v0.8.3 https://github.com/rozinanime-sketch/net_surgeon.git
+git clone --branch v0.9.0 https://github.com/rozinanime-sketch/net_surgeon.git
 cd net_surgeon
 ./run.sh
 ```
