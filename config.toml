@@ -200,4 +200,4 @@ fake_sni_candidates = ["di.fm", "4pda.to", "zoom.us", "roblox.com", "gitlab.com"
 # сети, покажет диагностика домена Discord (строка «Голос»).
 # Работает в прозрачном режиме Linux (запуск с --firewall) и на Android;
 # в Windows пока нет.
-hop = 0
+hop = 4

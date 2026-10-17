@@ -76,14 +76,27 @@ pub struct BypassParams {
 /// по счётчику — пять пакетов на поток, — и мусор сам съедал этот запас;
 /// голос Discord с ним не подключался вовсе. Старая секция в чужих
 /// конфигах просто игнорируется.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct CallParams {
     /// Смена исходного порта у потоков звонков, когда на текущем набралось
     /// N датаграмм в обе стороны; 0 — выключено. Против той самой отсечки после пяти пакетов (см.
     /// `session::Hop`). Прозрачный режим Linux и SOCKS5 (весь Android);
     /// в Windows пока нет.
-    #[serde(default)]
+    ///
+    /// По умолчанию включена (с 0.9.0) — и для конфигов без секции
+    /// `[calls]`, то есть у всех, кто обновился: иначе голос Discord на сетях
+    /// с отсечкой так и висел бы на 5000 мс, пока человек не найдёт
+    /// настройку.
+    #[serde(default = "default_hop")]
     pub hop: u32,
+}
+
+fn default_hop() -> u32 { 4 }
+
+impl Default for CallParams {
+    fn default() -> Self {
+        CallParams { hop: default_hop() }
+    }
 }
 
 fn default_true() -> bool { true }
@@ -412,6 +425,20 @@ mod tests {
     fn shipped_config() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
         std::fs::read_to_string(path).expect("config.toml должен читаться")
+    }
+
+    /// Конфиг из прошлых версий секции [calls] не знает (а [socks5_junk] в нём
+    /// остался) — смена порта всё равно включена.
+    #[test]
+    fn call_hop_is_on_for_old_configs() {
+        let old: String = shipped_config()
+            .split("[calls]")
+            .next()
+            .unwrap()
+            .to_string()
+            + "\n[socks5_junk]\ncount = 6\ncalls = true\n";
+        let config: Config = toml::from_str(&old).expect("старый конфиг разбирается");
+        assert_eq!(config.calls.hop, 4);
     }
 
     #[test]
