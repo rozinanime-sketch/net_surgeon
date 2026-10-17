@@ -77,7 +77,8 @@ async fn main() {
         let installed = net_surgeon::firewall::install(
             cfg.transparent_port,
             cfg.udp_port,
-            cfg.enabled && cfg.socks5_junk.calls,
+            // Перехват UDP звонков нужен только смене порта.
+            cfg.enabled && cfg.calls.hop > 0,
             cfg.packet_mode,
         );
         match installed {

@@ -67,28 +67,26 @@ pub struct BypassParams {
     pub fake_sni_candidates: Vec<String>,
 }
 
-/// Параметры junk-обфускации в SOCKS5 UDP (раньше были захардкожены
-/// прямо в run_socks5_udp_processor).
-#[derive(Debug, Deserialize, Clone)]
-pub struct Socks5JunkParams {
-    pub count: usize,
-    pub size_min: usize,
-    pub size_max: usize,
-    pub delay_min_ms: u64,
-    pub delay_max_ms: u64,
-    /// Мусор и перед потоками звонков: STUN и UDP к сетям Telegram. См.
-    /// `session::is_call_flow`. Экспериментально, поэтому с выключателем.
-    #[serde(default = "default_true")]
-    pub calls: bool,
+/// Звонки по UDP (секция `[calls]`).
+///
+/// Раньше здесь была секция `[socks5_junk]`: мусор перед UDP-потоками
+/// (QUIC сайтов из списка, STUN, голос Discord, сети Telegram) — приём
+/// `--dpi-desync=fake` из zapret. Удалена 2026-10-17: ни одного замера,
+/// где мусор помог, а вред измерен. Провайдер режет UDP к Cloudflare/AWS
+/// по счётчику — пять пакетов на поток, — и мусор сам съедал этот запас;
+/// голос Discord с ним не подключался вовсе. Старая секция в чужих
+/// конфигах просто игнорируется.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct CallParams {
+    /// Смена исходного порта у потоков звонков каждые N датаграмм; 0 —
+    /// выключено. Против той самой отсечки после пяти пакетов (см.
+    /// `session::Hop`). Прозрачный режим Linux и SOCKS5 (весь Android);
+    /// в Windows пока нет.
+    #[serde(default)]
+    pub hop: u32,
 }
 
 fn default_true() -> bool { true }
-
-impl Default for Socks5JunkParams {
-    fn default() -> Self {
-        Self { count: 6, size_min: 100, size_max: 800, delay_min_ms: 15, delay_max_ms: 40, calls: true }
-    }
-}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -149,7 +147,7 @@ pub struct Config {
     pub enabled: bool,
     pub bypass: BypassParams,
     #[serde(default)]
-    pub socks5_junk: Socks5JunkParams,
+    pub calls: CallParams,
     /// Через сколько часов запись в strategies.txt считается протухшей
     /// и домен проверяется диагностикой заново.
     #[serde(default = "default_strategy_ttl_hours")]

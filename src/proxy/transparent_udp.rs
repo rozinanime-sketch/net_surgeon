@@ -58,10 +58,10 @@
 //! понадобились бы `IPV6_RECVORIGDSTADDR` и вторая ветка разбора.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -70,8 +70,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::bypass::needs_bypass;
-use crate::config::Socks5JunkParams;
 use crate::dns::ip_cache::IpDomainCache;
 use crate::observability::logging::{log_t, LogLevel, LogSender};
 use crate::observability::metrics::Metrics;
@@ -251,13 +249,12 @@ fn recv_with_orig_dst(
 
 // --- слушатель -------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+/// `hop` — смена исходного порта у потоков звонков каждые столько датаграмм
+/// (см. `session::Hop`); 0 — выключено.
 pub async fn run_transparent_udp(
     listen_host: &str,
     port: u16,
-    is_enabled: bool,
-    bypass_domains: Arc<HashSet<String>>,
-    junk: Socks5JunkParams,
+    hop: u32,
     log_tx: LogSender,
     metrics: Arc<Metrics>,
     token: CancellationToken,
@@ -346,9 +343,7 @@ pub async fn run_transparent_udp(
             payload,
             client_addr,
             orig_dst,
-            is_enabled,
-            &bypass_domains,
-            &junk,
+            hop,
             &sessions,
             &log_tx,
             &metrics,
@@ -366,9 +361,7 @@ async fn handle_datagram(
     payload: Vec<u8>,
     client_addr: SocketAddr,
     orig_dst: SocketAddr,
-    is_enabled: bool,
-    bypass_domains: &Arc<HashSet<String>>,
-    junk: &Socks5JunkParams,
+    hop: u32,
     sessions: &Arc<Mutex<HashMap<SessionKey, Session>>>,
     log_tx: &LogSender,
     metrics: &Arc<Metrics>,
@@ -390,7 +383,7 @@ async fn handle_datagram(
         table.remove(&key);
     }
 
-    // Имя домена в QUIC зашифровано, поэтому решение об обходе
+    // Имя домена в QUIC зашифровано, поэтому решение о блокировке
     // принимается по адресу — через кэш «адрес → домен». Его наполняют
     // DoH-релей и прозрачный TCP-режим (по SNI): браузер обычно сначала
     // открывает сайт по TCP и лишь потом переходит на QUIC.
@@ -413,44 +406,32 @@ async fn handle_datagram(
         return;
     }
 
-    let bypass = match &domain {
-        Some(d) => needs_bypass(is_enabled, d, bypass_domains),
-        None => false,
-    };
-    // Звонок — мусор и без списка обхода, как в SOCKS5: DPI режет звонки
-    // по STUN, а у ретрансляторов голоса нет имени. Такие потоки сюда
-    // приводят правила для session::CALL_PORTS и сетей Telegram.
-    let call = !bypass
-        && is_enabled
-        && junk.calls
-        && session::is_call_flow(&payload, orig_dst.ip());
     let is_quic = session::is_quic_initial(&payload);
-    // Приманка — под протокол первого пакета (QUIC/STUN/голос Discord), а не
-    // просто QUIC-или-мусор.
-    let decoy = session::classify_decoy(&payload);
-    let junk_plan = (bypass || call).then(|| (junk.clone(), decoy));
+    // Звонкам — смена порта против отсечки по счётчику пакетов (см.
+    // session::Hop). Такие потоки сюда приводят правила для
+    // session::CALL_PORTS и сетей Telegram.
+    let hop_every = if hop > 0 && session::is_call_flow(&payload, orig_dst.ip()) { hop } else { 0 };
 
     // Сверх предела новая сессия не открывается (см. limits).
     let Some(slot) = crate::proxy::limits::udp_slot(log_tx) else { return };
-    let Some(session) = open_session(client_addr, orig_dst, is_quic, junk_plan, slot, log_tx, metrics, token).await else {
+    let Some(session) = open_session(client_addr, orig_dst, is_quic, hop_every, slot, log_tx, metrics, token).await else {
         return;
     };
 
     // Кроме QUIC сюда приходит UDP на порты звонков, а на них сидят и игры.
-    // О каждой такой сессии без мусора писать незачем: лог утонул бы в них.
-    if call {
-        log_t(log_tx, LogLevel::Info, "log.call_junk", vec![("addr", orig_dst.to_string())]);
-    } else if bypass || orig_dst.port() == 443 {
+    // О каждой такой сессии без смены порта писать незачем: лог утонул бы.
+    if hop_every > 0 {
+        log_t(log_tx, LogLevel::Info, "log.call_hop", vec![
+            ("addr", orig_dst.to_string()),
+            ("every", hop_every.to_string()),
+        ]);
+    } else if orig_dst.port() == 443 {
         log_t(log_tx, LogLevel::Info, "log.tproxy_session", vec![
             ("addr", orig_dst.to_string()),
             ("domain", domain.unwrap_or_else(|| orig_dst.ip().to_string())),
-            ("bypass", bypass.to_string()),
         ]);
     }
 
-    // Первая датаграмма встаёт в очередь за мусором: задача отправки
-    // сначала отработает мусор, потом её — цикл приёма не ждёт ни того,
-    // ни другого.
     session::enqueue(&session.sender, payload);
     table.insert(key, session);
 }
@@ -461,7 +442,7 @@ async fn open_session(
     client_addr: SocketAddr,
     orig_dst: SocketAddr,
     is_quic: bool,
-    junk: Option<(Socks5JunkParams, session::DecoyKind)>,
+    hop_every: u32,
     slot: crate::proxy::limits::Slot,
     log_tx: &LogSender,
     metrics: &Arc<Metrics>,
@@ -516,32 +497,61 @@ async fn open_session(
 
     let last_seen = Arc::new(std::sync::Mutex::new(Instant::now()));
     let cancel = token.child_token();
+    let client = SocketAddr::V4(client_v4);
+    let generation = (hop_every > 0).then(|| Arc::new(AtomicU64::new(0)));
 
     tokio::spawn(return_path(
         Arc::clone(&upstream),
-        reply,
-        SocketAddr::V4(client_v4),
+        Arc::clone(&reply),
+        client,
         Arc::clone(&last_seen),
         Arc::clone(metrics),
         cancel.clone(),
+        generation.as_ref().map(|g| (0, Arc::clone(g))),
     ));
+
+    // У каждого нового сокета свой читатель ответов; все шлют клиенту
+    // через один обратный сокет — для клиента это один и тот же сервер.
+    let hop = generation.map(|generation| {
+        let (last_seen, metrics, cancel) = (Arc::clone(&last_seen), Arc::clone(metrics), cancel.clone());
+        let mine = Arc::clone(&generation);
+        session::Hop {
+            every: hop_every,
+            dst: orig_dst,
+            generation,
+            on_new: Box::new(move |sock, g| {
+                tokio::spawn(return_path(
+                    sock,
+                    Arc::clone(&reply),
+                    client,
+                    Arc::clone(&last_seen),
+                    Arc::clone(&metrics),
+                    cancel.clone(),
+                    Some((g, Arc::clone(&mine))),
+                ));
+            }),
+        }
+    });
 
     let sender = session::spawn_writer(
         upstream,
-        junk,
-        Arc::clone(metrics),
+        hop,
         cancel.clone(),
         WriterLog {
             log_tx: log_tx.clone(),
             addr: orig_dst,
             forward_error_key: "log.tproxy_forward_error",
-            junk_sent_key: None,
         },
     );
 
     Some(Session { sender, last_seen, cancel, _quic: is_quic.then(|| metrics.quic_session()), _slot: slot })
 }
 
+/// Пересылает клиенту ответы с одного исходящего сокета.
+///
+/// `hop` — (номер этого сокета, номер текущего) при смене порта. Тогда
+/// читатель не текущего сокета уходит после `session::HOP_IDLE` тишины, а его уход
+/// сессию не хоронит: она живёт на следующих сокетах, и убирает её GC.
 async fn return_path(
     upstream: Arc<UdpSocket>,
     reply: Arc<UdpSocket>,
@@ -549,17 +559,22 @@ async fn return_path(
     last_seen: Arc<std::sync::Mutex<Instant>>,
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
+    hop: Option<(u64, Arc<AtomicU64>)>,
 ) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
+    // Без смены порта тишина не повод уходить — ждём сколько угодно.
+    let idle = if hop.is_some() { session::HOP_IDLE } else { SESSION_TIMEOUT };
 
     loop {
         let n = tokio::select! {
             _ = cancel.cancelled() => break,
-            r = upstream.recv(&mut buf) => match r {
-                Ok(n) => n,
+            r = tokio::time::timeout(idle, upstream.recv(&mut buf)) => match r {
+                Ok(Ok(n)) => n,
                 // Разовый ICMP-отказ не повод хоронить сессию.
-                Err(e) if super::socks5::udp::is_transient_udp_error(&e) => continue,
-                Err(_) => break,
+                Ok(Err(e)) if super::socks5::udp::is_transient_udp_error(&e) => continue,
+                Ok(Err(_)) => break,
+                Err(_) if session::is_stale(&hop) => return,
+                Err(_) => continue,
             },
         };
 
@@ -574,8 +589,11 @@ async fn return_path(
     }
 
     // Сессия без обратного пути мертва: отмена останавливает отправку и
-    // подсказывает `handle_datagram` открыть её заново.
-    cancel.cancel();
+    // подсказывает `handle_datagram` открыть её заново. При смене порта
+    // обратных путей много, и смерть одного ничего не значит.
+    if hop.is_none() {
+        cancel.cancel();
+    }
 }
 
 fn spawn_gc(sessions: Arc<Mutex<HashMap<SessionKey, Session>>>, token: CancellationToken) {

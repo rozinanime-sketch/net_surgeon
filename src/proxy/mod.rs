@@ -323,7 +323,6 @@ pub async fn run_all(
                     domains,
                     config.bypass.clone(),
                     config.strategy_ttl_hours,
-                    config.socks5_junk.clone(),
                     dns_relay_for_divert(&config),
                     config.packet_mode,
                     log_tx,
@@ -345,7 +344,6 @@ pub async fn run_all(
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let transparent_udp_task = {
         let config = Arc::clone(&config);
-        let domains = Arc::clone(&domains);
         let log_tx = log_tx.clone();
         let metrics = Arc::clone(&metrics);
         let token = token.clone();
@@ -355,9 +353,7 @@ pub async fn run_all(
                 transparent_udp::run_transparent_udp(
                     &config.listen_host,
                     config.transparent_port,
-                    config.enabled,
-                    domains,
-                    config.socks5_junk.clone(),
+                    if config.enabled { config.calls.hop } else { 0 },
                     log_tx,
                     metrics,
                     token,
@@ -371,17 +367,13 @@ pub async fn run_all(
     let transparent_udp_task = tokio::spawn(async {});
 
     let socks5_udp_task = {
-        let config = Arc::clone(&config);
+        let hop = if config.enabled { config.calls.hop } else { 0 };
         let log_tx = log_tx.clone();
         let metrics = Arc::clone(&metrics);
         let token = token.clone();
-        let policy = socks5::udp::UdpPolicy {
-            is_enabled: config.enabled,
-            bypass_domains: Arc::clone(&domains),
-            ip_cache: Arc::clone(&ip_cache),
-        };
+        let policy = socks5::udp::UdpPolicy { ip_cache: Arc::clone(&ip_cache), hop };
         tokio::spawn(async move {
-            socks5::udp::run_socks5_udp_processor(&socks5_udp_address, config.socks5_junk.clone(), policy, log_tx, metrics, token).await;
+            socks5::udp::run_socks5_udp_processor(&socks5_udp_address, policy, log_tx, metrics, token).await;
         })
     };
 

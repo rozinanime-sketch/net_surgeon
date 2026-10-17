@@ -1,15 +1,15 @@
 use tokio::net::UdpSocket;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::bypass::{extract_domain, needs_bypass};
+use crate::bypass::extract_domain;
 use crate::dns::ip_cache::IpDomainCache;
 use crate::observability::logging::{LogSender, log_t, LogLevel};
-use crate::config::Socks5JunkParams;
 use crate::observability::metrics::Metrics;
 use crate::protocol::socks5::parse_socks5_target;
 use crate::proxy::udp::session::{self, WriterLog};
@@ -28,8 +28,8 @@ struct SocksSession {
     _quic: Option<crate::observability::metrics::QuicSessionGuard>,
     /// Очередь отправки через отдельный исходящий сокет (слушающий для этого
     /// не годится: ответ сервера был бы неотличим от нового пакета клиента).
-    /// Отправку ведёт одна задача на сессию — так мусор уходит первым,
-    /// а датаграммы не обгоняют друг друга.
+    /// Отправку ведёт одна задача на сессию — так датаграммы не обгоняют
+    /// друг друга.
     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     /// Останавливает задачу обратного пути, когда GC закрывает сессию.
     cancel: CancellationToken,
@@ -41,8 +41,7 @@ struct SocksSession {
 ///
 /// По одному адресу клиента сессия склеивала разные назначения: браузер с
 /// одного UDP-порта говорит и с сервером видео, и с API, а исходящий сокет
-/// у них получался общий. Ответы при этом приходили вперемешку, junk уходил
-/// только для первого адреса, а отдельный сокет на пару вдобавок позволяет
+/// у них получался общий. Ответы при этом приходили вперемешку, а отдельный сокет на пару вдобавок позволяет
 /// сделать `connect()` — и тогда ядро само отбрасывает датаграммы от всех,
 /// кроме этого сервера.
 type SessionKey = (SocketAddr, SocketAddr);
@@ -83,21 +82,27 @@ async fn run_return_path(
     metrics: Arc<Metrics>,
     log_tx: LogSender,
     cancel: CancellationToken,
+    hop: Option<(u64, Arc<AtomicU64>)>,
 ) {
     let mut buffer = [0u8; MAX_DATAGRAM];
+    // Без смены порта тишина не повод уходить — ждём сколько угодно.
+    let idle = if hop.is_some() { session::HOP_IDLE } else { SESSION_TIMEOUT };
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            recv_result = upstream.recv_from(&mut buffer) => {
+            recv_result = tokio::time::timeout(idle, upstream.recv_from(&mut buffer)) => {
                 let (bytes_read, from) = match recv_result {
-                    Ok(v) => v,
+                    // Тишина: старый сокет при смене порта больше не нужен.
+                    Err(_) if session::is_stale(&hop) => return,
+                    Err(_) => continue,
+                    Ok(Ok(v)) => v,
                     // ICMP «порт недоступен» на connected-сокете приходит
                     // разовой ошибкой ECONNREFUSED. Раньше она завершала
                     // обратный путь навсегда, а сессия оставалась в таблице:
                     // клиент слал дальше, ответы больше не доходили.
-                    Err(e) if is_transient_udp_error(&e) => continue,
-                    Err(e) => {
+                    Ok(Err(e)) if is_transient_udp_error(&e) => continue,
+                    Ok(Err(e)) => {
                         log_t(&log_tx, LogLevel::Warning, "log.socks5_udp_reply_error", vec![
                             ("addr", client_addr.to_string()),
                             ("error", e.to_string()),
@@ -129,8 +134,11 @@ async fn run_return_path(
 
     // Обратного пути больше нет — сессия мертва. Отмена останавливает
     // задачу отправки и служит признаком для `route`: следующая датаграмма
-    // откроет сессию заново, а не уйдёт в пустоту.
-    cancel.cancel();
+    // откроет сессию заново, а не уйдёт в пустоту. При смене порта обратных
+    // путей много, и смерть одного ничего не значит.
+    if hop.is_none() {
+        cancel.cancel();
+    }
 }
 
 /// Ошибки UDP-сокета, после которых чтение можно продолжать.
@@ -141,23 +149,23 @@ pub(crate) fn is_transient_udp_error(e: &std::io::Error) -> bool {
     )
 }
 
-/// Кому из UDP-потоков нужен мусор перед первой датаграммой.
+/// Что нужно UDP-пересылке: кэш «адрес → домен», по которому
+/// отбрасываются трекеры, и смена порта у звонков.
 ///
-/// Раньше мусор получал КАЖДЫЙ поток, без оглядки на список обхода и даже
-/// при выключенном обходе. На Android через SOCKS5 идёт весь UDP телефона:
-/// звонки, игры, QUIC ко всем сайтам — и у каждого нового потока первая
-/// датаграмма ждала шесть мусорных пакетов, 75–200 мс. Решение теперь то же,
-/// что в прозрачном режиме: по имени назначения или по кэшу «адрес → домен».
+/// Раньше здесь были ещё выключатель и список обхода — решать, кому слать
+/// мусор перед первой датаграммой. Мусор удалён (см. `config::CallParams`).
 #[derive(Clone)]
 pub struct UdpPolicy {
-    pub is_enabled: bool,
-    pub bypass_domains: Arc<HashSet<String>>,
     pub ip_cache: Arc<IpDomainCache>,
+    /// Смена исходного порта у потоков звонков каждые столько датаграмм
+    /// (см. `session::Hop`); 0 — выключено. На Android через этот путь идёт
+    /// весь UDP телефона, и голос Discord упирается в ту же отсечку UDP к
+    /// Cloudflare после пяти пакетов, что и в Linux.
+    pub hop: u32,
 }
 
 pub async fn run_socks5_udp_processor(
     socks5_udp_port: &str,
-    junk: Socks5JunkParams,
     policy: UdpPolicy,
     log_tx: LogSender,
     metrics: Arc<Metrics>,
@@ -234,7 +242,6 @@ pub async fn run_socks5_udp_processor(
                 let ctx = RouteCtx {
                     server_socket: Arc::clone(&server_socket),
                     sessions: Arc::clone(&active_sessions),
-                    junk: junk.clone(),
                     policy: policy.clone(),
                     log_tx: log_tx.clone(),
                     metrics: Arc::clone(&metrics),
@@ -290,7 +297,6 @@ pub async fn run_socks5_udp_processor(
 struct RouteCtx {
     server_socket: Arc<UdpSocket>,
     sessions: SessionTable,
-    junk: Socks5JunkParams,
     policy: UdpPolicy,
     log_tx: LogSender,
     metrics: Arc<Metrics>,
@@ -341,16 +347,6 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
         return;
     }
 
-    let bypass = domain
-        .as_deref()
-        .is_some_and(|d| needs_bypass(ctx.policy.is_enabled, d, &ctx.policy.bypass_domains));
-    // Звонок (STUN или UDP к сетям Telegram) — мусор и без списка обхода:
-    // DPI режет звонки по STUN, а у ретрансляторов голоса нет имени.
-    let call = !bypass
-        && ctx.policy.is_enabled
-        && ctx.junk.calls
-        && session::is_call_flow(&payload, dst_addr.ip());
-
     // Сверх предела новая сессия не открывается, датаграмма отбрасывается:
     // идущие сессии важнее (см. limits).
     let Some(slot) = crate::proxy::limits::udp_slot(&ctx.log_tx) else { return };
@@ -382,6 +378,14 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
 
     let last_seen = Arc::new(std::sync::Mutex::new(Instant::now()));
     let cancel = ctx.token.child_token();
+    // Звонкам — смена порта против отсечки по счётчику пакетов (см.
+    // session::Hop), как в прозрачном режиме Linux.
+    let hop_every = if ctx.policy.hop > 0 && session::is_call_flow(&payload, dst_addr.ip()) {
+        ctx.policy.hop
+    } else {
+        0
+    };
+    let generation = (hop_every > 0).then(|| Arc::new(AtomicU64::new(0)));
 
     tokio::spawn(run_return_path(
         Arc::clone(&upstream),
@@ -391,38 +395,61 @@ async fn route(ctx: RouteCtx, client_src_addr: SocketAddr, dst_addr: SocketAddr,
         Arc::clone(&ctx.metrics),
         ctx.log_tx.clone(),
         cancel.clone(),
+        generation.as_ref().map(|g| (0, Arc::clone(g))),
     ));
 
-    if call {
-        log_t(&ctx.log_tx, LogLevel::Info, "log.call_junk", vec![("addr", dst_addr.to_string())]);
+    // У каждого нового сокета свой читатель ответов; все шлют клиенту через
+    // слушающий сокет — для клиента это один и тот же сервер.
+    let hop = generation.map(|generation| {
+        let server_socket = Arc::clone(&ctx.server_socket);
+        let (last_seen, metrics, log_tx, cancel) =
+            (Arc::clone(&last_seen), Arc::clone(&ctx.metrics), ctx.log_tx.clone(), cancel.clone());
+        let mine = Arc::clone(&generation);
+        session::Hop {
+            every: hop_every,
+            dst: dst_addr,
+            generation,
+            on_new: Box::new(move |sock, g| {
+                tokio::spawn(run_return_path(
+                    sock,
+                    Arc::clone(&server_socket),
+                    client_src_addr,
+                    Arc::clone(&last_seen),
+                    Arc::clone(&metrics),
+                    log_tx.clone(),
+                    cancel.clone(),
+                    Some((g, Arc::clone(&mine))),
+                ));
+            }),
+        }
+    });
+    if hop_every > 0 {
+        log_t(&ctx.log_tx, LogLevel::Info, "log.call_hop", vec![
+            ("addr", dst_addr.to_string()),
+            ("every", hop_every.to_string()),
+        ]);
     }
-    // С именем: по одному адресу не понять, почему поток получил мусор.
+
+    // С именем: по одному адресу не понять, к какому сайту ушёл браузер.
     let target = match &domain {
         Some(d) => format!("{d} ({dst_addr})"),
         None => dst_addr.to_string(),
     };
-    if bypass {
-        log_t(&ctx.log_tx, LogLevel::Warning, "log.socks5_udp_junk", vec![("addr", target)]);
-    } else if is_quic && !call {
-        // QUIC без обхода тоже в лог, по одной строке на поток: иначе не
-        // видно, что браузер ушёл на HTTP/3 к сайту, чьё имя прокси не
-        // опознал, и обход к нему просто не применялся.
+    if is_quic {
+        // QUIC в лог, по одной строке на поток: видно, что браузер ушёл на
+        // HTTP/3 и к какому сайту.
         log_t(&ctx.log_tx, LogLevel::Info, "log.socks5_quic", vec![("addr", target)]);
     }
     let quic = is_quic.then(|| ctx.metrics.quic_session());
 
-    // Мусор отправит задача сессии, первая датаграмма встанет в очередь
-    // следом за ним.
     let sender = session::spawn_writer(
         upstream,
-        (bypass || call).then(|| (ctx.junk.clone(), session::classify_decoy(&payload))),
-        Arc::clone(&ctx.metrics),
+        hop,
         cancel.clone(),
         WriterLog {
             log_tx: ctx.log_tx.clone(),
             addr: dst_addr,
             forward_error_key: "log.socks5_udp_forward_error",
-            junk_sent_key: Some("log.socks5_udp_junk_sent"),
         },
     );
     session::enqueue(&sender, payload);

@@ -324,14 +324,9 @@ fn draw_metrics(frame: &mut Frame, area: Rect, app: &App) {
         Some(false) => (t!("metrics.fail").to_string(), Color::LightRed),
         None => ("—".to_string(), Color::DarkGray),
     };
-    // QUIC-обход идёт через SOCKS5 UDP: показываем число активных сессий
-    // и сколько фейковых Initial отправлено. Прежний индикатор OK/FAIL
-    // относился к удалённому форвардеру и ни о чём не говорил.
-    let quic_info = if m.quic_initial_sent > 0 {
-        format!("{} ({})", m.quic_sessions, m.quic_initial_sent)
-    } else {
-        m.quic_sessions.to_string()
-    };
+    // Число активных QUIC-сессий. Раньше в скобках шло ещё число поддельных
+    // Initial — они ушли вместе с мусором (см. config::CallParams).
+    let quic_info = m.quic_sessions.to_string();
 
     let health = Paragraph::new(Line::from(vec![
         Span::styled(t!("metrics.dns").to_string(), Style::default().fg(Color::DarkGray)),

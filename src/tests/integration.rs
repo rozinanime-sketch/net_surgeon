@@ -405,20 +405,19 @@ fn unacked_bytes(fd: crate::bypass::socket::RawSock) -> libc::c_int {
     n
 }
 
-/// Мусор перед UDP-потоком — только для доменов из списка обхода.
+/// SOCKS5 UDP пересылает датаграммы как есть — без мусора перед первой.
 ///
-/// Раньше его получал каждый поток, и на Android первая датаграмма любого
-/// звонка, игры или QUIC ждала шесть мусорных пакетов. Здесь два сервера:
-/// адрес одного опознан по кэшу как домен из списка, другого — нет. Мусор
-/// должен прийти только первому.
+/// Раньше перед потоками к сайтам из списка и перед звонками (STUN) уходили
+/// мусорные пакеты. Мусор удалён (см. `config::CallParams`): провайдер режет
+/// UDP к Cloudflare/AWS по счётчику пакетов, и мусор сам съедал этот запас.
+/// Здесь три потока — обычный, к домену из кэша и STUN, — и каждый сервер
+/// должен получить ровно свою датаграмму.
 #[tokio::test]
-async fn socks5_udp_junk_only_for_listed_domains() {
-    use std::collections::HashSet;
+async fn socks5_udp_sends_no_junk() {
     use std::sync::Arc;
     use tokio::net::UdpSocket;
     use tokio_util::sync::CancellationToken;
 
-    use crate::config::Socks5JunkParams;
     use crate::dns::ip_cache::IpDomainCache;
     use crate::observability::logging;
     use crate::observability::metrics::Metrics;
@@ -426,12 +425,10 @@ async fn socks5_udp_junk_only_for_listed_domains() {
 
     let listed_server = UdpSocket::bind("127.0.0.2:0").await.unwrap();
     let plain_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    // Звонок: адрес не из списка, но первый пакет — STUN
     let call_server = UdpSocket::bind("127.0.0.3:0").await.unwrap();
 
     let ip_cache = Arc::new(IpDomainCache::new());
     ip_cache.insert("127.0.0.2".parse().unwrap(), "video.listed.test".into());
-    ip_cache.insert("127.0.0.1".parse().unwrap(), "other.test".into());
 
     let relay_addr = {
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -439,17 +436,12 @@ async fn socks5_udp_junk_only_for_listed_domains() {
     };
     let token = CancellationToken::new();
     let (log_tx, _log_rx) = logging::channel();
-    let junk = Socks5JunkParams { count: 2, size_min: 900, size_max: 900, delay_min_ms: 1, delay_max_ms: 1, calls: true };
-    let policy = UdpPolicy {
-        is_enabled: true,
-        bypass_domains: Arc::new(HashSet::from(["listed.test".to_string()])),
-        ip_cache,
-    };
+    let policy = UdpPolicy { ip_cache, hop: 0 };
     {
         let token = token.clone();
         let relay = relay_addr.to_string();
         tokio::spawn(async move {
-            run_socks5_udp_processor(&relay, junk, policy, log_tx, Metrics::new(), token).await;
+            run_socks5_udp_processor(&relay, policy, log_tx, Metrics::new(), token).await;
         });
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -462,33 +454,112 @@ async fn socks5_udp_junk_only_for_listed_domains() {
         d.extend_from_slice(payload);
         d
     };
-    async fn sizes(server: &UdpSocket, count: usize) -> Vec<usize> {
+    async fn received(server: &UdpSocket) -> Vec<Vec<u8>> {
         let mut buf = [0u8; 2048];
         let mut out = Vec::new();
-        for _ in 0..count {
-            let n = tokio::time::timeout(Duration::from_secs(3), server.recv(&mut buf))
-                .await
-                .expect("датаграмма не пришла")
-                .unwrap();
-            out.push(n);
+        // Первая обязана прийти; дальше — подождать, не придёт ли лишнее.
+        let n = tokio::time::timeout(Duration::from_secs(3), server.recv(&mut buf))
+            .await
+            .expect("датаграмма не пришла")
+            .unwrap();
+        out.push(buf[..n].to_vec());
+        while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(200), server.recv(&mut buf)).await {
+            out.push(buf[..n].to_vec());
         }
         out
     }
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    client.send_to(&datagram(plain_server.local_addr().unwrap(), b"plain"), relay_addr).await.unwrap();
-    client.send_to(&datagram(listed_server.local_addr().unwrap(), b"listed"), relay_addr).await.unwrap();
-
     // STUN Binding Request: тип, длина 0, «магическое число», 12 байт ID
     let mut stun = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42];
     stun.extend_from_slice(&[7u8; 12]);
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.send_to(&datagram(plain_server.local_addr().unwrap(), b"plain"), relay_addr).await.unwrap();
+    client.send_to(&datagram(listed_server.local_addr().unwrap(), b"listed"), relay_addr).await.unwrap();
     client.send_to(&datagram(call_server.local_addr().unwrap(), &stun), relay_addr).await.unwrap();
 
-    assert_eq!(sizes(&plain_server, 1).await, vec![5], "поток вне списка получил мусор");
-    assert_eq!(sizes(&listed_server, 3).await, vec![900, 900, 6], "поток из списка остался без мусора");
-    // Приманка под STUN — валидный 20-байтовый Binding Request, а не 900
-    // случайных байт: DPI видит «начало звонка», а не мусор.
-    assert_eq!(sizes(&call_server, 3).await, vec![20, 20, 20], "звонок (STUN) получил приманку-STUN");
+    assert_eq!(received(&plain_server).await, vec![b"plain".to_vec()]);
+    assert_eq!(received(&listed_server).await, vec![b"listed".to_vec()], "домен из кэша — без мусора");
+    assert_eq!(received(&call_server).await, vec![stun], "звонок — без приманки");
+
+    token.cancel();
+}
+
+/// SOCKS5 UDP со сменой порта (путь Android): звонок уходит с нового
+/// исходного порта каждые `hop` датаграмм, а ответы со всех портов
+/// доходят до клиента.
+#[tokio::test]
+async fn socks5_udp_call_hops_source_port_and_keeps_replies() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::dns::ip_cache::IpDomainCache;
+    use crate::observability::logging;
+    use crate::observability::metrics::Metrics;
+    use crate::proxy::socks5::udp::{run_socks5_udp_processor, UdpPolicy};
+
+    // Эхо-сервер: отвечает тем же и запоминает, с каких портов писали.
+    let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let server_addr = server.local_addr().unwrap();
+    let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let (server, ports) = (Arc::clone(&server), Arc::clone(&ports));
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = server.recv_from(&mut buf).await {
+                ports.lock().unwrap().push(from.port());
+                let _ = server.send_to(&buf[..n], from).await;
+            }
+        });
+    }
+
+    let relay_addr = {
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        probe.local_addr().unwrap()
+    };
+    let token = CancellationToken::new();
+    let (log_tx, _log_rx) = logging::channel();
+    let policy = UdpPolicy { ip_cache: Arc::new(IpDomainCache::new()), hop: 2 };
+    {
+        let token = token.clone();
+        let relay = relay_addr.to_string();
+        tokio::spawn(async move {
+            run_socks5_udp_processor(&relay, policy, log_tx, Metrics::new(), token).await;
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let std::net::SocketAddr::V4(a) = server_addr else { unreachable!() };
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut got = Vec::new();
+    for i in 0..5u8 {
+        // STUN Binding Request — по нему поток узнаётся как звонок.
+        let mut stun = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42];
+        stun.extend_from_slice(&[i; 12]);
+        let mut d = vec![0x00, 0x00, 0x00, 0x01];
+        d.extend_from_slice(&a.ip().octets());
+        d.extend_from_slice(&a.port().to_be_bytes());
+        d.extend_from_slice(&stun);
+        client.send_to(&d, relay_addr).await.unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+            .await
+            .expect("ответ не дошёл до клиента")
+            .unwrap();
+        // 10 байт заголовка SOCKS5, дальше эхо: байт-метка в transaction ID.
+        assert_eq!(n, 10 + 20, "эхо целиком, в обёртке SOCKS5");
+        got.push(buf[10 + 8]);
+    }
+    assert_eq!(got, vec![0, 1, 2, 3, 4], "ответ на каждую датаграмму, по порядку");
+
+    let ports = ports.lock().unwrap().clone();
+    let distinct: HashSet<_> = ports.iter().collect();
+    assert_eq!(distinct.len(), 3, "по два пакета с порта: {ports:?}");
+    assert_eq!(ports[0], ports[1]);
+    assert_ne!(ports[1], ports[2]);
 
     token.cancel();
 }
@@ -505,7 +576,6 @@ async fn socks5_udp_returns_the_reply_to_the_client() {
     use tokio::net::UdpSocket;
     use tokio_util::sync::CancellationToken;
 
-    use crate::config::Socks5JunkParams;
     use crate::observability::logging;
     use crate::observability::metrics::Metrics;
     use crate::proxy::socks5::udp::{run_socks5_udp_processor, UdpPolicy};
@@ -531,17 +601,12 @@ async fn socks5_udp_returns_the_reply_to_the_client() {
 
     let token = CancellationToken::new();
     let (log_tx, _log_rx) = logging::channel();
-    let junk = Socks5JunkParams { count: 0, ..Socks5JunkParams::default() };
     {
         let token = token.clone();
         let relay = relay_addr.to_string();
         tokio::spawn(async move {
-            let policy = UdpPolicy {
-                is_enabled: true,
-                bypass_domains: std::sync::Arc::new(Default::default()),
-                ip_cache: std::sync::Arc::new(crate::dns::ip_cache::IpDomainCache::new()),
-            };
-            run_socks5_udp_processor(&relay, junk, policy, log_tx, Metrics::new(), token).await;
+            let policy = UdpPolicy { ip_cache: std::sync::Arc::new(crate::dns::ip_cache::IpDomainCache::new()), hop: 0 };
+            run_socks5_udp_processor(&relay, policy, log_tx, Metrics::new(), token).await;
         });
     }
     tokio::time::sleep(Duration::from_millis(100)).await;

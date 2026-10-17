@@ -102,7 +102,6 @@ pub async fn run_transparent_proxy(
     bypass_domains: Arc<HashSet<String>>,
     bypass_params: BypassParams,
     strategy_ttl_hours: u64,
-    junk: crate::config::Socks5JunkParams,
     dns_relay: Option<std::net::SocketAddr>,
     packet_mode: bool,
     log_tx: LogSender,
@@ -126,10 +125,10 @@ pub async fn run_transparent_proxy(
     #[cfg(not(target_os = "linux"))]
     let _ = packet_mode;
 
-    // Мусор и DNS нужны только перехвату Windows: в Linux UDP идёт своим
-    // слушателем (transparent_udp), а DNS заворачивает правило nftables.
+    // DNS нужен только перехвату Windows: в Linux его заворачивает правило
+    // nftables.
     #[cfg(not(windows))]
-    let _ = (junk, dns_relay);
+    let _ = dns_relay;
 
     // В Windows развёрнутый перехватом пакет приходит на адрес сетевой
     // карты, а не на 127.0.0.1, и слушатель на петле его не принял бы.
@@ -179,12 +178,9 @@ pub async fn run_transparent_proxy(
     // не нужны: без перехвата к ним никто не придёт.
     #[cfg(windows)]
     let udp = crate::packet::UdpContext {
-        policy: crate::proxy::socks5::udp::UdpPolicy {
-            is_enabled,
-            bypass_domains: Arc::clone(&bypass_domains),
-            ip_cache: Arc::clone(&ip_cache),
-        },
-        junk: junk.clone(),
+        // Смены порта в Windows пока нет: перехват пропускает пакеты
+        // приложения как есть, и порт пришлось бы переписывать в каждом.
+        policy: crate::proxy::socks5::udp::UdpPolicy { ip_cache: Arc::clone(&ip_cache), hop: 0 },
         metrics: Arc::clone(&metrics),
         dns_relay,
         runtime: tokio::runtime::Handle::current(),
@@ -193,6 +189,8 @@ pub async fn run_transparent_proxy(
     let rules = udp.describe();
     #[cfg(windows)]
     let tcp = crate::packet::TcpContext {
+        is_enabled,
+        bypass_domains: Arc::clone(&bypass_domains),
         strategies: Arc::clone(&strategies),
         bypass_params: bypass_params.clone(),
         ttl_hours: strategy_ttl_hours,

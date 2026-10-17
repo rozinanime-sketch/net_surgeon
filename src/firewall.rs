@@ -162,8 +162,7 @@ pub fn ruleset(plan: &Plan) -> String {
         add(format!("add rule {t} mark_out meta skgid {gid} return"));
         add(format!("add rule {t} mark_out {ours} meta nfproto ipv4 udp dport 443 meta mark set {MARK:#x}"));
         // Звонки — той же дорогой: прозрачный UDP-слушатель сам решит,
-        // слать ли мусор (session::is_call_flow). Тот же набор портов и
-        // сетей перехватывает WinDivert в Windows.
+        // менять ли им порт (session::is_call_flow, session::Hop).
         if calls {
             let ports = crate::proxy::udp::session::CALL_PORTS
                 .iter()

@@ -601,15 +601,14 @@ impl WindowRelease {
 //
 // Обе жили ради секции [ranges], которая удалена вместе с ними.
 
-/// Собирает синтетический QUIC v1 Initial-пакет с валидным структурным заголовком
-/// (long header, version, DCID/SCID, varint length, packet number) и случайным
-/// "телом" вместо настоящего зашифрованного CRYPTO-фрейма.
-///
-/// В отличие от чисто случайных байт, такой пакет проходит поверхностный
-/// структурный парсинг DPI (выглядит как настоящий QUIC Initial по формату RFC 9000),
-/// но расшифровать его невозможно — внутри бессмысленный шум.
-///
-/// Подход адаптирован из проекта SonicDPI (fakes.rs::build_fake_quic_initial).
+// Приманки для UDP — поддельные STUN и IP discovery Discord — удалены
+// вместе с мусором (см. `config::CallParams`).
+
+/// Синтетический QUIC v1 Initial со структурно валидным заголовком (long
+/// header, version, DCID/SCID, varint length, packet number) и случайным
+/// телом. Раньше служил приманкой перед QUIC; теперь — только образцом для
+/// тестов детекторов и парсеров.
+#[cfg(test)]
 pub fn build_fake_quic_initial() -> Vec<u8> {
     let dcid_len: usize = 8;
     let scid_len: usize = 0;
@@ -642,41 +641,6 @@ pub fn build_fake_quic_initial() -> Vec<u8> {
     // Случайное "тело" — имитация зашифрованного CRYPTO-фрейма + AEAD tag
     out.extend_from_slice(&random::bytes(payload_len));
 
-    out
-}
-
-/// Поддельный STUN Binding Request (RFC 5389): приманка для потоков звонков,
-/// которые DPI узнаёт по STUN (WebRTC, P2P Telegram/WhatsApp).
-///
-/// В отличие от случайного мусора, это структурно валидный STUN: DPI видит
-/// «начало звонка» и классифицирует поток по приманке, а настоящий первый
-/// пакет принимает за продолжение. Так же zapret шлёт `--dpi-desync-fake-stun`.
-///
-/// Тип — Binding Request (0x0001), magic cookie по RFC, случайный 12-байтовый
-/// transaction ID (чтобы серия не выглядела машинной), без атрибутов (длина 0).
-/// Сервер на чужой transaction ID не ответит ничем, что сломало бы звонок:
-/// настоящий ICE-агент сверяет ID и отбрасывает несовпавшее.
-pub fn build_fake_stun() -> Vec<u8> {
-    let mut out = Vec::with_capacity(20);
-    out.extend_from_slice(&[0x00, 0x01]); // Binding Request
-    out.extend_from_slice(&[0x00, 0x00]); // длина атрибутов = 0
-    out.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // magic cookie
-    out.extend_from_slice(&random::bytes(12)); // transaction ID
-    out
-}
-
-/// Поддельный первый пакет голоса Discord (запрос IP discovery): приманка
-/// для голосовых потоков Discord, которые узнаются именно по нему, а не по
-/// STUN (см. [`crate::proxy::udp::session::is_discord_ip_discovery`]).
-///
-/// Форма точная (74 байта, тип 0x0001, длина 70), тело — случайное: SSRC и
-/// адрес настоящему серверу ни о чём не говорят, а DPI видит узнаваемый
-/// пакет голоса и пропускает поток. Аналог `--dpi-desync-fake-discord`
-/// с заготовленным `ACTIVE_DISCORD_UDP.bin` у zapret.
-pub fn build_fake_discord_voice() -> Vec<u8> {
-    let mut out = Vec::with_capacity(74);
-    out.extend_from_slice(&[0x00, 0x01, 0x00, 70]); // тип запроса + длина тела
-    out.extend_from_slice(&random::bytes(70)); // SSRC + адрес + порт — шум
     out
 }
 

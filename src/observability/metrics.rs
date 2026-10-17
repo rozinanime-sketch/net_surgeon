@@ -32,7 +32,6 @@ pub struct Metrics {
     /// udp/quic.rs: писать их стало некому, а показывать числа от
     /// подсистемы, через которую не идёт трафик, — вводить в заблуждение.
     pub quic_sessions: AtomicUsize,
-    pub quic_initial_sent: AtomicU64,
     /// Последний DoH-запрос релея удался. До первого запроса и без релея
     /// — неизвестно, а не «OK»: раньше индикатор горел зелёным, ничего не
     /// проверив.
@@ -112,7 +111,6 @@ impl Metrics {
             bytes_rx: AtomicU64::new(0),
             bytes_tx: AtomicU64::new(0),
             quic_sessions: AtomicUsize::new(0),
-            quic_initial_sent: AtomicU64::new(0),
             dns_checked: AtomicBool::new(false),
             dns_ok: AtomicBool::new(false),
             tcp_listening: AtomicBool::new(false),
@@ -143,7 +141,6 @@ impl Metrics {
     /// потоков (packet::udp::Tracker) и живёт до конца процесса.
     pub fn quic_session_opened(&self) { self.quic_sessions.fetch_add(1, Ordering::Relaxed); }
     pub fn quic_session_closed(&self) { self.quic_sessions.fetch_sub(1, Ordering::Relaxed); }
-    pub fn quic_initial_sent(&self) { self.quic_initial_sent.fetch_add(1, Ordering::Relaxed); }
     pub fn set_dns_ok(&self, ok: bool) {
         self.dns_ok.store(ok, Ordering::Relaxed);
         self.dns_checked.store(true, Ordering::Relaxed);
@@ -230,7 +227,6 @@ impl Metrics {
             bytes_rx: self.bytes_rx.load(Ordering::Relaxed),
             bytes_tx: self.bytes_tx.load(Ordering::Relaxed),
             quic_sessions: self.quic_sessions.load(Ordering::Relaxed),
-            quic_initial_sent: self.quic_initial_sent.load(Ordering::Relaxed),
             dns_ok: self.dns_checked.load(Ordering::Relaxed).then(|| self.dns_ok.load(Ordering::Relaxed)),
             tcp_listening: self.tcp_listening.load(Ordering::Relaxed),
             udp_listening: self.udp_listening.load(Ordering::Relaxed),
@@ -283,7 +279,6 @@ pub struct MetricsSnapshot {
     pub bytes_rx: u64,
     pub bytes_tx: u64,
     pub quic_sessions: usize,
-    pub quic_initial_sent: u64,
     /// `None` — DoH-релей ещё ничего не проверял (или не запущен).
     pub dns_ok: Option<bool>,
     pub tcp_listening: bool,

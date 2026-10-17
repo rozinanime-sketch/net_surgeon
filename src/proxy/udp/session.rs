@@ -1,4 +1,4 @@
-//! Исходящая половина UDP-сессии: мусорные пакеты и пересылка по порядку.
+//! Исходящая половина UDP-сессии: пересылка по порядку и смена порта.
 //!
 //! # Зачем отдельная задача на сессию
 //!
@@ -12,22 +12,21 @@
 //!   слала мусор, вторая находила готовую сессию и уходила раньше неё —
 //!   QUIC Initial приходил на сервер переставленным.
 //!
-//! Здесь у сессии одна очередь и одна задача, которая её разгребает: сначала
-//! мусор, потом датаграммы строго в порядке приёма. Приёмник только кладёт
-//! в очередь и сразу возвращается к чтению.
+//! Здесь у сессии одна очередь и одна задача, которая её разгребает:
+//! датаграммы уходят строго в порядке приёма. Приёмник только кладёт в
+//! очередь и сразу возвращается к чтению. Мусора с тех пор нет совсем (см.
+//! `config::CallParams`), но порядок по-прежнему держит эта задача, и смена
+//! порта ([`Hop`]) тоже живёт здесь.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::bypass::{fragment, random};
-use crate::config::Socks5JunkParams;
 use crate::observability::logging::{log_t, LogLevel, LogSender};
-use crate::observability::metrics::Metrics;
 
 use super::quic_parser::{parse_quic_header, QuicPacketType};
 
@@ -42,12 +41,78 @@ pub struct WriterLog {
     pub log_tx: LogSender,
     pub addr: SocketAddr,
     pub forward_error_key: &'static str,
-    /// Сообщение после отправки мусора. `None` — не писать.
-    pub junk_sent_key: Option<&'static str>,
 }
 
-/// Первая ли это датаграмма QUIC-рукопожатия: мусор для неё должен
-/// выглядеть как QUIC, иначе поток случайных байт сам становится приметой.
+/// Смена исходного порта каждые `every` датаграмм.
+///
+/// Провайдер режет UDP к сетям Cloudflare и AWS (а на них голос Discord,
+/// серверы `c-…`) по счётчику на поток: первые пять пакетов проходят, дальше
+/// поток глохнет навсегда, на любом порту и с любым содержимым. Замер
+/// 2026-10-17, NTP к time.cloudflare.com: `✓✓✓✓✓..........`; пауза в 30 с
+/// блок не снимает, пакет раз в 2 с — тоже (считаются пакеты, а не время).
+/// Мусор против этого бессилен — он сам идёт в счёт пяти. А вот
+/// новый исходный порт каждые 4 пакета прошёл весь: `✓✓✓✓|✓✓✓✓|✓✓✓✓|…`.
+/// Счётчик у провайдера привязан к потоку, и поток просто не доживает
+/// до отсечки.
+///
+/// Ответы сервер может слать на любой из недавних портов, поэтому старые
+/// сокеты не закрываются сразу: их читатели живут, пока сокет не замолчит
+/// на [`HOP_IDLE`] (см. `transparent_udp::return_path` и
+/// `socks5::udp::run_return_path`).
+pub struct Hop {
+    pub every: u32,
+    pub dst: SocketAddr,
+    /// Номер текущего сокета. Читатель старого сокета по нему понимает, что
+    /// сокет уже не текущий и при тишине его можно бросить.
+    pub generation: Arc<AtomicU64>,
+    /// Запускает читателя ответов для нового сокета (сокет, его номер).
+    pub on_new: Box<dyn Fn(Arc<UdpSocket>, u64) + Send + Sync>,
+}
+
+/// Сколько тишины терпит читатель старого сокета при смене порта. Ответ на
+/// последний отправленный с него пакет приходит за время RTT; держать
+/// дольше — копить сокеты: голос шлёт ~50 пакетов в секунду, при смене
+/// каждые 4 это дюжина новых портов в секунду.
+pub const HOP_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Старый ли это сокет: `hop` — (номер сокета, номер текущего). Читатель
+/// старого сокета при тишине уходит, текущего — ждёт дальше.
+pub fn is_stale(hop: &Option<(u64, Arc<AtomicU64>)>) -> bool {
+    matches!(hop, Some((mine, current)) if *mine != current.load(Ordering::Relaxed))
+}
+
+/// Новый исходящий сокет к тому же назначению — то есть новый исходный порт.
+async fn fresh_upstream(dst: SocketAddr) -> std::io::Result<UdpSocket> {
+    let any = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let sock = UdpSocket::bind(any).await?;
+    sock.connect(dst).await?;
+    Ok(sock)
+}
+
+impl Hop {
+    /// Открывает следующий сокет и запускает его читателя. При ошибке
+    /// остаётся старый: лучше поток, который скоро обрежут, чем никакого.
+    async fn next(&self, log: &WriterLog) -> Option<Arc<UdpSocket>> {
+        match fresh_upstream(self.dst).await {
+            Ok(sock) => {
+                let sock = Arc::new(sock);
+                let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+                (self.on_new)(Arc::clone(&sock), generation);
+                Some(sock)
+            }
+            Err(e) => {
+                log_t(&log.log_tx, LogLevel::Warning, log.forward_error_key, vec![
+                    ("addr", log.addr.to_string()),
+                    ("error", e.to_string()),
+                ]);
+                None
+            }
+        }
+    }
+}
+
+/// Первая ли это датаграмма QUIC-рукопожатия: по ней считаются QUIC-сессии
+/// в интерфейсе и пишется лог о блокировке.
 pub fn is_quic_initial(payload: &[u8]) -> bool {
     matches!(
         parse_quic_header(payload, 8),
@@ -56,10 +121,8 @@ pub fn is_quic_initial(payload: &[u8]) -> bool {
 }
 
 /// Пакет STUN (RFC 5389): служебный протокол, которым стороны звонка
-/// договариваются о соединении через NAT.
-///
-/// По нему DPI оператора и узнаёт звонки: голос дальше зашифрован без
-/// узнаваемой сигнатуры, а STUN стандартный. Признак надёжный: два старших
+/// договариваются о соединении через NAT. Им начинается звонок WebRTC и
+/// P2P Telegram/WhatsApp. Признак надёжный: два старших
 /// бита типа нулевые, в байтах 4..8 «магическое число» 0x2112A442, длина
 /// в заголовке совпадает с остатком пакета и кратна четырём.
 pub fn is_stun(payload: &[u8]) -> bool {
@@ -85,8 +148,8 @@ pub fn is_discord_ip_discovery(payload: &[u8]) -> bool {
 ///
 /// Звонки Telegram ходят и на его собственные серверы (ретрансляторы
 /// голоса), и напрямую между собеседниками. Первые узнаются по адресу,
-/// вторые — по STUN в первом пакете. Мусор перед ними — тот же приём,
-/// что `--dpi-desync=fake` с фильтром STUN у zapret.
+/// вторые — по STUN в первом пакете. Таким потокам меняется исходный порт
+/// (см. [`Hop`]).
 pub fn is_call_flow(payload: &[u8], dst: std::net::IpAddr) -> bool {
     is_stun(payload) || is_discord_ip_discovery(payload) || crate::proxy::telegram::is_telegram_network(dst)
 }
@@ -99,9 +162,8 @@ pub fn is_call_flow(payload: &[u8], dst: std::net::IpAddr) -> bool {
 /// `19294-19344`, и на прежнем узком `19302-19309` такие звонки проходили
 /// мимо перехвата. Так же этот диапазон держат zapret/Flowseal.
 ///
-/// По ним прозрачный режим решает, какой UDP вообще перехватывать, —
-/// одинаково в Linux (правила nftables) и в Windows (фильтр WinDivert).
-/// Весь UDP перехватывать незачем: игры и VPN шли бы через прокси без
+/// По ним прозрачный режим Linux решает, какой UDP вообще перехватывать
+/// (правила nftables). Весь UDP перехватывать незачем: игры и VPN шли бы через прокси без
 /// всякой пользы. Сети Telegram перехватываются по адресу, на любом порту.
 pub const CALL_PORTS: &[(u16, u16)] = &[(3478, 3481), (19294, 19344), (50000, 65535)];
 
@@ -119,81 +181,22 @@ pub const LOCAL_NETS_V4: &[([u8; 4], u8)] = &[
     ([255, 255, 255, 255], 32),
 ];
 
-/// Какую приманку слать перед настоящими датаграммами.
-///
-/// Приманка под протокол потока убедительнее случайного мусора: DPI узнаёт
-/// «начало» QUIC/STUN/голоса Discord и классифицирует поток по ней, а
-/// настоящий первый пакет принимает за продолжение. Тот же приём, что
-/// `--dpi-desync-fake-quic/-stun/-discord` у zapret, где под каждый протокол
-/// свой заготовленный .bin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecoyKind {
-    /// Поддельный QUIC Initial — для QUIC (обычно UDP/443).
-    Quic,
-    /// Поддельный STUN Binding Request — для звонков по STUN (WebRTC, P2P).
-    Stun,
-    /// Поддельный запрос IP discovery — для голоса Discord.
-    Discord,
-    /// Случайные байты — для прочего UDP, где формы протокола у нас нет.
-    Random,
-}
-
-/// Подбирает приманку по первому пакету потока.
-///
-/// QUIC и голос Discord опознаются точно; STUN — по magic cookie. Всё
-/// остальное (MTProto к сетям Telegram, прочий UDP из списка обхода) не имеет
-/// у нас узнаваемой формы, поэтому остаётся случайный мусор, как раньше.
-pub fn classify_decoy(payload: &[u8]) -> DecoyKind {
-    if is_quic_initial(payload) {
-        DecoyKind::Quic
-    } else if is_discord_ip_discovery(payload) {
-        DecoyKind::Discord
-    } else if is_stun(payload) {
-        DecoyKind::Stun
-    } else {
-        DecoyKind::Random
-    }
-}
-
-/// Один пакет приманки под тип потока. Случайный мусор меняет размер в
-/// заданных пределах, чтобы серия не выглядела одинаковой.
-pub fn junk_packet(junk: &Socks5JunkParams, kind: DecoyKind) -> Vec<u8> {
-    match kind {
-        DecoyKind::Quic => fragment::build_fake_quic_initial(),
-        DecoyKind::Stun => fragment::build_fake_stun(),
-        DecoyKind::Discord => fragment::build_fake_discord_voice(),
-        DecoyKind::Random => random::bytes(random::in_range_usize(junk.size_min, junk.size_max)),
-    }
-}
-
 /// Запускает задачу отправки и возвращает очередь для датаграмм.
 ///
-/// `junk` — параметры мусора и признак QUIC; `None` — сессия без обхода.
-/// Задача завершается, когда все отправители очереди удалены (сессию убрал
-/// GC) или отменён `cancel`.
+/// `hop` — смена исходного порта (см. [`Hop`]); `None` — один сокет на всю
+/// сессию. Задача завершается, когда все отправители очереди удалены
+/// (сессию убрал GC) или отменён `cancel`.
 pub fn spawn_writer(
     upstream: Arc<UdpSocket>,
-    junk: Option<(Socks5JunkParams, DecoyKind)>,
-    metrics: Arc<Metrics>,
+    hop: Option<Hop>,
     cancel: CancellationToken,
     log: WriterLog,
 ) -> mpsc::Sender<Vec<u8>> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(QUEUE_CAPACITY);
 
     tokio::spawn(async move {
-        if let Some((params, kind)) = junk {
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = send_junk(&upstream, &params, kind, &metrics) => {}
-            }
-            if let Some(key) = log.junk_sent_key {
-                log_t(&log.log_tx, LogLevel::Success, key, vec![
-                    ("count", params.count.to_string()),
-                    ("addr", log.addr.to_string()),
-                ]);
-            }
-        }
-
+        let mut upstream = upstream;
+        let mut sent: u32 = 0;
         loop {
             let payload = tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -202,6 +205,15 @@ pub fn spawn_writer(
                     None => break,
                 },
             };
+            if let Some(h) = &hop
+                && sent >= h.every
+            {
+                if let Some(next) = h.next(&log).await {
+                    upstream = next;
+                }
+                sent = 0;
+            }
+            sent += 1;
             if let Err(e) = upstream.send(&payload).await {
                 log_t(&log.log_tx, LogLevel::Warning, log.forward_error_key, vec![
                     ("addr", log.addr.to_string()),
@@ -220,27 +232,10 @@ pub fn enqueue(sender: &mpsc::Sender<Vec<u8>>, payload: Vec<u8>) {
     let _ = sender.try_send(payload);
 }
 
-async fn send_junk(upstream: &UdpSocket, junk: &Socks5JunkParams, kind: DecoyKind, metrics: &Metrics) {
-    for i in 0..junk.count {
-        if kind == DecoyKind::Quic {
-            metrics.quic_initial_sent();
-        }
-        let packet = junk_packet(junk, kind);
-
-        let _ = upstream.send(&packet).await;
-
-        // Пауза только между мусорными пакетами: хвостовая задерживала бы
-        // настоящую датаграмму ни за чем.
-        if i + 1 < junk.count {
-            let delay = random::in_range(junk.delay_min_ms, junk.delay_max_ms);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// STUN Binding Request: тип 0x0001, длина 0, cookie, 12 байт ID.
     fn binding_request() -> Vec<u8> {
@@ -298,67 +293,83 @@ mod tests {
     }
 
     #[test]
-    fn protocol_decoys_pass_their_own_detectors() {
-        // Приманка каждого типа структурно валидна — DPI увидит «начало»
-        // нужного протокола, а не мусор.
-        assert!(is_stun(&fragment::build_fake_stun()), "фейковый STUN — валидный STUN");
-        assert!(
-            is_discord_ip_discovery(&fragment::build_fake_discord_voice()),
-            "фейковый голос Discord — валидный IP discovery",
-        );
-        assert!(
-            is_quic_initial(&fragment::build_fake_quic_initial()),
-            "фейковый QUIC — валидный Initial",
-        );
-    }
-
-    #[test]
-    fn decoy_kind_follows_the_first_packet() {
-        assert_eq!(classify_decoy(&fragment::build_fake_quic_initial()), DecoyKind::Quic);
-        assert_eq!(classify_decoy(&binding_request()), DecoyKind::Stun);
-        let mut discovery = vec![0x00, 0x01, 0x00, 70];
-        discovery.extend_from_slice(&[0u8; 70]);
-        assert_eq!(classify_decoy(&discovery), DecoyKind::Discord);
-        assert_eq!(classify_decoy(b"just some bytes"), DecoyKind::Random);
+    fn quic_initial_is_recognised() {
+        assert!(is_quic_initial(&crate::bypass::fragment::build_fake_quic_initial()));
+        assert!(!is_quic_initial(&binding_request()));
     }
 
     #[tokio::test]
-    async fn junk_goes_first_and_payloads_keep_their_order() {
+    async fn payloads_keep_their_order() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         upstream.connect(server.local_addr().unwrap()).await.unwrap();
 
         let (log_tx, _rx) = crate::observability::logging::channel();
-        let junk = Socks5JunkParams { count: 3, size_min: 1000, size_max: 1000, delay_min_ms: 20, delay_max_ms: 20, calls: true };
         let tx = spawn_writer(
             Arc::new(upstream),
-            Some((junk, DecoyKind::Random)),
-            Metrics::new(),
+            None,
             CancellationToken::new(),
-            WriterLog {
-                log_tx,
-                addr: server.local_addr().unwrap(),
-                forward_error_key: "log.tproxy_forward_error",
-                junk_sent_key: None,
-            },
+            WriterLog { log_tx, addr: server.local_addr().unwrap(), forward_error_key: "log.tproxy_forward_error" },
         );
 
-        // Обе датаграммы попадают в очередь сразу, пока мусор ещё уходит
         enqueue(&tx, b"first".to_vec());
         enqueue(&tx, b"second".to_vec());
 
         let mut buf = [0u8; 2048];
-        let mut got = Vec::new();
-        for _ in 0..5 {
+        for want in [&b"first"[..], b"second"] {
             let n = tokio::time::timeout(Duration::from_secs(2), server.recv(&mut buf))
                 .await
                 .expect("датаграмма не пришла")
                 .unwrap();
-            got.push(buf[..n].to_vec());
+            assert_eq!(&buf[..n], want);
+        }
+    }
+
+    #[tokio::test]
+    async fn hop_changes_source_port_every_n_datagrams() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = server.local_addr().unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        upstream.connect(dst).await.unwrap();
+
+        let readers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&readers);
+        let generation = Arc::new(AtomicU64::new(0));
+        let hop = Hop {
+            every: 2,
+            dst,
+            generation: Arc::clone(&generation),
+            on_new: Box::new(move |_sock, g| seen.lock().unwrap().push(g)),
+        };
+
+        let (log_tx, _rx) = crate::observability::logging::channel();
+        let tx = spawn_writer(
+            Arc::new(upstream),
+            Some(hop),
+            CancellationToken::new(),
+            WriterLog { log_tx, addr: dst, forward_error_key: "log.tproxy_forward_error" },
+        );
+        for i in 0..5u8 {
+            enqueue(&tx, vec![i]);
         }
 
-        assert!(got[..3].iter().all(|p| p.len() == 1000), "сначала мусор");
-        assert_eq!(got[3], b"first");
-        assert_eq!(got[4], b"second");
+        let mut buf = [0u8; 16];
+        let mut from = Vec::new();
+        for i in 0..5u8 {
+            let (n, src) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+                .await
+                .expect("датаграмма не пришла")
+                .unwrap();
+            assert_eq!(&buf[..n], &[i], "порядок сохраняется и при смене порта");
+            from.push(src.port());
+        }
+
+        // По два пакета с порта: [a, a, b, b, c].
+        assert_eq!(from[0], from[1]);
+        assert_ne!(from[1], from[2]);
+        assert_eq!(from[2], from[3]);
+        assert_ne!(from[3], from[4]);
+        assert_eq!(*readers.lock().unwrap(), vec![1, 2], "у каждого нового сокета свой читатель");
+        assert_eq!(generation.load(Ordering::Relaxed), 2);
     }
 }

@@ -162,9 +162,11 @@ In `plain` mode, point your application at the proxy yourself:
 <details>
 <summary><b>🐧 Linux: how interception works and why the network shouldn't break</b></summary>
 
-HTTPS (TCP/443), QUIC (UDP/443), DNS (UDP/53) and call UDP (Discord voice on
-ports 50000–65535, STUN, Telegram servers) are intercepted. Junk goes before
-a call, as in SOCKS5 mode; turn it off with `calls = false`. The rules live
+HTTPS (TCP/443), QUIC (UDP/443) and DNS (UDP/53) are intercepted. With
+`[calls] hop = 4`, so is call UDP (Discord voice on ports 50000–65535, STUN,
+Telegram servers): its source port changes every 4 packets, so voice gets
+through where the ISP cuts UDP to Cloudflare/AWS after the first five
+packets (Discord says "connected" but pings 5000 ms). The rules live
 in an nftables table owned by the program's process: the kernel deletes it
 as soon as the process exits, even after `kill -9` or a crash. That's why
 sudo is needed only once after download or build — to grant the program

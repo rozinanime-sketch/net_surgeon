@@ -33,12 +33,8 @@ const FIELD_GROUPS: &[(&str, &[(&str, &str)])] = &[
         ("field.hostfakesplit_midhost", "bypass.hostfakesplit_midhost"),
         ("field.hostfakesplit_disorder_after", "bypass.hostfakesplit_disorder_after"),
     ]),
-    ("config.group_junk", &[
-        ("field.junk_count", "socks5_junk.count"),
-        ("field.junk_size_min", "socks5_junk.size_min"),
-        ("field.junk_size_max", "socks5_junk.size_max"),
-        ("field.junk_delay_min", "socks5_junk.delay_min_ms"),
-        ("field.junk_delay_max", "socks5_junk.delay_max_ms"),
+    ("config.group_calls", &[
+        ("field.calls_hop", "calls.hop"),
     ]),
     ("config.group_diagnostics", &[
         ("field.strategy_ttl", "strategy_ttl_hours"),
@@ -242,6 +238,21 @@ mod tests {
         // на разборе конфига — приложение окирпичивалось из своего же UI.
         assert!(typed_value(get_item_at_path(&d, &["port"]), "abc").is_err());
         assert!(typed_value(get_item_at_path(&d, &["enabled"]), "ага").is_err());
+    }
+
+    /// Конфиг телефона создан из старой копии без секции `[calls]`: запись
+    /// `calls.hop` из «Настроек» должна сама создать секцию, а не упасть.
+    /// toml_edit заводит её inline-таблицей (`calls = { hop = 4 }`) — не
+    /// так красиво, как `[calls]`, но конфиг читается.
+    #[test]
+    fn writing_into_a_missing_section_creates_it() {
+        let mut d = doc("port = 1080\n\n[socks5_junk]\ncount = 6\n");
+        let item = typed_value(get_item_at_path(&d, &["calls", "hop"]), "4").unwrap();
+        d["calls"]["hop"] = item;
+        let rendered = d.to_string();
+        #[derive(serde::Deserialize)]
+        struct Calls { calls: crate::config::CallParams }
+        assert_eq!(toml::from_str::<Calls>(&rendered).unwrap().calls.hop, 4);
     }
 
     #[test]

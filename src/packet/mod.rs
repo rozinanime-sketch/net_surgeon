@@ -44,6 +44,7 @@ pub use imp::*;
 #[cfg(windows)]
 mod imp {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -54,17 +55,13 @@ mod imp {
     use crate::engine::strategy::StrategyStore;
     use crate::proxy::adaptive::{self, Selected};
     use super::udp::{self, Policy, Step, Tracker};
-    use crate::bypass::{needs_bypass, random};
-    use crate::config::Socks5JunkParams;
     use crate::observability::logging::{log_t, LogLevel, LogSender};
     use crate::observability::metrics::Metrics;
     use crate::proxy::socks5::udp::UdpPolicy;
-    use crate::proxy::udp::session;
 
-    /// Что нужно перехвату UDP: решать, какие потоки обходить, и чем.
+    /// Что нужно перехвату UDP: узнавать трекеры и считать QUIC-сессии.
     pub struct UdpContext {
         pub policy: UdpPolicy,
-        pub junk: Socks5JunkParams,
         pub metrics: Arc<Metrics>,
         /// DoH-релей, куда отдавать перехваченные DNS-запросы. `None` — DNS
         /// не перехватывается.
@@ -74,18 +71,9 @@ mod imp {
     }
 
     impl UdpContext {
-        /// Слать ли мусор перед звонками: как в Linux, выключается
-        /// `calls = false` или общим выключателем обхода.
-        fn calls(&self) -> bool {
-            self.policy.is_enabled && self.junk.calls
-        }
-
         /// Что перехватывается — для строки в логе, как в Linux.
         pub fn describe(&self) -> String {
             let mut what = vec!["TCP/443".to_string(), "QUIC".to_string()];
-            if self.calls() {
-                what.push(rust_i18n::t!("fw.calls").into_owned());
-            }
             if self.dns_relay.is_some() {
                 what.push("DNS".into());
             }
@@ -95,6 +83,10 @@ mod imp {
 
     /// Что нужно перехвату TCP: выбирать стратегию и засчитывать её исход.
     pub struct TcpContext {
+        /// Общий выключатель и список обхода. Раньше лежали в UdpPolicy и
+        /// оттуда же брались для TCP; у UDP решать по ним стало нечего.
+        pub is_enabled: bool,
+        pub bypass_domains: Arc<HashSet<String>>,
         pub strategies: Arc<StrategyStore>,
         pub bypass_params: BypassParams,
         pub ttl_hours: u64,
@@ -132,7 +124,7 @@ mod imp {
             let telegram: Option<Vec<_>> = crate::proxy::telegram::relay()
                 .map(|_| crate::proxy::telegram::networks_v4().collect());
             let tcp_filter = super::tcp::filter(port, telegram.as_deref());
-            let udp_filter = format!("!loopback and {}", udp::filter(ctx.dns_relay.is_some(), ctx.calls()));
+            let udp_filter = format!("!loopback and {}", udp::filter(ctx.dns_relay.is_some()));
             // Оба открываются до запуска потоков: не открылся второй — первый
             // закроется вместе с Arc, и перехват не останется наполовину.
             let tcp = Arc::new(Handle::open(&tcp_filter)?);
@@ -222,7 +214,7 @@ mod imp {
     }
 
     fn run_udp(handle: &Arc<Handle>, ctx: &UdpContext, log_tx: &LogSender) {
-        let mut flows: Tracker<(Vec<u8>, Address)> = Tracker::default();
+        let mut flows = Tracker::default();
         recv_loop(handle, log_tx, |pkt, addr| {
             let Some(u) = udp::parse(pkt) else {
                 handle.send(pkt, &addr);
@@ -342,7 +334,7 @@ mod imp {
             crate::block::is_blocked(domain)
         }
         fn needs_bypass(&self, domain: &str) -> bool {
-            needs_bypass(self.policy.is_enabled, domain, &self.policy.bypass_domains)
+            crate::bypass::needs_bypass(self.tcp.is_enabled, domain, &self.tcp.bypass_domains)
         }
         fn select(&self, domain: &str, hello: &[u8]) -> Selected {
             adaptive::select_packet(&self.adaptive(), domain, hello)
@@ -392,35 +384,23 @@ mod imp {
 
     fn on_udp(
         handle: &Arc<Handle>,
-        flows: &mut Tracker<(Vec<u8>, Address)>,
+        flows: &mut Tracker,
         pkt: &[u8],
         addr: &Address,
         ctx: &UdpContext,
         log_tx: &LogSender,
     ) {
-        // То же решение, что в прозрачном UDP-режиме Linux (transparent_udp).
+        // То же решение, что в прозрачном UDP-режиме Linux (transparent_udp):
+        // трекер выбрасывается, остальное идёт как есть.
         let mut domain = None;
-        let mut call = false;
-        let (step, count) = flows.process(
-            pkt,
-            Instant::now(),
-            |u, payload| {
-                domain = ctx.policy.ip_cache.lookup(&u.dst);
-                if domain.as_deref().is_some_and(crate::block::is_blocked) {
-                    return Policy::Block;
-                }
-                let bypass = domain
-                    .as_deref()
-                    .is_some_and(|d| needs_bypass(ctx.policy.is_enabled, d, &ctx.policy.bypass_domains));
-                call = !bypass && ctx.calls() && session::is_call_flow(payload, u.dst);
-                if bypass || call {
-                    Policy::Junk { quic: session::is_quic_initial(payload) }
-                } else {
-                    Policy::Pass
-                }
-            },
-            || (pkt.to_vec(), *addr),
-        );
+        let (step, count) = flows.process(pkt, Instant::now(), |u, _| {
+            domain = ctx.policy.ip_cache.lookup(&u.dst);
+            if domain.as_deref().is_some_and(crate::block::is_blocked) {
+                Policy::Block
+            } else {
+                Policy::Pass
+            }
+        });
         for _ in 0..count.opened {
             ctx.metrics.quic_session_opened();
         }
@@ -432,7 +412,6 @@ mod imp {
             Step::Pass => {
                 handle.send(pkt, addr);
             }
-            Step::Queued => {}
             Step::Drop { first } => {
                 if first && let Some(d) = domain {
                     log_t(log_tx, LogLevel::Info, "log.blocked", vec![
@@ -441,61 +420,7 @@ mod imp {
                     ]);
                 }
             }
-            Step::Junk { rx, quic } => {
-                if let Some(u) = udp::parse(pkt) {
-                    let target = SocketAddr::new(u.dst, u.dport).to_string();
-                    if call {
-                        log_t(log_tx, LogLevel::Info, "log.call_junk", vec![("addr", target)]);
-                    } else {
-                        log_t(log_tx, LogLevel::Info, "log.tproxy_session", vec![
-                            ("addr", target),
-                            ("domain", domain.unwrap_or_else(|| u.dst.to_string())),
-                            ("bypass", "true".to_string()),
-                        ]);
-                    }
-                }
-                spawn_junk_sender(Arc::clone(handle), rx, quic, ctx.junk.clone(), Arc::clone(&ctx.metrics));
-            }
         }
-    }
-
-    /// Шлёт мусор, потом всё из очереди потока по порядку. Отдельным
-    /// потоком: паузы между мусором остановили бы перехват всей машины.
-    /// Завершается, когда перехват закрывает очередь.
-    fn spawn_junk_sender(
-        handle: Arc<Handle>,
-        rx: std::sync::mpsc::Receiver<(Vec<u8>, Address)>,
-        quic: bool,
-        junk: Socks5JunkParams,
-        metrics: Arc<Metrics>,
-    ) {
-        let _ = std::thread::Builder::new().name("udp-junk".into()).spawn(move || {
-            let Ok((first, addr)) = rx.recv() else { return };
-            if let Some(u) = udp::parse(&first) {
-                // Приманка — под протокол первого пакета, как в Linux
-                // (session::classify_decoy): QUIC, STUN или голос Discord.
-                let kind = session::classify_decoy(first.get(u.ip_len + 8..).unwrap_or_default());
-                for i in 0..junk.count {
-                    let mut fake = udp::with_payload(&first, &u, &session::junk_packet(&junk, kind));
-                    let mut fake_addr = addr;
-                    handle.fix_checksums(&mut fake, &mut fake_addr);
-                    handle.send(&fake, &fake_addr);
-                    if quic {
-                        metrics.quic_initial_sent();
-                    }
-                    // Пауза только между мусором, как в Linux: хвостовая
-                    // задерживала бы настоящий пакет ни за чем.
-                    if i + 1 < junk.count {
-                        let delay = random::in_range(junk.delay_min_ms, junk.delay_max_ms);
-                        std::thread::sleep(std::time::Duration::from_millis(delay));
-                    }
-                }
-            }
-            handle.send(&first, &addr);
-            for (pkt, addr) in rx {
-                handle.send(&pkt, &addr);
-            }
-        });
     }
 
     /// Сколько ждать ответа DoH-релея. Системный резолвер Windows сам
