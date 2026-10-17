@@ -8,3 +8,4 @@ discord.com	hostfakesplit
 discord.gg	hostfakesplit
 discordapp.com	hostfakesplit
 discordapp.net	hostfakesplit
+discord.media	hostfakesplit

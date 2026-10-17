@@ -57,6 +57,15 @@ const OFFERS: &[Offer] = &[
             "notebooklm-pa.googleapis.com",
         ],
     },
+    Offer {
+        file: "pin_strategies.txt",
+        mark: ".added_pin",
+        // Голосовые серверы Discord (`c-amsNN-….discord.media`). Без
+        // закрепления каждый новый сервер подбирал технику заново; на
+        // телефоне выпал oob, поток замёрз, и голос подключался 1–2 минуты
+        // (2026-10-17). Проходит та же техника, что у остального Discord.
+        domains: &["discord.media\thostfakesplit"],
+    },
 ];
 
 /// Что произошло с одним списком. Списки, где ничего не менялось, в
@@ -123,11 +132,17 @@ fn apply_offer(offer: &Offer) -> Option<ListUpdate> {
 }
 
 /// Новый текст списка, если в него есть что дописать, и дописанные домены.
+///
+/// Строка списка — домен, за которым может идти ещё что-то (в
+/// pin_strategies.txt — техника через TAB). Покрыт ли домен, решает только
+/// первое слово: закреплённый у пользователя домен с другой техникой не
+/// перебивается.
 fn append_missing(current: &str, fresh: &[&str]) -> (Option<String>, Vec<String>) {
-    let present = crate::block::parse(current);
+    let domain = |line: &str| line.split_whitespace().next().unwrap_or("").to_string();
+    let present: std::collections::HashSet<String> = crate::block::parse(current).iter().map(|l| domain(l)).collect();
     let added: Vec<String> = fresh
         .iter()
-        .filter(|d| !crate::bypass::matches_list(d, &present))
+        .filter(|d| !crate::bypass::matches_list(&domain(d), &present))
         .map(|d| d.to_string())
         .collect();
     if added.is_empty() {
@@ -152,6 +167,19 @@ mod tests {
     #[test]
     fn domain_covered_by_parent_is_not_appended() {
         let (text, added) = append_missing("googleapis.com\n", &["robinfrontend-pa.googleapis.com"]);
+        assert!(added.is_empty());
+        assert_eq!(text, None);
+    }
+
+    #[test]
+    fn pin_lines_are_compared_by_domain() {
+        let current = "discord.com\thostfakesplit\nlatency.discord.media\n";
+        let (text, added) = append_missing(current, &["discord.media\thostfakesplit"]);
+        assert_eq!(added, ["discord.media\thostfakesplit"], "поддомен в списке родителя не покрывает");
+        assert!(text.unwrap().ends_with("latency.discord.media\ndiscord.media\thostfakesplit\n"));
+
+        // Свою технику для домена пользователь уже выбрал — не трогаем.
+        let (text, added) = append_missing("discord.media\toob\n", &["discord.media\thostfakesplit"]);
         assert!(added.is_empty());
         assert_eq!(text, None);
     }
@@ -210,9 +238,10 @@ mod tests {
         // запуске: домен забыли внести в сам список в репозитории.
         for offer in OFFERS {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(offer.file);
-            let list = crate::block::parse(&std::fs::read_to_string(path).unwrap());
+            let list = std::fs::read_to_string(path).unwrap();
             for d in offer.domains {
-                assert!(crate::bypass::matches_list(d, &list), "{d} нет в {}", offer.file);
+                let (text, _) = append_missing(&list, &[d]);
+                assert!(text.is_none(), "{d} нет в {}", offer.file);
             }
         }
     }
